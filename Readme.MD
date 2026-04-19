@@ -1,122 +1,145 @@
-﻿# NewLife.Office - 办公自动化库
+# Pek.Office
 
-![GitHub top language](https://img.shields.io/github/languages/top/newlifex/NewLife.Office?logo=github)
-![GitHub License](https://img.shields.io/github/license/newlifex/NewLife.Office?logo=github)
-![Nuget Downloads](https://img.shields.io/nuget/dt/NewLife.Office?logo=nuget)
-![Nuget](https://img.shields.io/nuget/v/NewLife.Office?logo=nuget)
-![Nuget (with prereleases)](https://img.shields.io/nuget/vpre/NewLife.Office?label=dev%20nuget&logo=nuget)
+Pek.Office 是一个面向 .NET 的办公文档处理库，当前仓库覆盖 Excel、Word、PowerPoint、PDF、Markdown、RTF、ODS、EML、MSG、iCalendar、vCard、EPUB、XPS 等常见办公与文档格式。
 
-办公自动化库  
+项目当前 NuGet 包名为 Pek.Office，公开 API 主要位于 NewLife.Office 命名空间。
 
-源码： https://github.com/NewLifeX/NewLife.Office  
-Nuget：NewLife.Office  
+## 项目定位
 
-## 项目简介
+- 面向服务端或工具侧的文档读写、导入导出与格式转换
+- 基于文件格式本身实现，不依赖 Office 或 LibreOffice 进程自动化
+- 同时支持 OpenXML/ZIP+XML 与 OLE2/CFB 旧二进制格式
+- 提供统一入口 OfficeFactory，用于识别支持的文档类型并创建读取器
 
-`NewLife.Office` 是一个功能全面的 .NET 办公自动化库，覆盖 **Excel（xlsx/xls）、Word（docx/doc）、PPT（pptx/ppt）、PDF**、Markdown、RTF、ODS、Email（eml/msg）、iCalendar、vCard、EPUB、XPS 以及基于 OLE2/BIFF8 的老式二进制格式，致力于为 .NET 社区提供零依赖、MIT 许可的高质量办公自动化能力。
+## 目标框架与依赖
 
-- 仅依赖 `NewLife.Core`，零外部依赖
-- 支持 `net45/netstandard2.0/netstandard2.1`
-- 直接基于 Open XML（ZIP + XML）/ PDF / OLE2 文件结构实现
-- 统一命名空间 `NewLife.Office`，API 风格一致，学习成本低
+- 目标框架：net45、netstandard2.0、netstandard2.1
+- 运行时核心依赖：DH.NCore
+- 测试框架：xUnit
 
-> CSV 读写能力由 `NewLife.Core` 的 `CsvFile` 提供，本仓库不重复实现 CSV。
+安装示例：
 
-## 已实现能力（Excel）
+```bash
+dotnet add package Pek.Office
+```
 
-### ExcelWriter（写入）
+## 当前实现模块
 
-- 多工作表写入、表头与多行数据写入
-- 单元格样式：字体/背景/边框/对齐/换行/数字格式
-- 布局能力：列宽、行高、合并单元格、冻结窗格、自动筛选
-- 高级能力：超链接、下拉数据验证、条件格式、插入图片、图表（柱/折/饼/散点）、数据透视表
-- 页面能力：页面方向、纸张大小、页边距、页眉页脚、打印标题行
-- 安全能力：工作表保护
-- 便捷能力：`WriteObjects<T>()`、`WriteDataTable()`
+### Excel
 
-### ExcelReader（读取）
+- ExcelReader：读取 xlsx 工作簿、工作表行数据、对象集合、DataTable
+- ExcelWriter：写入 xlsx，支持表头、数据行、样式、冻结窗格、自动筛选、数据验证、图片、页面设置、条件格式等常见能力
+- ExcelTemplate：基于占位符执行模板填充
+- BiffReader：读取 Excel 97-2003 的 xls 二进制文件
+- BiffWriter：生成 Excel 97-2003 的 xls 文件，支持多工作表、对象集合和 DataTable 导出
 
-- 读取多工作表行数据（自动类型转换）
-- `ReadObjects<T>()` 对象映射导入（支持 `DisplayName/Description`）
-- `ReadDataTable()` 导入为 `DataTable`
-- `GetMergeRanges()` 读取合并区域
+### Word
 
-### ExcelTemplate（模板填充）
+- WordReader / WordWriter：读写 docx
+- WordTemplate：docx 模板占位符填充
+- WordHtmlConverter：docx 转 HTML
+- WordPdfConverter：docx 转 PDF，属于内容映射型转换，不依赖外部渲染引擎
+- DocReader：读取 Word 97-2003 的 doc 文件，可提取全文、段落和表格
 
-- 基于现有 xlsx 模板执行 `{{Key}}` 占位符替换
-- 支持输出到文件或流
+### PowerPoint
 
-### BiffReader（xls 安全读取）
+- PptxReader / PptxWriter：读写 pptx
+- PptxTemplate：pptx 模板填充
+- PptReader：读取 PowerPoint 97-2003 的 ppt 文件，提取幻灯片文本
+- PptxPdfConverter：pptx 转 PDF，当前按文本内容和版面顺序映射，不做像素级渲染
 
-- 基于 OLE2/CFB 容器，解析 BIFF8 格式工作表流
-- `ReadSheet()` 读取工作表行数据
-- `ReadObjects<T>()` 对象映射导入
-- 支持字符串、数字、布尔、日期、RK 编码等多种单元格类型
+### PDF
 
-## 已实现能力（Word）
-
-### WordWriter / WordReader / WordTemplate
-
-- docx 全面读写：段落、表格、图片、标题、列表、超链接、页眉页脚、页面设置
-- 模板填充：`{{Key}}` 占位符替换，保留原样式
-- `WordHtmlConverter`：docx 转语义化 HTML（段落→`<p>`，表格→`<table>`，标题→`<h1>`-`<h6>`）
-- `WordPdfConverter`：docx 转 PDF（内容映射型，纳入 PdfFluentDocument）
-- `DocReader`：读取 doc 格式（OLE2 容器，提取纯文本和段落结构）
-
-## 已实现能力（PPT）
-
-### PptxWriter / PptxReader / PptxTemplate
-
-- pptx 全面读写：幻灯片管理、文本框、表格、图片、基本形状、超链接、备注、模板填充
-- 布局设计：母版、版式、背景、尺寸、幻灯片切换动画
-- `PptReader`：读取 ppt 格式（OLE2 容器，提取幻灯片文本）
-
-## 已实现能力（PDF）
-
-### PdfWriter / PdfReader / PdfDocument
-
-- 创建 PDF：文本排版、表格、图片、页眉页脚、中文字体支持（Type0/STSong-Light，UniGB-UCS2-H 编码）
-- `PdfFluentDocument`：声明式布局 API（Row/Column/Text/Image/Table），自动分页
-- PDF 操作：合并/拆分、水印、页面旋转、文字覆盖、可点击链接、书签导航
-- `PdfEncryptor`：加密/权限控制
-- 文本提取：逐页/全文，带坐标信息提取
-
-## 已实现能力（Markdown / RTF / ODS）
+- PdfWriter / PdfReader / PdfDocument：基础 PDF 读写能力
+- PdfFluentDocument：声明式 PDF 排版接口
+- PdfEncryptor：PDF 加密与权限处理
 
 ### Markdown
 
-- `MarkdownParser`：解析 CommonMark + GFM（标题/段落/代码块/列表/引用/粗斜体/图片/表格/任务列表）
-- `MarkdownWriter`：将 `MarkdownDocument` 序列化为 .md 文本（包括 GFM 扩展）
-- `MarkdownHtmlConverter`：Markdown 转换为语义化 HTML
-- `MarkdownWordConverter`：Markdown → Word（docx），标题/段落/列表/表格映射为 Word 样式
-- `MarkdownPdfConverter`：Markdown → PDF（通过 PdfFluentDocument 直出 PDF）
-- `MarkdownDocument.ToWord()` / `ToPdf()` 快捷方法
+- MarkdownParser / MarkdownWriter：Markdown 解析与输出
+- MarkdownHtmlConverter：Markdown 转 HTML
+- MarkdownWordConverter：Markdown 转 Word
+- MarkdownPdfConverter：Markdown 转 PDF
+- MarkdownDocument：文档对象模型与快捷转换入口
 
 ### RTF
 
-- `RtfReader`：解析 RTF 文件，提取段落（字体/颜色/对齐）、表格、文档属性、嵌入图片（PNG/JPEG/WMF/EMF）
-- `RtfWriter`：创建 RTF 文件（段落格式/表格/模板填充）；`AddImage()` 支持嵌入 PNG/JPEG 图片（十六进制编码）
+- RtfDocument / RtfReader / RtfWriter：RTF 解析与写入
+- 支持段落、表格、颜色、字体、图片提取与图片嵌入
+- 支持基于 {{Key}} 的模板填充
 
 ### ODS
 
-- `OdsReader`：读取 LibreOffice ODS 格式，提取多工作表单元格数据、合并单元格、单元格样式（字体/颜色/背景/对齐）
-- `OdsWriter`：生成 ODS 文件（多工作表、字符串/数字/日期/布尔/公式、单元格样式写入）
+- OdsReader / OdsWriter：读写 OpenDocument Spreadsheet
+- 支持多工作表、对象映射、DataTable、基础单元格样式、合并区域读取
 
-## OLE2/CFB 容器
+### 邮件与个人信息格式
 
-- `CfbReader`：解析 Compound File Binary 容器（安全寻找 Stream，支持 v3/v4 水印）
-- `CfbWriter`：生成合法 CFB 文件（写入流和目录树）
-- 支撟 xls（Excel 97-2003）、doc（Word 97-2003）、ppt（PPT 97-2003）共用基础层
+- EmlReader / EmlWriter / EmlMessage：EML 邮件读写
+- MsgReader：Outlook MSG 读取
+- ICalReader / ICalWriter / ICalDocument：iCalendar 读写
+- VCardReader / VCardWriter / VCardContact：vCard 读写
+
+### 电子书与固定版式文档
+
+- EpubReader / EpubWriter / EpubDocument：EPUB 2/3 读写
+- XpsReader / XpsWriter：XPS 读写、文本提取、图片提取、元数据读写
+
+### 基础容器与工厂
+
+- CfbDocument / CfbReader：OLE2/CFB 容器解析与写入
+- OfficeFactory：统一识别支持的扩展名并创建对应读取器
+
+## OfficeFactory 支持格式
+
+当前 OfficeFactory 内置支持以下 15 种扩展名：
+
+- .xlsx
+- .xls
+- .docx
+- .doc
+- .pptx
+- .ppt
+- .pdf
+- .rtf
+- .ods
+- .epub
+- .vcf
+- .eml
+- .ics
+- .md
+- .xps
+
+说明：
+
+- 对于 xlsx、xls、docx、doc、pptx、ppt、pdf，会返回对应 Reader 实例
+- 对于 rtf、ods、epub、md，会直接返回解析后的文档对象或结果对象
+- 对于 eml、ics、vcf、xps，会返回对应读取器实例，由调用方继续读取文件内容
 
 ## 快速开始
 
+### 读取任意支持的文件
+
 ```csharp
+using NewLife.Office;
+
+if (OfficeFactory.IsSupported(".xlsx"))
+{
+    using var reader = (ExcelReader)OfficeFactory.CreateReader("demo.xlsx");
+    var rows = reader.ReadRows("Sheet1").ToList();
+}
+```
+
+### 写入 xlsx
+
+```csharp
+using System.Text;
 using NewLife.Office;
 
 using var ms = new MemoryStream();
 var writer = new ExcelWriter(ms);
 
-writer.WriteHeader("Data", new[] { "编号", "姓名", "金额" }, CellStyle.Header);
+writer.WriteHeader("Data", ["编号", "姓名", "金额"], CellStyle.Header);
 writer.WriteRow("Data", new Object?[] { 1, "张三", 1234.56m }, new CellStyle
 {
     Border = CellBorderStyle.Thin,
@@ -132,230 +155,107 @@ var reader = new ExcelReader(ms, Encoding.UTF8);
 var rows = reader.ReadRows("Data").ToList();
 ```
 
-### 对象集合导出
+### 写入 xls
 
 ```csharp
-public class UserInfo
+using NewLife.Office;
+
+using var writer = new BiffWriter();
+writer.WriteHeader(["姓名", "年龄", "成绩"]);
+writer.WriteRow(new Object?[] { "Alice", 28, 95.5 });
+writer.WriteRow(new Object?[] { "Bob", 31, 88.0 });
+writer.Save("data.xls");
+```
+
+### docx 转 PDF
+
+```csharp
+using NewLife.Office;
+
+var converter = new WordPdfConverter();
+converter.ConvertToFile("input.docx", "output.pdf");
+```
+
+### pptx 转 PDF
+
+```csharp
+using NewLife.Office;
+
+var converter = new PptxPdfConverter
 {
-    [DisplayName("编号")]
-    public Int32 Id { get; set; }
-
-    [DisplayName("姓名")]
-    public String Name { get; set; }
-
-    [DisplayName("金额")]
-    public Decimal Amount { get; set; }
-}
-
-var list = new List<UserInfo>
-{
-    new() { Id = 1, Name = "张三", Amount = 1234.56m },
-    new() { Id = 2, Name = "李四", Amount = 9876.00m },
+    DocumentTitle = "演示文稿导出"
 };
-
-using var ms = new MemoryStream();
-var writer = new ExcelWriter(ms);
-writer.WriteObjects("用户列表", list);
-writer.Save();
+converter.Convert("slides.pptx", "slides.pdf");
 ```
 
-### 对象集合导入
-
-```csharp
-using var fs = File.OpenRead("users.xlsx");
-var reader = new ExcelReader(fs);
-var users = reader.ReadObjects<UserInfo>("用户列表");
-```
-
-### 模板填充
-
-```csharp
-// 基于 xlsx 模板替换 {{Key}} 占位符，保留原有样式
-var template = new ExcelTemplate("report_template.xlsx");
-template.Fill(new Dictionary<String, Object>
-{
-    ["Title"] = "2025年度报告",
-    ["Author"] = "张三",
-    ["Date"] = DateTime.Today.ToString("yyyy-MM-dd"),
-});
-template.Save("report_output.xlsx");
-```
-
-### 单元格样式
-
-```csharp
-var style = new CellStyle
-{
-    Bold = true,
-    FontColor = "FFFFFF",        // 白色字体
-    BackgroundColor = "4472C4",  // 蓝色背景
-    HAlign = HorizontalAlignment.Center,
-    Border = CellBorderStyle.Thin,
-    NumberFormat = "#,##0.00",
-};
-
-writer.WriteHeader("Sheet1", new[] { "编号", "姓名", "金额" }, style);
-writer.MergeCell("Sheet1", "A1:C1");  // 合并标题行
-writer.SetRowHeight("Sheet1", 1, 30); // 设置行高
-```
-
-## 已实现能力（邮件 / 日历 / 联系人 / 电子书）
-
-### EML（邮件）
-
-- `EmlReader`：解析 RFC 5322 + MIME 邮件，含 multipart/mixed、multipart/alternative
-- `EmlWriter`：生成合法 MIME 邮件（文本/HTML 正文、附件、内嵌图片）
-- 支持 RFC 2047 Base64/Q-Encoding 头部解码、quoted-printable 正文解码
-
-### MSG（Outlook 邮件）
-
-- `MsgReader`：基于 OLE2/CFB 容器解析 Outlook .msg 文件，提取 MAPI 属性
-- 支持主题（PR_SUBJECT）、发件人、收件人列表（To/Cc/Bcc）
-- 支持纯文本正文（PR_BODY）和 HTML 正文（PR_HTML_BODY）
-- 支持多附件提取（`__attach_version1.0_#NN` 子存储，含文件名和二进制数据）
-
-### iCalendar（日历）
-
-- `ICalReader`：解析 RFC 5545 .ics 文件，提取 VEVENT/VTODO/VJOURNAL 及重复规则
-- `ICalWriter`：生成符合 RFC 5545 的 .ics 文件，支持 RRULE 序列化和 75 字节行折叠
-
-### vCard（联系人）
-
-- `VCardReader`：解析 RFC 6350 .vcf 文件，支持 vCard 3.0/4.0，含 FN/N/ORG/TEL/EMAIL/ADR/BDAY/PHOTO
-- `VCardWriter`：生成 vCard 4.0 格式，支持多联系人批量写入
-
-### EPUB（电子书）
-
-- `EpubReader`：读取 EPUB 2/3 文件（ZIP + OPF + XHTML），提取元数据和章节内容
-- `EpubWriter`：生成符合 EPUB 3 规范的电子书（mimetype/container.xml/OPF/Nav/章节 XHTML/CSS/封面图片）
-
-## 已实现能力（XPS）
-
-### XpsReader / XpsWriter
-
-- `XpsReader`：解析 XPS（XML Paper Specification）文件（ZIP + XML），遍历 FixedDocumentSequence → FixedDocument → FixedPage
-- 文本提取：从 `<Glyphs UnicodeString="...">` 元素提取文本内容
-- 图片提取：`ExtractImages()` 返回所有嵌入 PNG/JPEG 资源
-- 页面信息：`Width`/`Height` 从 `<FixedPage>` 属性读取
-- 元数据：`ReadProperties()` 解析 `docProps/core.xml`（标题/作者/主题）
-- `XpsWriter`：生成合法 XPS 文件（`[Content_Types].xml` + `_rels/.rels` + FDS + .fpage）
-- `AddPage(width, height, IEnumerable<(text, x, y, fontSize)>)` 多页写入
-- `SetProperties(XpsProperties)` 写入文档属性
-- `AddImage(name, data, mime)` 嵌入图片资源
-- `Save(path|stream)` / `ToBytes()` 输出
-
-## 测试状态
-
-- 当前测试集：`395` 项
-- 通过：`395` 项
-- 失败：`0` 项
-
-## 已实现格式概览
+## 能力概览
 
 | 格式 | 读取 | 写入 | 模板 | 转换 | 说明 |
 |------|:---:|:---:|:---:|:---:|------|
-| **Excel xlsx** | ✅ | ✅ | ✅ | — | 含样式/图表/透视表/条件格式/图片 |
-| **Excel xls** | ✅ | 🔄规划 | — | — | OLE2/BIFF8，BiffReader 已实现读取 |
-| **Word docx** | ✅ | ✅ | ✅ | HTML/PDF | 含段落/表格/图片/页眉页脚 |
-| **Word doc** | ✅ | — | — | — | MS-DOC，DocReader 提取纯文本 |
-| **PPT pptx** | ✅ | ✅ | ✅ | 🔄规划 | 含文本框/图片/表格/图表/母版 |
-| **PPT ppt** | ✅ | — | — | — | MS-PPT，PptReader 提取幻灯片文本 |
-| **PDF** | ✅ | ✅ | — | — | 含 Fluent API/合并/拆分/加密 |
-| **Markdown** | ✅ | ✅ | — | HTML/Word/PDF | CommonMark + GFM，含 AST 模型，→Word/→PDF 已实现 |
-| **RTF** | ✅ | ✅ | ✅ | — | 段落/表格/模板填充/图片嵌入（PNG/JPEG） |
-| **ODS** | ✅ | ✅ | — | — | LibreOffice 原生格式 |
-| **EML** | ✅ | ✅ | — | — | RFC 5322 + MIME，附件/内嵌图片 |
-| **MSG** | ✅ | — | — | — | Outlook，OLE2 + MAPI，提取主题/正文/附件 |
-| **iCalendar** | ✅ | ✅ | — | — | RFC 5545 .ics，VEVENT/VTODO/RRULE |
-| **vCard** | ✅ | ✅ | — | — | RFC 6350 .vcf，vCard 3.0/4.0 |
-| **EPUB** | ✅ | ✅ | — | — | EPUB 2/3，OPF/Nav/章节/封面 |
-| **XPS** | ✅ | ✅ | — | — | ZIP+XML，Glyphs 文本提取/多页写入/图片/元数据 |
+| Excel xlsx | ✅ | ✅ | ✅ | — | ExcelReader / ExcelWriter / ExcelTemplate |
+| Excel xls | ✅ | ✅ | — | — | BiffReader / BiffWriter |
+| Word docx | ✅ | ✅ | ✅ | HTML、PDF | WordReader / WordWriter / WordTemplate |
+| Word doc | ✅ | — | — | — | DocReader |
+| PowerPoint pptx | ✅ | ✅ | ✅ | PDF | PptxReader / PptxWriter / PptxTemplate / PptxPdfConverter |
+| PowerPoint ppt | ✅ | — | — | — | PptReader |
+| PDF | ✅ | ✅ | — | — | PdfReader / PdfWriter / PdfFluentDocument |
+| Markdown | ✅ | ✅ | — | HTML、Word、PDF | Markdown 系列 |
+| RTF | ✅ | ✅ | ✅ | — | RtfDocument / RtfWriter |
+| ODS | ✅ | ✅ | — | — | OdsReader / OdsWriter |
+| EML | ✅ | ✅ | — | — | EmlReader / EmlWriter |
+| MSG | ✅ | — | — | — | MsgReader |
+| iCalendar | ✅ | ✅ | — | — | ICalReader / ICalWriter |
+| vCard | ✅ | ✅ | — | — | VCardReader / VCardWriter |
+| EPUB | ✅ | ✅ | — | — | EpubReader / EpubWriter |
+| XPS | ✅ | ✅ | — | — | XpsReader / XpsWriter |
 
-## 代码结构
+## 目录结构
 
+```text
+Pek.Office/
+├── Calendar/
+├── Epub/
+├── Excel/
+├── Mail/
+├── Markdown/
+├── Ods/
+├── OLE2/
+├── PDF/
+├── PPT/
+├── Rtf/
+├── VCard/
+├── Word/
+├── Xps/
+└── OfficeFactory.cs
 ```
-NewLife.Office/
-├── Excel/        # xlsx 读写：ExcelWriter / ExcelReader / ExcelTemplate / CellStyle / ExcelHelper / BiffReader
-├── Word/         # docx 读写：WordWriter / WordReader / WordTemplate / DocReader / WordHtmlConverter / WordPdfConverter
-├── PPT/          # pptx 读写：PptxWriter / PptxReader / PptxTemplate / PptReader
-├── PDF/          # PDF 读写：PdfWriter / PdfReader / PdfDocument / PdfFluentDocument / PdfEncryptor
-├── OLE2/         # OLE2/CFB 容器：CfbReader / CfbWriter
-├── Markdown/     # Markdown 读写：MarkdownParser / MarkdownWriter / MarkdownHtmlConverter
-├── Rtf/          # RTF 读写：RtfReader / RtfWriter
-├── Ods/          # ODS 读写：OdsReader / OdsWriter
-├── Mail/         # EML 邮件读写：EmlReader / EmlWriter / EmlMessage
-├── Calendar/     # iCalendar .ics 读写：ICalReader / ICalWriter / ICalDocument
-├── VCard/        # vCard .vcf 读写：VCardReader / VCardWriter / VCardContact
-├── Epub/         # EPUB 读写：EpubReader / EpubWriter / EpubDocument
-└── Xps/          # XPS 读写：XpsReader / XpsWriter
+
+## 测试覆盖
+
+仓库已提供独立的 xUnit 测试项目，覆盖以下主要模块：
+
+- ExcelReader / ExcelWriter / ExcelTemplate / BiffReader / BiffWriter
+- CfbDocument、DocReader、PptReader
+- Eml、Msg、ICal、VCard、Epub
+- Markdown、Rtf、Ods、Xps
+- WordHtmlConverter、WordPdfConverter、PptxPdfConverter
+- OfficeFactory 集成测试
+
+运行测试：
+
+```bash
+dotnet test XUnitTest/XUnitTest.csproj
 ```
 
-## 规划中
+## 已知边界
 
-以下功能已在路线图中，但尚未实现：
+- WordPdfConverter 和 PptxPdfConverter 当前属于内容映射型转换，目标是稳定导出文本和基本结构，不追求 Office 原生渲染级还原
+- WordPdfConverter.ConvertToImages 和 PptxPdfConverter.ConvertToImages 当前按设计抛出 NotSupportedException
+- OfficeFactory.CreateReader 的返回值类型会随扩展名变化，调用方需要按具体格式进行转换或继续处理
 
-### 写入 xls（BIFF8，Excel 97-2003）
+## 适用场景
 
-- 生成合法 BIFF8 工作簿流并写入 OLE2 容器
-
-### PPT → PDF / 图片
-
-- pptx 每张幻灯片转换为 PDF 页面或 PNG/JPEG 图像
-
-### ODS 合并单元格
-
-- OdsReader 识别合并单元格（number-columns-spanned）
-
-## 新生命项目矩阵
-
-各项目默认支持net9.0/netstandard2.1/netstandard2.0/net4.62/net4.5，旧版（2024.0801）支持net4.0/net2.0
-
-|                               项目                               | 年份  | 说明                                                                                        |
-| :--------------------------------------------------------------: | :---: | ------------------------------------------------------------------------------------------- |
-|                             基础组件                             |       | 支撑其它中间件以及产品项目                                                                  |
-|          [NewLife.Core](https://github.com/NewLifeX/X)           | 2002  | 核心库，日志、配置、缓存、网络、序列化、APM性能追踪                                         |
-|    [NewLife.XCode](https://github.com/NewLifeX/NewLife.XCode)    | 2005  | 大数据中间件，单表百亿级，MySql/SQLite/SqlServer/Oracle/PostgreSql/达梦，自动分表，读写分离 |
-|      [NewLife.Net](https://github.com/NewLifeX/NewLife.Net)      | 2005  | 网络库，单机千万级吞吐率（2266万tps），单机百万级连接（400万Tcp长连接）                     |
-| [NewLife.Remoting](https://github.com/NewLifeX/NewLife.Remoting) | 2011  | 协议通信库，提供CS应用通信框架，支持Http/RPC通信框架，高吞吐，物联网设备低开销易接入        |
-|     [NewLife.Cube](https://github.com/NewLifeX/NewLife.Cube)     | 2010  | 魔方快速开发平台，集成了用户权限、SSO登录、OAuth服务端等，单表100亿级项目验证               |
-|    [NewLife.Agent](https://github.com/NewLifeX/NewLife.Agent)    | 2008  | 服务管理组件，把应用安装成为操作系统守护进程，Windows服务、Linux的Systemd                   |
-|     [NewLife.Zero](https://github.com/NewLifeX/NewLife.Zero)     | 2020  | Zero零代脚手架，基于NewLife组件生态的项目模板NewLife.Templates，Web、WebApi、Service        |
-|                              中间件                              |       | 对接知名中间件平台                                                                          |
-|    [NewLife.Redis](https://github.com/NewLifeX/NewLife.Redis)    | 2017  | Redis客户端，微秒级延迟，百万级吞吐，丰富的消息队列，百亿级数据量项目验证                   |
-| [NewLife.RocketMQ](https://github.com/NewLifeX/NewLife.RocketMQ) | 2018  | RocketMQ纯托管客户端，支持Apache RocketMQ和阿里云消息队列，十亿级项目验                     |
-|     [NewLife.MQTT](https://github.com/NewLifeX/NewLife.MQTT)     | 2019  | 物联网消息协议，MqttClient/MqttServer，客户端支持阿里云物联网                               |
-|      [NewLife.IoT](https://github.com/NewLifeX/NewLife.IoT)      | 2022  | IoT标准库，定义物联网领域的各种通信协议标准规范                                             |
-|   [NewLife.Modbus](https://github.com/NewLifeX/NewLife.Modbus)   | 2022  | ModbusTcp/ModbusRTU/ModbusASCII，基于IoT标准库实现，支持ZeroIoT平台和IoTEdge网关            |
-|  [NewLife.Siemens](https://github.com/NewLifeX/NewLife.Siemens)  | 2022  | 西门子PLC协议，基于IoT标准库实现，支持IoT平台和IoTEdge                                      |
-|      [NewLife.Map](https://github.com/NewLifeX/NewLife.Map)      | 2022  | 地图组件库，封装百度地图、高德地图、腾讯地图、天地图                                        |
-|    [NewLife.Audio](https://github.com/NewLifeX/NewLife.Audio)    | 2023  | 音频编解码库，PCM/ADPCMA/G711A/G722U/WAV/AAC                                                |
-|                             产品平台                             |       | 产品平台级，编译部署即用，个性化自定义                                                      |
-|         [Stardust](https://github.com/NewLifeX/Stardust)         | 2018  | 星尘，分布式服务平台，节点管理、APM监控中心、配置中心、注册中心、发布中心                   |
-|           [AntJob](https://github.com/NewLifeX/AntJob)           | 2019  | 蚂蚁调度，分布式大数据计算平台（实时/离线），蚂蚁搬家分片思想，万亿级数据量项目验证         |
-|      [NewLife.ERP](https://github.com/NewLifeX/NewLife.ERP)      | 2021  | 企业ERP，产品管理、客户管理、销售管理、供应商管理                                           |
-|         [CrazyCoder](https://github.com/NewLifeX/XCoder)         | 2006  | 码神工具，众多开发者工具，网络、串口、加解密、正则表达式、Modbus、MQTT                      |
-|           [EasyIO](https://github.com/NewLifeX/EasyIO)           | 2023  | 简易文件存储，支持分布式系统中文件集中存储。                                                |
-|           [XProxy](https://github.com/NewLifeX/XProxy)           | 2005  | 产品级反向代理，NAT代理、Http代理                                                           |
-|        [HttpMeter](https://github.com/NewLifeX/HttpMeter)        | 2022  | Http压力测试工具                                                                            |
-|         [GitCandy](https://github.com/NewLifeX/GitCandy)         | 2015  | Git源代码管理系统                                                                           |
-|          [SmartOS](https://github.com/NewLifeX/SmartOS)          | 2014  | 嵌入式操作系统，完全独立自主，支持ARM Cortex-M芯片架构                                      |
-|          [SmartA2](https://github.com/NewLifeX/SmartA2)          | 2019  | 嵌入式工业计算机，物联网边缘网关，高性能.NET8主机，应用于工业、农业、交通、医疗             |
-|                          FIoT物联网平台                          | 2020  | 物联网整体解决方案，建筑、环保、农业，软硬件及大数据分析一体化，单机十万级点位项目验证      |
-|                        UWB高精度室内定位                         | 2020  | 厘米级（10~20cm）高精度室内定位，软硬件一体化，与其它系统联动，大型展厅项目验证             |
-
-## 新生命开发团队
-
-![XCode](https://newlifex.com/logo.png)  
-
-新生命团队（NewLife）成立于2002年，是新时代物联网行业解决方案提供者，致力于提供软硬件应用方案咨询、系统架构规划与开发服务。  
-团队主导的80多个开源项目已被广泛应用于各行业，Nuget累计下载量高达400余万次。  
-团队开发的大数据中间件NewLife.XCode、蚂蚁调度计算平台AntJob、星尘分布式平台Stardust、缓存队列组件NewLife.Redis以及物联网平台FIoT，均成功应用于电力、高校、互联网、电信、交通、物流、工控、医疗、文博等行业，为客户提供了大量先进、可靠、安全、高质量、易扩展的产品和系统集成服务。  
-
-我们将不断通过服务的持续改进，成为客户长期信赖的合作伙伴，通过不断的创新和发展，成为国内优秀的IoT服务供应商。  
-
-`新生命团队始于2002年，部分开源项目具有20年以上漫长历史，源码库保留有2010年以来所有修改记录`  
-网站：<https://newlifex.com>  
-开源：<https://github.com/newlifex>  
-QQ群：1600800/1600838  
-微信公众号：  
-![智能大石头](https://newlifex.com/stone.jpg)  
+- 后台报表导出
+- 文档批量导入导出
+- 旧版 Office 二进制格式解析
+- 邮件、日历、联系人、电子书等结构化文档处理
+- 轻量级文档格式转换与内容提取
