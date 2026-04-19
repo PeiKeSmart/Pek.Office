@@ -1,6 +1,6 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
+    <TargetFrameworks>net45;netstandard2.0;netstandard2.1</TargetFrameworks>
     <OutputType>Library</OutputType>
     <RootNamespace>Pek.Office</RootNamespace>
     <AssemblyTitle>办公自动化库</AssemblyTitle>
@@ -45,11 +45,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="DH.NCore" Version="4.22.2026.412-beta0524" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.202">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
-    <PackageReference Include="Pek.Common" Version="4.22.2026.416-beta1017" />
   </ItemGroup>
 
   <ItemGroup>
