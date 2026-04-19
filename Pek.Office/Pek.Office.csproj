@@ -28,18 +28,18 @@
     <PackageId>$(AssemblyName)</PackageId>
     <Authors>$(Company)</Authors>
     <MaintainerEmail>berin@peksmart.net</MaintainerEmail>
-    <PackageProjectUrl>https://www.haocoding.com/</PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/PeiKeSmart/Pek.Office</PackageProjectUrl>
     <PackageIcon>DH.png</PackageIcon>
-    <RepositoryUrl>https://github.com/PeiKeSmart/Pek.AspNetCore</RepositoryUrl>
+    <RepositoryUrl>https://github.com/PeiKeSmart/Pek.Office</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>湖北登灏科技有限公司;DH组件;DH;$(AssemblyName)</PackageTags>
+    <PackageTags>湖北登灏科技有限公司;DH组件;DH;PeiKeSmart;Pek;Office;Excel;Word;PDF;Markdown;$(AssemblyName)</PackageTags>
     <PackageReleaseNotes></PackageReleaseNotes>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-    <PackageReadmeFile></PackageReadmeFile>
+    <PackageReadmeFile>Readme.MD</PackageReadmeFile>
     <AllowedOutputExtensionsInPackageBuildOutputFolder>$(AllowedOutputExtensionsInPackageBuildOutputFolder);.pdb</AllowedOutputExtensionsInPackageBuildOutputFolder>
     <!--<GeneratePackageOnBuild>true</GeneratePackageOnBuild>-->
   </PropertyGroup>
@@ -54,6 +54,7 @@
 
   <ItemGroup>
     <Content Include="..\Doc\DH.png" Link="DH.png" PackagePath="\" />
+    <None Include="..\Readme.MD" Link="Readme.MD" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

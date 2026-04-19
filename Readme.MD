@@ -2,7 +2,7 @@
 
 Pek.Office 是一个面向 .NET 的办公文档处理库，当前仓库覆盖 Excel、Word、PowerPoint、PDF、Markdown、RTF、ODS、EML、MSG、iCalendar、vCard、EPUB、XPS 等常见办公与文档格式。
 
-项目当前 NuGet 包名为 Pek.Office，公开 API 主要位于 NewLife.Office 命名空间。
+项目当前 NuGet 包名为 Pek.Office。由于历史兼容原因，公开 API 仍主要位于 NewLife.Office 命名空间，README 中涉及该命名空间的示例均以当前源码为准。
 
 ## 项目定位
 

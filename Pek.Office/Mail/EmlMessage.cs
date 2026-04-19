@@ -3,7 +3,7 @@ namespace NewLife.Office;
 /// <summary>EML 邮件消息（RFC 5322 + MIME）</summary>
 /// <remarks>
 /// 表示一封完整的 EML 格式邮件，包含头部字段、正文和附件。
-/// 支持 text/plain、text/html 正文和 multipart/* 结构。
+/// 支持 text/plain、text/html 正文和 multipart 结构。
 /// </remarks>
 public class EmlMessage
 {
@@ -62,7 +62,7 @@ public class EmlAttachment
     /// <summary>Content-Type（如 application/octet-stream、image/png）</summary>
     public String ContentType { get; set; } = "application/octet-stream";
 
-    /// <summary>Content-ID（内嵌图片引用标识，带 <> 括号）</summary>
+    /// <summary>Content-ID（内嵌图片引用标识，带尖括号）</summary>
     public String? ContentId { get; set; }
 
     /// <summary>二进制内容</summary>
