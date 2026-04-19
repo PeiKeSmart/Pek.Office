@@ -20,11 +20,11 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.5" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
-    <PackageReference Include="NewLife.Core" Version="11.14.2026.402" />
-    <PackageReference Include="NewLife.UnitTest" Version="1.1.2026.102" />
-    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.5" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.6" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.4.0" />
+    <PackageReference Include="DH.NCore" Version="4.22.2026.412-beta0524" />
+    <PackageReference Include="DH.UnitTest" Version="4.21.2026.304-beta0007" />
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.6" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
       <PrivateAssets>all</PrivateAssets>
