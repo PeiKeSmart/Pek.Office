@@ -33,7 +33,7 @@
     <RepositoryUrl>https://github.com/PeiKeSmart/Pek.Office</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>湖北登灏科技有限公司;DH组件;DH;PeiKeSmart;Pek;Office;Excel;Word;PDF;Markdown;$(AssemblyName)</PackageTags>
-    <PackageReleaseNotes></PackageReleaseNotes>
+    <PackageReleaseNotes>新增 ITextExtractable/IMarkdownExtractable 统一文本提取接口；全格式覆盖，Excel/Word/PPT/PDF/RTF/ODS/EML/iCal/vCard/EPUB/XPS 均实现接口；OfficeFactory 新增 ReadText() 和 ReadMarkdown() 一行提取静态方法</PackageReleaseNotes>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
