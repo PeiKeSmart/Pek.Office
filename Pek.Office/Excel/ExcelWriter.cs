@@ -3,7 +3,7 @@ using System.Data;
 using System.Reflection;
 using System.Text;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Excel;
 
 /// <summary>轻量级Excel写入器，支持多个工作表</summary>
 /// <remarks>
@@ -13,8 +13,8 @@ namespace NewLife.Office;
 public partial class ExcelWriter : DisposeBase
 {
     #region 内部类型
-    /// <summary>单元格样式（值为 Excel 内置 numFmtId）。</summary>
-    private enum ExcelCellStyle : Int32
+    /// <summary>单元格数字格式样式（值为 Excel 内置 numFmtId）。</summary>
+    private enum NumFmtStyle : Int32
     {
         General = 0,  // General
         Integer = 1,  // 0 （整数，避免长整型使用科学计数）
@@ -25,12 +25,17 @@ public partial class ExcelWriter : DisposeBase
         DateTime = 22 // m/d/yy h:mm
     }
 
-    private static readonly ExcelCellStyle[] _cellStyles = (ExcelCellStyle[])Enum.GetValues(typeof(ExcelCellStyle));
+    private static readonly NumFmtStyle[] _cellFormats = (NumFmtStyle[])Enum.GetValues(typeof(NumFmtStyle));
 
-    private record FontEntry(String? Name, Double Size, Boolean Bold, Boolean Italic, Boolean Underline, String? Color);
-    private record FillEntry(String? BgColor, String PatternType);
-    private record BorderEntry(CellBorderStyle Style, String? Color);
-    private record XfEntry(Int32 NumFmtId, Int32 FontId, Int32 FillId, Int32 BorderId, HorizontalAlignment HAlign, VerticalAlignment VAlign, Boolean WrapText);
+    private record FontEntry(String? Name, Double Size, Boolean Bold, Boolean Italic, Boolean Underline, String? Color, Boolean Strike, String? VerticalAlign);
+    private record FillEntry(String? BgColor, String PatternType, String? GradientType = null, String? GradientColor1 = null, String? GradientColor2 = null, String? PatternFgColor = null, String? PatternTypeName = null);
+    private record BorderEntry(
+        BorderStyle Left, String? LeftColor,
+        BorderStyle Right, String? RightColor,
+        BorderStyle Top, String? TopColor,
+        BorderStyle Bottom, String? BottomColor,
+        BorderStyle Diagonal = BorderStyle.None, String? DiagonalColor = null);
+    private record XfEntry(Int32 NumFmtId, Int32 FontId, Int32 FillId, Int32 BorderId, HorizontalAlignment HAlign, VerticalAlignment VAlign, Boolean WrapText, Int32 TextRotation, Int32 Indent, Boolean ShrinkToFit);
 
     private class SheetHyperlink
     {
@@ -58,6 +63,13 @@ public partial class ExcelWriter : DisposeBase
         public String Extension { get; set; } = "png";
         public Double Width { get; set; }
         public Double Height { get; set; }
+        public Int64 FromColOff { get; set; }
+        public Int64 FromRowOff { get; set; }
+        public Int32 ToRow { get; set; } = -1;
+        public Int32 ToCol { get; set; } = -1;
+        public Int64 ToColOff { get; set; }
+        public Int64 ToRowOff { get; set; }
+        public String EditAs { get; set; } = "oneCell";
     }
 
     private class SheetPageSetup
@@ -77,10 +89,20 @@ public partial class ExcelWriter : DisposeBase
     private class ConditionalFormatEntry
     {
         public String Range { get; set; } = null!;
-        public ConditionalFormatType Type { get; set; }
+        public ConditionalFormatValues Type { get; set; }
         public String? Value { get; set; }
         public String? Value2 { get; set; }
         public String? Color { get; set; }
+        /// <summary>字体颜色（RGB十六进制，dxf 字体样式）</summary>
+        public String? FontColor { get; set; }
+        /// <summary>边框颜色（RGB十六进制，dxf 边框样式）</summary>
+        public String? BorderColor { get; set; }
+        /// <summary>是否加粗（dxf 字体样式）</summary>
+        public Boolean IsBold { get; set; }
+        /// <summary>图标集类型名（如 "3Arrows"、"3Flags"、"5Rating"），仅 IconSet 使用</summary>
+        public String? IconSetType { get; set; }
+        /// <summary>自定义公式字符串（不含 = 号），仅 Expression 使用</summary>
+        public String? Formula { get; set; }
     }
 
     private class SheetComment
@@ -89,6 +111,40 @@ public partial class ExcelWriter : DisposeBase
         public Int32 Col { get; set; }   // 0-based
         public String Text { get; set; } = null!;
         public String Author { get; set; } = String.Empty;
+
+        /// <summary>富文本段（非空时优先于 Text 输出）</summary>
+        public List<CommentSegment>? Segments { get; set; }
+
+        /// <summary>批注框宽度（磅）</summary>
+        public Double Width { get; set; } = 108;
+
+        /// <summary>批注框高度（磅）</summary>
+        public Double Height { get; set; } = 59.25;
+
+        /// <summary>是否可见（默认隐藏）</summary>
+        public Boolean Visible { get; set; }
+
+        /// <summary>批注框左边距（磅）</summary>
+        public Double Left { get; set; } = 59.25;
+
+        /// <summary>批注框上边距（磅）</summary>
+        public Double Top { get; set; } = 1.5;
+    }
+
+    /// <summary>Excel 文档属性（写入 docProps/core.xml）</summary>
+    public class ExcelDocumentProperties
+    {
+        /// <summary>标题</summary>
+        public String? Title { get; set; }
+
+        /// <summary>作者/创建者</summary>
+        public String? Creator { get; set; }
+
+        /// <summary>主题</summary>
+        public String? Subject { get; set; }
+
+        /// <summary>描述</summary>
+        public String? Description { get; set; }
     }
     #endregion
 
@@ -101,6 +157,9 @@ public partial class ExcelWriter : DisposeBase
 
     /// <summary>默认工作表名称（当调用 API 未指定 sheet 时使用）</summary>
     public String SheetName { get; set; } = "Sheet1";
+
+    /// <summary>文档属性</summary>
+    public ExcelDocumentProperties? DocumentProperties { get; set; }
 
     /// <summary>文本编码</summary>
     public Encoding Encoding { get; set; } = Encoding.UTF8;
@@ -123,9 +182,9 @@ public partial class ExcelWriter : DisposeBase
     private Int32 _sharedCount; // 总引用次数（含重复）
 
     // 样式管理（字体/填充/边框/XF 去重）
-    private readonly List<FontEntry> _fonts = [new(null, 0, false, false, false, null)]; // index 0 = 默认字体
+    private readonly List<FontEntry> _fonts = [new(null, 0, false, false, false, null, false, null)]; // index 0 = 默认字体
     private readonly List<FillEntry> _fills = [new(null, "none"), new(null, "gray125")]; // 0=none, 1=gray125 (Excel 要求)
-    private readonly List<BorderEntry> _borders = [new(CellBorderStyle.None, null)]; // index 0 = 无边框
+    private readonly List<BorderEntry> _borders = [new(BorderStyle.None, null, BorderStyle.None, null, BorderStyle.None, null, BorderStyle.None, null)]; // index 0 = 无边框
     private readonly Dictionary<String, Int32> _numFmtMap = new(StringComparer.Ordinal); // formatCode → numFmtId
     private Int32 _nextNumFmtId = 164; // 自定义 numFmt 从 164 开始
     private readonly List<XfEntry> _xfEntries;
@@ -137,8 +196,31 @@ public partial class ExcelWriter : DisposeBase
     private readonly Dictionary<String, (Int32 Rows, Int32 Cols)> _sheetFreezes = new(StringComparer.OrdinalIgnoreCase);
     // 自动筛选：sheet -> ref ("A1:F1")
     private readonly Dictionary<String, String> _sheetAutoFilters = new(StringComparer.OrdinalIgnoreCase);
+    // 是否显示网格线：sheet -> 是否显示（仅存隐藏状态）
+    private readonly Dictionary<String, Boolean> _sheetGridlines = new(StringComparer.OrdinalIgnoreCase);
+    // 视图缩放：sheet -> 缩放比例（百分比）
+    private readonly Dictionary<String, Int32> _sheetZooms = new(StringComparer.OrdinalIgnoreCase);
+    // 默认行高：sheet -> 磅值
+    private readonly Dictionary<String, Double> _sheetDefaultRowHeights = new(StringComparer.OrdinalIgnoreCase);
     // 行高：sheet -> { rowIndex(1基) -> height }
     private readonly Dictionary<String, Dictionary<Int32, Double>> _sheetRowHeights = new(StringComparer.OrdinalIgnoreCase);
+    // 列大纲：sheet -> { colIndex(0基) -> (level, collapsed) }
+    private readonly Dictionary<String, Dictionary<Int32, (Int32 Level, Boolean Collapsed)>> _sheetColOutlines = new(StringComparer.OrdinalIgnoreCase);
+    // 行大纲：sheet -> { rowIndex(1基) -> (level, collapsed) }
+    private readonly Dictionary<String, Dictionary<Int32, (Int32 Level, Boolean Collapsed)>> _sheetRowOutlines = new(StringComparer.OrdinalIgnoreCase);
+    // 隐藏行：sheet -> 行号集合（1基）
+    private readonly Dictionary<String, HashSet<Int32>> _sheetHiddenRows = new(StringComparer.OrdinalIgnoreCase);
+    // 隐藏列：sheet -> 列号集合（0基）
+    private readonly Dictionary<String, HashSet<Int32>> _sheetHiddenCols = new(StringComparer.OrdinalIgnoreCase);
+    // 工作表标签颜色：sheet -> RGB六位十六进制
+    private readonly Dictionary<String, String> _sheetTabColors = new(StringComparer.OrdinalIgnoreCase);
+    // 工作簿保护密码哈希（null 表示不保护）
+    private String? _workbookProtectionHash;
+    private Boolean _workbookLockStructure;
+    private Boolean _workbookLockWindows;
+
+    // 图表：sheet → 图表列表
+    private readonly Dictionary<String, List<ExcelChart>> _sheetCharts = new(StringComparer.OrdinalIgnoreCase);
     // 超链接
     private readonly Dictionary<String, List<SheetHyperlink>> _sheetHyperlinks = new(StringComparer.OrdinalIgnoreCase);
     // 数据验证
@@ -149,10 +231,38 @@ public partial class ExcelWriter : DisposeBase
     private readonly Dictionary<String, SheetPageSetup> _sheetPageSetups = new(StringComparer.OrdinalIgnoreCase);
     // 工作表保护
     private readonly Dictionary<String, String?> _sheetProtection = new(StringComparer.OrdinalIgnoreCase);
+    // 工作表可见性：sheet → state ("visible"/"hidden"/"veryHidden")
+    private readonly Dictionary<String, String> _sheetStates = new(StringComparer.OrdinalIgnoreCase);
     // 条件格式
     private readonly Dictionary<String, List<ConditionalFormatEntry>> _sheetCondFormats = new(StringComparer.OrdinalIgnoreCase);
     // 批注
     private readonly Dictionary<String, List<SheetComment>> _sheetComments = new(StringComparer.OrdinalIgnoreCase);
+
+    // 线程化批注（M27，工作簿级，person 部件全局共享）
+    private readonly List<ThreadedComment> _threadedComments = [];
+
+    // 分页符：sheet → 行号列表（1基，此行开始新页）
+    private readonly Dictionary<String, List<Int32>> _sheetPageBreaks = new(StringComparer.OrdinalIgnoreCase);
+    // 垂直分页符：sheet → 列号列表（0基，此列开始新页）
+    private readonly Dictionary<String, List<Int32>> _sheetColPageBreaks = new(StringComparer.OrdinalIgnoreCase);
+
+    // 迷你图组：sheet → 迷你图组列表
+    private readonly Dictionary<String, List<SparklineGroup>> _sheetSparklineGroups = new(StringComparer.OrdinalIgnoreCase);
+
+    // 每单元格样式覆盖（0基行, 0基列）→ CellFormat
+    private readonly Dictionary<String, Dictionary<(Int32 Row, Int32 Col), CellFormat>> _cellFormatOverrides = new(StringComparer.OrdinalIgnoreCase);
+
+    // OtherParts 透传：Reader 收集的原始 ZIP 部件，Save 时原样写回
+    private Dictionary<String, Byte[]> _otherParts = [];
+
+    // 用户自定义命名范围（排除 _xlnm.* 系统名）
+    private readonly List<(String Name, String Formula)> _definedNames = [];
+
+    // 结构化表格：sheet → 表格列表
+    private readonly Dictionary<String, List<Table>> _sheetTables = new(StringComparer.OrdinalIgnoreCase);
+
+    // 切片器（M28）：列表，Save 时按表格解析列
+    private readonly List<ExcelSlicer> _slicers = [];
     #endregion
 
     #region 构造
@@ -172,21 +282,21 @@ public partial class ExcelWriter : DisposeBase
         _xfEntries = InitBuiltinXfEntries();
     }
 
-    /// <summary>销毁释放</summary>
+    /// <summary>销毁释放。仅显式 Dispose 时自动 Save，析构函数不写文件（GC 回收时托管资源可能已释放）</summary>
     /// <param name="disposing"></param>
     protected override void Dispose(Boolean disposing)
     {
         base.Dispose(disposing);
-        if (Stream == null) Save();
+        if (disposing && Stream == null) Save();
     }
 
     private static List<XfEntry> InitBuiltinXfEntries()
     {
         // 按 _cellStyles 枚举值升序，生成内置 XF 条目（全使用默认字体/填充/边框）
         var list = new List<XfEntry>();
-        foreach (var st in _cellStyles)
+        foreach (var st in _cellFormats)
         {
-            list.Add(new XfEntry((Int32)st, 0, 0, 0, HorizontalAlignment.General, VerticalAlignment.Top, false));
+            list.Add(new XfEntry((Int32)st, 0, 0, 0, HorizontalAlignment.General, VerticalAlignment.Top, false, 0, 0, false));
         }
         return list;
     }
@@ -211,7 +321,7 @@ public partial class ExcelWriter : DisposeBase
     /// <param name="sheet">工作表名称（可空，空时使用 <see cref="SheetName"/>）</param>
     /// <param name="headers">列头文本集合</param>
     /// <param name="style">表头单元格样式</param>
-    public void WriteHeader(String sheet, IEnumerable<String> headers, CellStyle? style)
+    public void WriteHeader(String sheet, IEnumerable<String> headers, CellFormat? style)
     {
         if (sheet.IsNullOrEmpty()) sheet = SheetName;
         if (headers == null) throw new ArgumentNullException(nameof(headers));
@@ -246,7 +356,7 @@ public partial class ExcelWriter : DisposeBase
     /// <param name="sheet">工作表名称（可空，空时使用 <see cref="SheetName"/>）</param>
     /// <param name="data">数据集合，每行一个对象数组</param>
     /// <param name="style">统一单元格样式</param>
-    public void WriteRows(String? sheet, IEnumerable<Object?[]> data, CellStyle? style)
+    public void WriteRows(String? sheet, IEnumerable<Object?[]> data, CellFormat? style)
     {
         if (data == null) throw new ArgumentNullException(nameof(data));
 
@@ -267,7 +377,7 @@ public partial class ExcelWriter : DisposeBase
     /// <param name="sheet">工作表名称（可空）</param>
     /// <param name="values">单行数据</param>
     /// <param name="style">单元格样式</param>
-    public void WriteRow(String? sheet, Object?[] values, CellStyle? style = null)
+    public void WriteRow(String? sheet, Object?[] values, CellFormat? style = null)
     {
         if (sheet.IsNullOrEmpty()) sheet = SheetName;
         EnsureSheet(sheet);
@@ -349,6 +459,38 @@ public partial class ExcelWriter : DisposeBase
         _sheetAutoFilters[sheet] = range;
     }
 
+    /// <summary>设置是否显示网格线（默认显示）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="show">是否显示网格线</param>
+    public void SetGridlines(String? sheet, Boolean show)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        _sheetGridlines[sheet] = show;
+    }
+
+    /// <summary>设置视图缩放比例（百分比，10-400）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="zoom">缩放比例（如 150 表示 150%）</param>
+    public void SetZoomScale(String? sheet, Int32 zoom)
+    {
+        if (zoom is < 10 or > 400) throw new ArgumentOutOfRangeException(nameof(zoom));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        _sheetZooms[sheet] = zoom;
+    }
+
+    /// <summary>设置默认行高（磅值，影响未指定行高的行）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="height">默认行高（磅值）</param>
+    public void SetDefaultRowHeight(String? sheet, Double height)
+    {
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        _sheetDefaultRowHeights[sheet] = height;
+    }
+
     /// <summary>设置行高</summary>
     /// <param name="sheet">工作表名称（可空）</param>
     /// <param name="row">行号（1基）</param>
@@ -365,6 +507,121 @@ public partial class ExcelWriter : DisposeBase
             _sheetRowHeights[sheet] = dict;
         }
         dict[row] = height;
+    }
+
+    /// <summary>隐藏指定行（1基行号，与 Excel 一致）。需在 Save 之前调用。</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="row">行号（1基）</param>
+    public void SetRowHidden(String? sheet, Int32 row)
+    {
+        if (row < 1) throw new ArgumentOutOfRangeException(nameof(row));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!_sheetHiddenRows.TryGetValue(sheet, out var set))
+        {
+            set = [];
+            _sheetHiddenRows[sheet] = set;
+        }
+        set.Add(row);
+    }
+
+    /// <summary>隐藏指定列（0基列号）。需在 Save 之前调用。</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="columnIndex">列号（0基）</param>
+    public void SetColumnHidden(String? sheet, Int32 columnIndex)
+    {
+        if (columnIndex < 0) throw new ArgumentOutOfRangeException(nameof(columnIndex));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!_sheetHiddenCols.TryGetValue(sheet, out var set))
+        {
+            set = [];
+            _sheetHiddenCols[sheet] = set;
+        }
+        set.Add(columnIndex);
+    }
+
+    /// <summary>设置列大纲/分组级别（用于折叠展开列）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="columnIndex">列号（0基）</param>
+    /// <param name="level">大纲级别（1-8，0 表示取消分组）</param>
+    /// <param name="collapsed">是否默认折叠</param>
+    public void SetColumnOutlineLevel(String? sheet, Int32 columnIndex, Int32 level, Boolean collapsed = false)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!_sheetColOutlines.TryGetValue(sheet, out var dict))
+        {
+            dict = [];
+            _sheetColOutlines[sheet] = dict;
+        }
+        dict[columnIndex] = (level, collapsed);
+    }
+
+    /// <summary>设置行大纲/分组级别（用于折叠展开行）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="row">行号（1基）</param>
+    /// <param name="level">大纲级别（1-8，0 表示取消分组）</param>
+    /// <param name="collapsed">是否默认折叠</param>
+    public void SetRowOutlineLevel(String? sheet, Int32 row, Int32 level, Boolean collapsed = false)
+    {
+        if (row < 1) throw new ArgumentOutOfRangeException(nameof(row));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!_sheetRowOutlines.TryGetValue(sheet, out var dict))
+        {
+            dict = [];
+            _sheetRowOutlines[sheet] = dict;
+        }
+        dict[row] = (level, collapsed);
+    }
+
+    /// <summary>设置工作表标签颜色</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="color">RGB 六位十六进制（如 "FF0000"），null 表示清除颜色</param>
+    public void SetSheetTabColor(String? sheet, String? color)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (color.IsNullOrEmpty())
+            _sheetTabColors.Remove(sheet!);
+        else
+            _sheetTabColors[sheet!] = color!;
+    }
+
+    /// <summary>设置工作簿保护（防止结构/窗口被修改）</summary>
+    /// <param name="password">保护密码（null 表示无密码保护）</param>
+    /// <param name="lockStructure">是否锁定工作表结构（添加/移动/删除/重命名）</param>
+    /// <param name="lockWindows">是否锁定窗口位置和大小</param>
+    public void ProtectWorkbook(String? password, Boolean lockStructure = true, Boolean lockWindows = false)
+    {
+        _workbookLockStructure = lockStructure;
+        _workbookLockWindows = lockWindows;
+        if (password.IsNullOrEmpty())
+        {
+            _workbookProtectionHash = String.Empty; // 无密码但启用保护
+        }
+        else
+        {
+            // 使用 xor + count 算法（与 Excel 97-2003 兼容的简单哈希）
+            // 注：xlsx 实际支持更安全的哈希算法，这里使用最简单的兼容实现
+            _workbookProtectionHash = ComputeXorHash(password!);
+        }
+    }
+
+    private static String ComputeXorHash(String password)
+    {
+        // Excel 97-2003 式密码保护哈希（xor 算法），与 ProtectSheet 复用同一实现
+        var hash = 0;
+        if (password.Length == 0) return "0000";
+        for (var i = password.Length - 1; i >= 0; i--)
+        {
+            hash = ((hash >> 14) & 0x01) | ((hash << 1) & 0x7fff);
+            hash ^= password[i];
+        }
+        hash = ((hash >> 14) & 0x01) | ((hash << 1) & 0x7fff);
+        hash ^= (password.Length + 0x8000);
+        return hash.ToString("X4");
     }
     #endregion
 
@@ -454,6 +711,14 @@ public partial class ExcelWriter : DisposeBase
     /// <param name="heightPx">图片高度（像素）</param>
     public void AddImage(String? sheet, Int32 row, Int32 col, Byte[] imageData, String extension = "png", Double widthPx = 100, Double heightPx = 100)
     {
+        AddImage(sheet, row, col, imageData, extension, widthPx, heightPx, 0, 0, -1, -1, 0, 0, "oneCell");
+    }
+
+    /// <summary>插入图片（完整锚点信息）</summary>
+    private void AddImage(String? sheet, Int32 fromRow, Int32 fromCol, Byte[] imageData, String extension,
+        Double widthPx, Double heightPx, Int64 fromColOff, Int64 fromRowOff,
+        Int32 toRow, Int32 toCol, Int64 toColOff, Int64 toRowOff, String editAs)
+    {
         if (imageData == null || imageData.Length == 0) throw new ArgumentNullException(nameof(imageData));
         if (sheet.IsNullOrEmpty()) sheet = SheetName;
         EnsureSheet(sheet);
@@ -463,7 +728,16 @@ public partial class ExcelWriter : DisposeBase
             list = [];
             _sheetImages[sheet] = list;
         }
-        list.Add(new SheetImage { Row = row, Col = col, Data = imageData, Extension = extension.ToLower().TrimStart('.'), Width = widthPx, Height = heightPx });
+        list.Add(new SheetImage
+        {
+            Row = fromRow, Col = fromCol,
+            Data = imageData, Extension = extension.ToLower().TrimStart('.'),
+            Width = widthPx, Height = heightPx,
+            FromColOff = fromColOff, FromRowOff = fromRowOff,
+            ToRow = toRow, ToCol = toCol,
+            ToColOff = toColOff, ToRowOff = toRowOff,
+            EditAs = editAs,
+        });
     }
     #endregion
 
@@ -524,6 +798,209 @@ public partial class ExcelWriter : DisposeBase
         ps.PrintTitleEndRow = endRow;
     }
 
+    /// <summary>添加用户自定义命名范围</summary>
+    /// <param name="name">名称（须符合 Excel 命名规则，不可以 _xlnm. 开头）</param>
+    /// <param name="formula">公式或范围引用（如 "Sheet1!$A$1:$B$10" 或 "'数据'!$C:$C"）</param>
+    public void AddDefinedName(String name, String formula)
+    {
+        if (name.IsNullOrEmpty()) throw new ArgumentNullException(nameof(name));
+        if (formula.IsNullOrEmpty()) throw new ArgumentNullException(nameof(formula));
+        _definedNames.Add((name, formula));
+    }
+
+    /// <summary>按名称获取已添加的命名范围公式</summary>
+    /// <param name="name">命名范围名称（大小写不敏感）</param>
+    /// <returns>范围公式字符串，未找到返回 null</returns>
+    public String? GetRangeByName(String name)
+    {
+        if (name.IsNullOrEmpty()) return null;
+        foreach (var (n, f) in _definedNames)
+        {
+            if (n.EqualIgnoreCase(name)) return f;
+        }
+        return null;
+    }
+
+    /// <summary>设置打印区域</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="range">区域引用（如 "A1:F50"）</param>
+    public void SetPrintArea(String? sheet, String range)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!range.Contains('!'))
+            range = $"'{sheet}'!{range}";
+        _definedNames.RemoveAll(dn => dn.Name.EqualIgnoreCase("_xlnm.Print_Area") && dn.Formula.Contains($"'{sheet}'!"));
+        AddDefinedName("_xlnm.Print_Area", range);
+    }
+
+    /// <summary>添加迷你图组（行内微型图表）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="dataRange">数据区域（如 "Sheet1!B2:F2"）</param>
+    /// <param name="cellRange">放置迷你图的单元格区域（如 "Sheet1!G2:G2"）</param>
+    /// <param name="type">类型：line/column/stacked</param>
+    /// <param name="lineColor">线条/柱颜色（16进制RGB）</param>
+    /// <param name="markerColor">标记点颜色（可空）</param>
+    /// <returns>迷你图组对象</returns>
+    public SparklineGroup AddSparklineGroup(String? sheet, String dataRange, String cellRange, String type = "line", String? lineColor = "FF0000", String? markerColor = null)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        var sg = new SparklineGroup
+        {
+            Type = type,
+            DataRange = dataRange,
+            CellRange = cellRange,
+            LineColor = lineColor ?? "FF0000",
+            MarkerColor = markerColor
+        };
+        if (!_sheetSparklineGroups.TryGetValue(sheet, out var list))
+            _sheetSparklineGroups[sheet] = list = [];
+        list.Add(sg);
+        return sg;
+    }
+
+    /// <summary>迷你图组定义</summary>
+    public class SparklineGroup
+    {
+        /// <summary>类型：line/column/stacked</summary>
+        public String Type { get; set; } = "line";
+        /// <summary>数据区域</summary>
+        public String DataRange { get; set; } = String.Empty;
+        /// <summary>放置单元格区域</summary>
+        public String CellRange { get; set; } = String.Empty;
+        /// <summary>线条/柱颜色（16进制RGB）</summary>
+        public String LineColor { get; set; } = "FF0000";
+        /// <summary>标记点颜色</summary>
+        public String? MarkerColor { get; set; }
+    }
+
+    /// <summary>设置水平分页符</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="row">分页符所在行（1基，此行开始新页）</param>
+    public void SetPageBreak(String? sheet, Int32 row)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!_sheetPageBreaks.TryGetValue(sheet, out var breaks))
+            _sheetPageBreaks[sheet] = breaks = [];
+        if (!breaks.Contains(row))
+            breaks.Add(row);
+    }
+
+    /// <summary>设置垂直分页符</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="col">分页符所在列（1基，此列开始新页）</param>
+    public void SetColumnPageBreak(String? sheet, Int32 col)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!_sheetColPageBreaks.TryGetValue(sheet, out var breaks))
+            _sheetColPageBreaks[sheet] = breaks = [];
+        if (!breaks.Contains(col))
+            breaks.Add(col);
+    }
+
+    /// <summary>在当前工作表中添加结构化表格（OOXML table 元素）</summary>
+    /// <param name="range">表格范围（Excel 记法，如 "A1:E10"，含表头行）</param>
+    /// <param name="name">表格名称（同时作为表格引用标识）</param>
+    /// <param name="style">表格样式名称（如 "TableStyleMedium9"，默认不传时使用 Medium9）</param>
+    /// <param name="columnNames">列名集合；null 时从范围列位置自动生成 Column1/Column2...</param>
+    public void AddTable(String range, String name, String? style = null, String[]? columnNames = null)
+    {
+        if (range.IsNullOrEmpty()) throw new ArgumentNullException(nameof(range));
+        if (name.IsNullOrEmpty()) throw new ArgumentNullException(nameof(name));
+        EnsureSheet(SheetName);
+        if (!_sheetTables.TryGetValue(SheetName, out var tables))
+        {
+            tables = [];
+            _sheetTables[SheetName] = tables;
+        }
+        tables.Add(new Table
+        {
+            Range = range,
+            Name = name,
+            StyleName = style ?? "TableStyleMedium9",
+            ColumnNames = columnNames,
+        });
+    }
+
+    /// <summary>为结构化表格的指定列添加切片器（M28，Excel 2010+ 快速筛选）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="tableName">关联的结构化表格名称</param>
+    /// <param name="columnName">筛选字段列名（表格中的列名）</param>
+    /// <param name="caption">切片器显示标题（默认取列名）</param>
+    /// <param name="style">切片器样式（默认 SlicerStyleLight1）</param>
+    /// <returns>切片器对象（含自动生成的名称）</returns>
+    /// <exception cref="ArgumentNullException">tableName 或 columnName 为空</exception>
+    public ExcelSlicer AddSlicer(String? sheet, String tableName, String columnName, String? caption = null, String? style = null)
+    {
+        if (tableName.IsNullOrEmpty()) throw new ArgumentNullException(nameof(tableName));
+        if (columnName.IsNullOrEmpty()) throw new ArgumentNullException(nameof(columnName));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+
+        var slicer = new ExcelSlicer
+        {
+            Sheet = sheet,
+            TableName = tableName,
+            ColumnName = columnName,
+            Caption = caption ?? columnName,
+            Style = style ?? "SlicerStyleLight1",
+            Name = $"切片器_{columnName}",
+        };
+        // 名称去重
+        var idx = 2;
+        var baseName = slicer.Name;
+        while (_slicers.Any(s => s.Name == slicer.Name))
+            slicer.Name = $"{baseName}{idx++}";
+
+        _slicers.Add(slicer);
+        return slicer;
+    }
+
+    /// <summary>在指定工作表中添加结构化表格（OOXML table 元素）</summary>
+    /// <param name="sheet">工作表名称</param>
+    /// <param name="range">表格范围</param>
+    /// <param name="name">表格名称</param>
+    /// <param name="style">表格样式名称</param>
+    /// <param name="columnNames">列名集合</param>
+    public void AddTable(String sheet, String range, String name, String? style = null, String[]? columnNames = null)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        if (range.IsNullOrEmpty()) throw new ArgumentNullException(nameof(range));
+        if (name.IsNullOrEmpty()) throw new ArgumentNullException(nameof(name));
+        EnsureSheet(sheet);
+        if (!_sheetTables.TryGetValue(sheet, out var tables))
+        {
+            tables = [];
+            _sheetTables[sheet] = tables;
+        }
+        tables.Add(new Table
+        {
+            Range = range,
+            Name = name,
+            StyleName = style ?? "TableStyleMedium9",
+            ColumnNames = columnNames,
+        });
+    }
+
+    /// <summary>添加图表到工作表</summary>
+    /// <param name="sheet">工作表名称（可空，空时用当前工作表）</param>
+    /// <param name="chart">图表定义对象</param>
+    public void AddChart(String? sheet, ExcelChart chart)
+    {
+        if (chart == null) throw new ArgumentNullException(nameof(chart));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!_sheetCharts.TryGetValue(sheet, out var charts))
+        {
+            charts = [];
+            _sheetCharts[sheet] = charts;
+        }
+        charts.Add(chart);
+    }
+
     private SheetPageSetup GetOrCreatePageSetup(String sheet)
     {
         if (!_sheetPageSetups.TryGetValue(sheet, out var ps))
@@ -545,11 +1022,30 @@ public partial class ExcelWriter : DisposeBase
         EnsureSheet(sheet);
         _sheetProtection[sheet] = password;
     }
+
+    /// <summary>设置工作表可见性</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="veryHidden">true=深度隐藏（仅 VBA 可取消隐藏），false=普通隐藏（用户可从 UI 取消隐藏）</param>
+    public void HideSheet(String? sheet, Boolean veryHidden = false)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        _sheetStates[sheet] = veryHidden ? "veryHidden" : "hidden";
+    }
+
+    /// <summary>恢复工作表可见</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    public void UnhideSheet(String? sheet)
+    {
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        _sheetStates.Remove(sheet);
+    }
     #endregion
 
     #region 公式
     /// <summary>在指定行写入公式单元格（与 WriteRow 配合使用）</summary>
-    /// <remarks>更简单的方式是在 WriteRow 的 values 数组中直接传入 <see cref="ExcelFormula"/> 实例。</remarks>
+    /// <remarks>更简单的方式是在 WriteRow 的 values 数组中直接传入 <see cref="CellFormula"/> 实例。</remarks>
     /// <param name="sheet">工作表名称（可空）</param>
     /// <param name="formula">公式文本（不含等号，如 "SUM(A1:A10)"）</param>
     /// <param name="cachedValue">缓存值（可空）</param>
@@ -558,8 +1054,8 @@ public partial class ExcelWriter : DisposeBase
         if (formula.IsNullOrEmpty()) throw new ArgumentNullException(nameof(formula));
         if (sheet.IsNullOrEmpty()) sheet = SheetName;
         EnsureSheet(sheet);
-        // 包装为 ExcelFormula 放入当前行
-        AddRow(sheet, [new ExcelFormula(formula, cachedValue)]);
+        // 包装为 CellFormula 放入当前行
+        AddRow(sheet, [new CellFormula(formula, cachedValue)]);
     }
     #endregion
 
@@ -570,7 +1066,10 @@ public partial class ExcelWriter : DisposeBase
     /// <param name="col">列号（0基）</param>
     /// <param name="text">批注文本</param>
     /// <param name="author">批注作者（可空）</param>
-    public void AddComment(String? sheet, Int32 row, Int32 col, String text, String? author = null)
+    /// <param name="width">批注框宽度（磅，默认 108）</param>
+    /// <param name="height">批注框高度（磅，默认 59.25）</param>
+    /// <param name="visible">是否可见（默认隐藏）</param>
+    public void AddComment(String? sheet, Int32 row, Int32 col, String text, String? author = null, Double width = 108, Double height = 59.25, Boolean visible = false)
     {
         if (text.IsNullOrEmpty()) throw new ArgumentNullException(nameof(text));
         if (row < 1) throw new ArgumentOutOfRangeException(nameof(row));
@@ -582,7 +1081,104 @@ public partial class ExcelWriter : DisposeBase
             list = [];
             _sheetComments[sheet] = list;
         }
-        list.Add(new SheetComment { Row = row, Col = col, Text = text, Author = author ?? String.Empty });
+        list.Add(new SheetComment { Row = row, Col = col, Text = text, Author = author ?? String.Empty, Width = width, Height = height, Visible = visible });
+    }
+
+    /// <summary>为指定单元格添加富文本批注（M26）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="row">行号（1基）</param>
+    /// <param name="col">列号（0基）</param>
+    /// <param name="segments">富文本段列表</param>
+    /// <param name="author">批注作者（可空）</param>
+    /// <exception cref="ArgumentNullException">segments 为空</exception>
+    /// <exception cref="ArgumentOutOfRangeException">row 小于 1</exception>
+    public void AddComment(String? sheet, Int32 row, Int32 col, IEnumerable<CommentSegment> segments, String? author = null)
+    {
+        if (segments == null) throw new ArgumentNullException(nameof(segments));
+        if (row < 1) throw new ArgumentOutOfRangeException(nameof(row));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+
+        var list2 = segments.ToList();
+        if (list2.Count == 0) throw new ArgumentException("富文本段不能为空", nameof(segments));
+
+        if (!_sheetComments.TryGetValue(sheet, out var list))
+        {
+            list = [];
+            _sheetComments[sheet] = list;
+        }
+        list.Add(new SheetComment
+        {
+            Row = row,
+            Col = col,
+            Text = String.Join("", list2.Select(s => s.Text)),
+            Author = author ?? String.Empty,
+            Segments = list2,
+        });
+    }
+
+    /// <summary>为指定单元格添加线程化批注（M27，Excel 2016+ 对话式批注）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="row">行号（1基）</param>
+    /// <param name="col">列号（0基）</param>
+    /// <param name="text">批注文本</param>
+    /// <param name="author">作者显示名</param>
+    /// <param name="userId">作者用户标识（邮箱/账号，可空）</param>
+    /// <param name="parentId">父批注 Id（回复时传入，顶级批注为 null）</param>
+    /// <param name="time">批注时间（默认当前 UTC 时间）</param>
+    /// <returns>创建的线程化批注（含 Id/PersonId，可用于 Reply）</returns>
+    /// <exception cref="ArgumentNullException">text 或 author 为空</exception>
+    /// <exception cref="ArgumentOutOfRangeException">row 小于 1</exception>
+    public ThreadedComment AddThreadedComment(String? sheet, Int32 row, Int32 col, String text, String author, String? userId = null, String? parentId = null, DateTime? time = null)
+    {
+        if (text.IsNullOrEmpty()) throw new ArgumentNullException(nameof(text));
+        if (author.IsNullOrEmpty()) throw new ArgumentNullException(nameof(author));
+        if (row < 1) throw new ArgumentOutOfRangeException(nameof(row));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+
+        var comment = ThreadedComment.Create(sheet, row, col, text, author, userId);
+        comment.ParentId = parentId;
+        if (time != null) comment.Time = time.Value;
+        _threadedComments.Add(comment);
+        return comment;
+    }
+
+    /// <summary>为现有线程化批注添加回复（M27）</summary>
+    /// <param name="parent">父批注</param>
+    /// <param name="text">回复正文</param>
+    /// <param name="author">作者显示名</param>
+    /// <param name="userId">作者用户标识（可空）</param>
+    /// <returns>回复的线程化批注</returns>
+    /// <exception cref="ArgumentNullException">parent 或 text 为空</exception>
+    public ThreadedComment ReplyThreadedComment(ThreadedComment parent, String text, String author, String? userId = null)
+    {
+        if (parent == null) throw new ArgumentNullException(nameof(parent));
+        if (text.IsNullOrEmpty()) throw new ArgumentNullException(nameof(text));
+        if (author.IsNullOrEmpty()) throw new ArgumentNullException(nameof(author));
+
+        var comment = ThreadedComment.Reply(parent, text, author, userId);
+        _threadedComments.Add(comment);
+        return comment;
+    }
+
+    /// <summary>设置指定单元格的样式（覆盖行级样式）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="row">行号（0基）</param>
+    /// <param name="col">列号（0基）</param>
+    /// <param name="style">单元格样式</param>
+    public void SetCellFormat(String? sheet, Int32 row, Int32 col, CellFormat style)
+    {
+        if (style == null) throw new ArgumentNullException(nameof(style));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+
+        if (!_cellFormatOverrides.TryGetValue(sheet, out var dict))
+        {
+            dict = [];
+            _cellFormatOverrides[sheet] = dict;
+        }
+        dict[(row, col)] = style;
     }
     #endregion
 
@@ -594,7 +1190,7 @@ public partial class ExcelWriter : DisposeBase
     /// <param name="value">条件值</param>
     /// <param name="color">满足条件时的背景色（RGB十六进制）</param>
     /// <param name="value2">第二个条件值（仅 Between 类型使用）</param>
-    public void AddConditionalFormat(String? sheet, String range, ConditionalFormatType type, String? value, String? color, String? value2 = null)
+    public void AddConditionalFormat(String? sheet, String range, ConditionalFormatValues type, String? value, String? color, String? value2 = null)
     {
         if (range.IsNullOrEmpty()) throw new ArgumentNullException(nameof(range));
         if (sheet.IsNullOrEmpty()) sheet = SheetName;
@@ -607,6 +1203,66 @@ public partial class ExcelWriter : DisposeBase
         }
         list.Add(new ConditionalFormatEntry { Range = range, Type = type, Value = value, Value2 = value2, Color = color });
     }
+
+    /// <summary>添加条件格式（带 dxf 字体样式：字体颜色/加粗）</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="range">应用范围（如 "A1:A100"）</param>
+    /// <param name="type">条件类型</param>
+    /// <param name="value">条件值</param>
+    /// <param name="color">满足条件时的背景色（RGB十六进制）</param>
+    /// <param name="value2">第二个条件值（仅 Between 类型使用）</param>
+    /// <param name="fontColor">满足条件时的字体颜色（RGB十六进制，可空）</param>
+    /// <param name="bold">满足条件时是否加粗</param>
+    /// <param name="borderColor">满足条件时的边框颜色（RGB十六进制，可空）</param>
+    public void AddConditionalFormat(String? sheet, String range, ConditionalFormatValues type, String? value, String? color, String? value2, String? fontColor, Boolean bold = false, String? borderColor = null)
+    {
+        if (range.IsNullOrEmpty()) throw new ArgumentNullException(nameof(range));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+
+        if (!_sheetCondFormats.TryGetValue(sheet, out var list))
+        {
+            list = [];
+            _sheetCondFormats[sheet] = list;
+        }
+        list.Add(new ConditionalFormatEntry { Range = range, Type = type, Value = value, Value2 = value2, Color = color, FontColor = fontColor, IsBold = bold, BorderColor = borderColor });
+    }
+
+    /// <summary>添加图标集条件格式</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="range">应用范围（如 "A1:A100"）</param>
+    /// <param name="iconSetType">图标集类型（如 "3Arrows"、"3Flags"、"3TrafficLights1"、"4Rating"、"5Rating"）</param>
+    public void AddIconSetConditionalFormat(String? sheet, String range, String iconSetType = "3Arrows")
+    {
+        if (range.IsNullOrEmpty()) throw new ArgumentNullException(nameof(range));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!_sheetCondFormats.TryGetValue(sheet, out var list))
+        {
+            list = [];
+            _sheetCondFormats[sheet] = list;
+        }
+        list.Add(new ConditionalFormatEntry { Range = range, Type = ConditionalFormatValues.IconSet, IconSetType = iconSetType });
+    }
+
+    /// <summary>添加自定义公式条件格式</summary>
+    /// <param name="sheet">工作表名称（可空）</param>
+    /// <param name="range">应用范围（如 "A1:A100"）</param>
+    /// <param name="formula">Excel 公式（不含 = 号，如 "A1&gt;100"、"AND(A1&gt;0,B1&lt;10)"）</param>
+    /// <param name="color">满足条件时的背景色（RGB十六进制）</param>
+    public void AddExpressionConditionalFormat(String? sheet, String range, String formula, String? color)
+    {
+        if (range.IsNullOrEmpty()) throw new ArgumentNullException(nameof(range));
+        if (formula.IsNullOrEmpty()) throw new ArgumentNullException(nameof(formula));
+        if (sheet.IsNullOrEmpty()) sheet = SheetName;
+        EnsureSheet(sheet);
+        if (!_sheetCondFormats.TryGetValue(sheet, out var list))
+        {
+            list = [];
+            _sheetCondFormats[sheet] = list;
+        }
+        list.Add(new ConditionalFormatEntry { Range = range, Type = ConditionalFormatValues.Expression, Formula = formula, Color = color });
+    }
     #endregion
 
     #region 对象映射
@@ -615,7 +1271,7 @@ public partial class ExcelWriter : DisposeBase
     /// <param name="sheet">工作表名称（可空）</param>
     /// <param name="data">对象集合</param>
     /// <param name="headerStyle">表头样式</param>
-    public void WriteObjects<T>(String? sheet, IEnumerable<T> data, CellStyle? headerStyle = null) where T : class
+    public void WriteObjects<T>(String? sheet, IEnumerable<T> data, CellFormat? headerStyle = null) where T : class
     {
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (sheet.IsNullOrEmpty()) sheet = SheetName;
@@ -653,7 +1309,7 @@ public partial class ExcelWriter : DisposeBase
     /// <param name="sheet">工作表名称（可空）</param>
     /// <param name="table">DataTable</param>
     /// <param name="headerStyle">表头样式</param>
-    public void WriteDataTable(String? sheet, DataTable table, CellStyle? headerStyle = null)
+    public void WriteDataTable(String? sheet, DataTable table, CellFormat? headerStyle = null)
     {
         if (table == null) throw new ArgumentNullException(nameof(table));
         if (sheet.IsNullOrEmpty()) sheet = SheetName;
@@ -669,6 +1325,198 @@ public partial class ExcelWriter : DisposeBase
         foreach (DataRow dr in table.Rows)
         {
             AddRow(sheet, dr.ItemArray);
+        }
+    }
+    #endregion
+
+    #region ExcelData写入
+    /// <summary>从完整快照写入工作簿</summary>
+    /// <param name="data">ExcelData 快照数据</param>
+    public void WriteExcel(ExcelDocument data)
+    {
+        if (data == null) throw new ArgumentNullException(nameof(data));
+
+        var autoFit = AutoFitColumnWidth;
+        AutoFitColumnWidth = false; // 写 ExcelData 时用预设列宽
+        _otherParts = data.OtherParts.Count > 0 ? new Dictionary<String, Byte[]>(data.OtherParts) : [];
+
+        // 用源文件的默认字体覆盖 font[0]，确保行/列标题字体与原文件一致
+        if (data.DefaultFont != null)
+        {
+            var df = data.DefaultFont;
+            _fonts[0] = new FontEntry(df.Name, df.Size, df.Bold, false, false, df.Color, false, null);
+        }
+
+        try
+        {
+            foreach (var sd in data.Worksheets)
+            {
+                var sheet = sd.Name;
+                EnsureSheet(sheet);
+
+                // 写入数据行（带每单元格样式）
+                var prevActualRow = -1;
+                for (var r = 0; r < sd.Rows.Count; r++)
+                {
+                    // 计算此行的实际 Excel 行号（0基）
+                    var actualRow = sd.ActualRowNumbers != null ? sd.ActualRowNumbers[r] : r;
+
+                // 若源文件存在跳行（如行 13 为空），推进行号计数器跳过缺失的行，
+                // 确保后续行的 r 属性与原始 Excel 行号一致（不插入空行元素）
+                if (actualRow > prevActualRow + 1)
+                    AdvanceToRow(sheet, actualRow + 1); // actualRow 是 0 基，目标行号 = actualRow+1（1基）
+                prevActualRow = actualRow;
+
+                    // 先设置该行的每单元格样式覆盖（需在 AddRow 之前）
+                    foreach (var kv in sd.CellFormats)
+                    {
+                        var (cr, cc) = kv.Key;
+                        if (cr == actualRow)
+                            SetCellFormat(sheet, actualRow, cc, kv.Value);
+                    }
+
+                    // 检查公式——将公式单元格的值包装为 CellFormula（不修改原始数据）
+                    var row = (Object?[])sd.Rows[r].Clone();
+                    for (var c = 0; c < row.Length; c++)
+                    {
+                        if (sd.Formulas.TryGetValue((actualRow, c), out var formula) && !formula.IsNullOrEmpty())
+                        {
+                            row[c] = new CellFormula(formula, row[c]);
+                        }
+                    }
+                    AddRow(sheet, row);
+                }
+
+                // 合并区域
+                foreach (var (sr, sc, er, ec) in sd.Merges)
+                {
+                    MergeCell(sheet, sr, sc, er, ec);
+                }
+
+                // 冻结窗格
+                if (sd.FreezePane.HasValue)
+                    FreezePane(sheet, sd.FreezePane.Value.Rows, sd.FreezePane.Value.Cols);
+
+                // 自动筛选
+                if (!sd.AutoFilter.IsNullOrEmpty())
+                    SetAutoFilter(sheet, sd.AutoFilter!);
+
+                // 显示设置（网格线/缩放/默认行高）
+                if (!sd.Gridlines)
+                    SetGridlines(sheet, false);
+                if (sd.ZoomScale != 100)
+                    SetZoomScale(sheet, sd.ZoomScale);
+                if (sd.DefaultRowHeight is > 0)
+                    SetDefaultRowHeight(sheet, sd.DefaultRowHeight.Value);
+
+                // 行高（0基→1基）
+                foreach (var kv in sd.RowHeights)
+                {
+                    SetRowHeight(sheet, kv.Key + 1, kv.Value);
+                }
+
+                // 列宽（已经是0基）
+                foreach (var kv in sd.ColumnWidths)
+                {
+                    SetColumnWidth(sheet, kv.Key, kv.Value);
+                }
+
+                // 隐藏行列（行 0基→1基，列 0基）
+                foreach (var r in sd.HiddenRows)
+                {
+                    SetRowHidden(sheet, r + 1);
+                }
+                foreach (var c in sd.HiddenColumns)
+                {
+                    SetColumnHidden(sheet, c);
+                }
+
+                // 超链接（0基行列→1基行）
+                foreach (var kv in sd.Hyperlinks)
+                {
+                    var (r, c) = kv.Key;
+                    AddHyperlink(sheet, r + 1, c, kv.Value.Url, kv.Value.Display);
+                }
+
+                // 图片
+                foreach (var img in sd.Images)
+                {
+                    AddImage(sheet, img.Row, img.Col, img.Data, img.Extension, img.Width, img.Height,
+                        img.FromColOff, img.FromRowOff, img.ToRow, img.ToCol, img.ToColOff, img.ToRowOff, img.EditAs);
+                }
+
+                // 页面设置
+                if (sd.Orientation != PageOrientation.Portrait || sd.PaperSize != PaperSize.Default)
+                    SetPageSetup(sheet, sd.Orientation, sd.PaperSize);
+                SetPageMargins(sheet, sd.MarginTop, sd.MarginBottom, sd.MarginLeft, sd.MarginRight);
+                if (!sd.HeaderText.IsNullOrEmpty() || !sd.FooterText.IsNullOrEmpty())
+                    SetHeaderFooter(sheet, sd.HeaderText, sd.FooterText);
+                if (sd.PrintTitleStartRow > 0)
+                    SetPrintTitleRows(sheet, sd.PrintTitleStartRow, sd.PrintTitleEndRow);
+
+                // 打印区域
+                if (!sd.PrintArea.IsNullOrEmpty())
+                    SetPrintArea(sheet, sd.PrintArea!);
+
+                // 分页符（1基）
+                foreach (var r in sd.RowPageBreaks)
+                {
+                    SetPageBreak(sheet, r);
+                }
+                foreach (var c in sd.ColumnPageBreaks)
+                {
+                    SetColumnPageBreak(sheet, c);
+                }
+
+                // 工作表保护
+                if (sd.ProtectionPassword != null)
+                    ProtectSheet(sheet, sd.ProtectionPassword);
+
+                // 条件格式
+                foreach (var cf in sd.ConditionalFormats)
+                {
+                    AddConditionalFormat(sheet, cf.Range, cf.Type, cf.Value, cf.Color, cf.Value2, cf.FontColor, cf.IsBold, cf.BorderColor);
+                }
+
+                // 批注（0基→1基行）
+                foreach (var kv in sd.Comments)
+                {
+                    var (r, c) = kv.Key;
+                    var cm = kv.Value;
+                    AddComment(sheet, r + 1, c, cm.Text, cm.Author, cm.Width, cm.Height, cm.Visible);
+                }
+
+                // 数据验证
+                foreach (var v in sd.Validations)
+                {
+                    if (v.Items != null && v.Items.Length > 0)
+                        AddDropdownValidation(sheet, v.CellRange, v.Items);
+                    else if (!v.ValidationType.IsNullOrEmpty())
+                        AddRangeValidation(sheet, v.CellRange, v.ValidationType!, v.Operator ?? "between", v.Formula1 ?? "0", v.Formula2);
+                }
+
+                // 结构化表格
+                foreach (var tbl in sd.Tables)
+                {
+                    AddTable(sheet, tbl.Range, tbl.Name, tbl.StyleName, tbl.ColumnNames);
+                }
+
+                // 图表
+                foreach (var ch in sd.Charts)
+                {
+                    AddChart(sheet, ch);
+                }
+            }
+
+            // 用户自定义命名范围
+            foreach (var kv in data.DefinedNames)
+            {
+                AddDefinedName(kv.Key, kv.Value);
+            }
+        }
+        finally
+        {
+            AutoFitColumnWidth = autoFit;
         }
     }
     #endregion

@@ -1,7 +1,9 @@
 using System.Text;
+using NewLife.Buffers;
 using NewLife.Office;
+using NewLife.Office.Ole2;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Ppt;
 
 /// <summary>PowerPoint 97-2003 二进制（.ppt）演示文稿读取器</summary>
 /// <remarks>
@@ -111,33 +113,45 @@ public sealed class PptReader : IDisposable, ITextExtractable, IMarkdownExtracta
     /// <param name="slides">累积的幻灯片文本列表</param>
     /// <param name="currentSlide">当前幻灯片文本收集器（null 代表还未进入任何幻灯片）</param>
     private static void ScanRecords(Byte[] buf, Int32 start, Int32 end,
-        List<List<String>> slides, List<String> currentSlide)
+        List<List<String>> slides, List<String>? currentSlide)
     {
-        var pos = start;
-        while (pos + 8 <= end)
+        var reader = new SpanReader(buf, start, end - start);
+        while (reader.Position + 8 <= reader.Capacity)
         {
-            var verType = ReadUInt16(buf, pos);
-            var recType = ReadUInt16(buf, pos + 2);
-            var recLen = (Int32)ReadUInt32(buf, pos + 4);
+            var verType = reader.ReadUInt16();
+            var recType = reader.ReadUInt16();
+            var recLen = (Int32)reader.ReadUInt32();
             var recVer = verType & 0x0F;
-            pos += 8;
+            var recInstance = verType >> 4;
 
-            if (recLen < 0 || pos + recLen > end) break;
+            if (recLen < 0 || reader.Position + recLen > reader.Capacity) break;
 
-            if (recType == RecTextCharsAtom && recLen >= 2)
+            var bodyStart = start + (Int32)reader.Position;
+
+            // 仅收集 SlideContainer 内的文本；Document 中的大纲文本不属于任何幻灯片，忽略
+            if (currentSlide != null && (recType == RecTextCharsAtom || recType == RecTextBytesAtom) && recLen >= 2)
             {
-                // UTF-16LE 文本：每字符 2 字节，长度需按 2 对齐
-                var charBytes = recLen & ~1;
-                var text = Encoding.Unicode.GetString(buf, pos, charBytes).TrimEnd('\r', '\n');
+                String text;
+                if (recType == RecTextCharsAtom)
+                {
+                    // UTF-16LE 文本：每字符 2 字节，长度需按 2 对齐
+                    var charBytes = recLen & ~1;
+                    text = Encoding.Unicode.GetString(buf, bodyStart, charBytes);
+                }
+                else
+                {
+                    // ANSI 文本：通过 Latin-1 编码批量转换
+                    text = DecodeLatin1(buf.AsSpan(bodyStart, recLen));
+                }
+                text = text.TrimEnd('\r', '\n').Replace('\r', '\n');
                 if (text.Length > 0)
-                    (currentSlide ?? GetOrAddSlide(slides))?.Add(text);
-            }
-            else if (recType == RecTextBytesAtom && recLen >= 1)
-            {
-                // ANSI 文本：直接字节→字符映射（ISO-8859-1）
-                var text = DecodeLatin1(buf, pos, recLen).TrimEnd('\r', '\n');
-                if (text.Length > 0)
-                    (currentSlide ?? GetOrAddSlide(slides))?.Add(text);
+                {
+                    // 续记录（recInstance=0xF）：合并到上一段末尾，不添加分隔符
+                    if (recInstance == 0x0F && currentSlide.Count > 0)
+                        currentSlide[currentSlide.Count - 1] += text;
+                    else
+                        currentSlide.Add(text);
+                }
             }
             else if (recVer == 0x0F)
             {
@@ -147,52 +161,26 @@ public sealed class PptReader : IDisposable, ITextExtractable, IMarkdownExtracta
                     // 进入一个新幻灯片
                     var slideTexts = new List<String>();
                     slides.Add(slideTexts);
-                    ScanRecords(buf, pos, pos + recLen, slides, slideTexts);
+                    ScanRecords(buf, bodyStart, bodyStart + recLen, slides, slideTexts);
                 }
                 else
                 {
                     // 其他容器—继续在当前幻灯片上下文中递归
-                    ScanRecords(buf, pos, pos + recLen, slides, currentSlide);
+                    ScanRecords(buf, bodyStart, bodyStart + recLen, slides, currentSlide);
                 }
             }
 
-            pos += recLen;
+            reader.Advance(recLen);
         }
     }
 
-    /// <summary>确保 slides 中至少有一个 slide，并返回最后一个</summary>
-    /// <param name="slides">幻灯片文本列表</param>
-    /// <returns>最后一个幻灯片的文本收集器</returns>
-    private static List<String> GetOrAddSlide(List<List<String>> slides)
-    {
-        if (slides.Count == 0) slides.Add([]);
-        return slides[slides.Count - 1];
-    }
-
-    /// <summary>ISO-8859-1 字节→字符映射</summary>
-    /// <param name="data">字节数组</param>
-    /// <param name="pos">起始偏移</param>
-    /// <param name="count">字节数</param>
+    /// <summary>ISO-8859-1 字节→字符批量转换</summary>
+    /// <param name="data">字节切片</param>
     /// <returns>解码后的字符串</returns>
-    private static String DecodeLatin1(Byte[] data, Int32 pos, Int32 count)
+    private static String DecodeLatin1(ReadOnlySpan<Byte> data)
     {
-        var chars = new Char[count];
-        for (var i = 0; i < count; i++)
-        {
-            chars[i] = (Char)data[pos + i];
-        }
-        return new String(chars);
+        return Encoding.GetEncoding(28591).GetString(data);
     }
-
-    #endregion
-
-    #region 字节工具
-
-    private static UInt16 ReadUInt16(Byte[] buf, Int32 pos) =>
-        (UInt16)(buf[pos] | (buf[pos + 1] << 8));
-
-    private static UInt32 ReadUInt32(Byte[] buf, Int32 pos) =>
-        (UInt32)(buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24));
 
     #endregion
 
@@ -200,10 +188,10 @@ public sealed class PptReader : IDisposable, ITextExtractable, IMarkdownExtracta
 
     // 幻灯片容器
     private const UInt16 RecSlideContainer = 0x03EE;
-    // 文本原子（UTF-16LE）
-    private const UInt16 RecTextCharsAtom = 0x03F2;
-    // 文本原子（ANSI/Latin-1）
-    private const UInt16 RecTextBytesAtom = 0x03F0;
+    // 文本原子（UTF-16LE）：MS-PPT 规范为 0x0FA0（早期误用 0x03F2=Environment，会导致真实文件读取失败）
+    private const UInt16 RecTextCharsAtom = 0x0FA0;
+    // 文本原子（ANSI/Latin-1）：MS-PPT 规范为 0x0FA8（早期误用 0x03F0=Notes）
+    private const UInt16 RecTextBytesAtom = 0x0FA8;
 
     #endregion
 

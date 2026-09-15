@@ -1,0 +1,37 @@
+namespace NewLife.Office.Ppt;
+
+/// <summary>PPT 幻灯片图片元素</summary>
+public class Picture
+{
+    #region 属性
+    /// <summary>图片字节数据</summary>
+    public Byte[] Data { get; set; } = [];
+
+    /// <summary>扩展名（png/jpg）</summary>
+    public String Extension { get; set; } = "png";
+
+    /// <summary>左边距（EMU）</summary>
+    public Int64 Left { get; set; }
+
+    /// <summary>上边距（EMU）</summary>
+    public Int64 Top { get; set; }
+
+    /// <summary>宽度（EMU）</summary>
+    public Int64 Width { get; set; } = 3000000;
+
+    /// <summary>高度（EMU）</summary>
+    public Int64 Height { get; set; } = 2000000;
+
+    /// <summary>关系ID（内部用）</summary>
+    public String RelId { get; set; } = String.Empty;
+
+    /// <summary>是否为 SVG 图片（S15-03）</summary>
+    public Boolean IsSvg { get; set; }
+
+    /// <summary>旋转角度（S15-02），以 60000 分之一度为单位（如 5400000=90°）</summary>
+    public Int32 Rotation { get; set; }
+
+    /// <summary>圆角半径（EMU）。设置后图片以圆角矩形裁剪，0 或不设置则为直角</summary>
+    public Int64 CornerRadius { get; set; }
+    #endregion
+}

@@ -1,6 +1,6 @@
 using System.Text;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Pdf;
 
 /// <summary>PDF 页面对象（记录每页内容）</summary>
 public class PdfPage
@@ -23,6 +23,12 @@ public class PdfPage
 
     /// <summary>页面超链接注释列表（PDF 坐标：原点在左下角）</summary>
     public List<(Single X, Single Y, Single W, Single H, String Url)> LinkAnnotations { get; } = [];
+
+    /// <summary>页面 ExtGState 字典（Key=fillAlpha,strokeAlpha, Value=GS名称）</summary>
+    public Dictionary<String, String> ExtGStates { get; } = [];
+
+    /// <summary>页面文本块列表（带坐标和字号的文本片段，用于往返测试）</summary>
+    public List<PdfText> TextBlocks { get; set; } = [];
 
     /// <summary>PDF 对象号（catalog=1, pages=2, page=3...）</summary>
     internal Int32 PageObjId { get; set; }

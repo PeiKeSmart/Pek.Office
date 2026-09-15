@@ -9,6 +9,9 @@ internal sealed class MarkdownHtmlConverter
 {
     #region 属性
     private readonly MarkdownHtmlOptions _options;
+
+    /// <summary>当前列表是否松散（CommonMark：松散列表项内容渲染为 &lt;p&gt;）</summary>
+    private Boolean _looseList;
     #endregion
 
     #region 构造
@@ -43,7 +46,7 @@ internal sealed class MarkdownHtmlConverter
                 RenderHeading(sb, block);
                 break;
             case MarkdownBlockType.Paragraph:
-                sb.Append("<p>");
+                sb.Append("<p").Append(BlockAttributes(block)).Append('>');
                 RenderInlines(sb, block.Inlines);
                 sb.AppendLine("</p>");
                 break;
@@ -51,7 +54,7 @@ internal sealed class MarkdownHtmlConverter
                 RenderCodeBlock(sb, block);
                 break;
             case MarkdownBlockType.BlockQuote:
-                sb.AppendLine("<blockquote>");
+                sb.Append("<blockquote").Append(BlockAttributes(block)).AppendLine(">");
                 foreach (var child in block.Children)
                 {
                     RenderBlock(sb, child);
@@ -59,21 +62,29 @@ internal sealed class MarkdownHtmlConverter
                 sb.AppendLine("</blockquote>");
                 break;
             case MarkdownBlockType.BulletList:
+                var bl = (BulletListBlock)block;
+                var savedLoose = _looseList;
+                _looseList = bl.IsLoose;
                 sb.AppendLine("<ul>");
                 foreach (var child in block.Children)
                 {
                     RenderBlock(sb, child);
                 }
                 sb.AppendLine("</ul>");
+                _looseList = savedLoose;
                 break;
             case MarkdownBlockType.OrderedList:
-                var start = block.OrderedStart > 1 ? " start=\"" + block.OrderedStart + "\"" : "";
+                var ol = (OrderedListBlock)block;
+                var start = ol.OrderedStart > 1 ? " start=\"" + ol.OrderedStart + "\"" : "";
+                savedLoose = _looseList;
+                _looseList = ol.IsLoose;
                 sb.AppendLine("<ol" + start + ">");
                 foreach (var child in block.Children)
                 {
                     RenderBlock(sb, child);
                 }
                 sb.AppendLine("</ol>");
+                _looseList = savedLoose;
                 break;
             case MarkdownBlockType.ListItem:
                 RenderListItem(sb, block);
@@ -85,7 +96,40 @@ internal sealed class MarkdownHtmlConverter
                 sb.AppendLine("<hr />");
                 break;
             case MarkdownBlockType.HtmlBlock:
-                sb.AppendLine(block.RawText);
+                var hb = (HtmlBlock)block;
+                sb.AppendLine(hb.RawText);
+                break;
+            case MarkdownBlockType.MathBlock:
+                var mb = (MathBlock)block;
+                sb.AppendLine("<div class=\"math\">$$");
+                sb.AppendLine(HtmlEncode(mb.Content));
+                sb.AppendLine("$$</div>");
+                break;
+            case MarkdownBlockType.FootnoteDefinition:
+                var fd = (FootnoteDefinitionBlock)block;
+                sb.Append("<div class=\"footnote\" id=\"fn-").Append(HtmlEncode(fd.Id)).Append("\"><sup>")
+                  .Append(HtmlEncode(fd.Id)).Append("</sup>: ");
+                RenderInlines(sb, fd.Definition);
+                sb.AppendLine("</div>");
+                break;
+            case MarkdownBlockType.DefinitionList:
+                sb.AppendLine("<dl>");
+                foreach (var child in block.Children)
+                {
+                    if (child is DefinitionTermBlock dt)
+                    {
+                        sb.Append("<dt>");
+                        RenderInlines(sb, dt.Inlines);
+                        sb.AppendLine("</dt>");
+                    }
+                    else if (child is DefinitionDescriptionBlock dd)
+                    {
+                        sb.Append("<dd>");
+                        RenderInlines(sb, dd.Inlines);
+                        sb.AppendLine("</dd>");
+                    }
+                }
+                sb.AppendLine("</dl>");
                 break;
             default:
                 break;
@@ -97,7 +141,8 @@ internal sealed class MarkdownHtmlConverter
     /// <param name="block">标题块</param>
     private void RenderHeading(StringBuilder sb, MarkdownBlock block)
     {
-        var level = block.Level < 1 ? 1 : block.Level > 6 ? 6 : block.Level;
+        var h = (HeadingBlock)block;
+        var level = h.Level < 1 ? 1 : h.Level > 6 ? 6 : h.Level;
         var tag = "h" + level;
         // 生成可链接的锚点 id
         var id = block.GetPlainText().ToLower()
@@ -107,7 +152,7 @@ internal sealed class MarkdownHtmlConverter
             .Replace("(", "")
             .Replace(")", "")
             .Replace("/", "");
-        sb.Append("<" + tag + " id=\"" + HtmlEncode(id) + "\">");
+        sb.Append("<" + tag + " id=\"" + HtmlEncode(id) + "\"" + BlockAttributes(block) + ">");
         RenderInlines(sb, block.Inlines);
         sb.AppendLine("</" + tag + ">");
     }
@@ -117,12 +162,13 @@ internal sealed class MarkdownHtmlConverter
     /// <param name="block">代码块</param>
     private void RenderCodeBlock(StringBuilder sb, MarkdownBlock block)
     {
+        var cb = (CodeBlock)block;
         var codeAttr = "";
-        if (_options.AddLanguageClass && !String.IsNullOrEmpty(block.Language))
-            codeAttr = " class=\"language-" + HtmlEncode(block.Language) + "\"";
+        if (_options.AddLanguageClass && !String.IsNullOrEmpty(cb.Language))
+            codeAttr = " class=\"language-" + HtmlEncode(cb.Language) + "\"";
 
         sb.Append("<pre><code" + codeAttr + ">");
-        sb.Append(HtmlEncode(block.RawText ?? ""));
+        sb.Append(HtmlEncode(cb.RawText ?? ""));
         sb.AppendLine("</code></pre>");
     }
 
@@ -131,16 +177,27 @@ internal sealed class MarkdownHtmlConverter
     /// <param name="block">列表项块</param>
     private void RenderListItem(StringBuilder sb, MarkdownBlock block)
     {
+        var li = (ListItemBlock)block;
         sb.Append("<li>");
-        if (block.IsTaskItem)
+        if (li.IsTaskItem)
         {
-            var checked_ = block.IsChecked ? " checked=\"\"" : "";
+            var checked_ = li.IsChecked ? " checked=\"\"" : "";
             sb.Append("<input type=\"checkbox\" disabled=\"\"" + checked_ + " /> ");
         }
 
         if (block.Children.Count == 0)
         {
-            RenderInlines(sb, block.Inlines);
+            // 松散列表：简单项内容包裹 <p>（CommonMark）
+            if (_looseList && block.Inlines.Count > 0)
+            {
+                sb.Append("<p>");
+                RenderInlines(sb, block.Inlines);
+                sb.Append("</p>");
+            }
+            else
+            {
+                RenderInlines(sb, block.Inlines);
+            }
         }
         else
         {
@@ -195,7 +252,8 @@ internal sealed class MarkdownHtmlConverter
         var tag = isHeader ? "th" : "td";
         foreach (var cell in row.Children)
         {
-            var align = cell.Alignment == null ? "" : " style=\"text-align:" + cell.Alignment + "\"";
+            var tc = (TableCellBlock)cell;
+            var align = tc.Alignment == null ? "" : " style=\"text-align:" + tc.Alignment + "\"";
             sb.Append("<" + tag + align + ">");
             RenderInlines(sb, cell.Inlines);
             sb.AppendLine("</" + tag + ">");
@@ -222,7 +280,7 @@ internal sealed class MarkdownHtmlConverter
         switch (inline.Type)
         {
             case MarkdownInlineType.Text:
-                sb.Append(HtmlEncode(inline.Text ?? ""));
+                RenderTextWithAbbr(sb, inline.Text ?? "");
                 break;
             case MarkdownInlineType.Strong:
                 sb.Append("<strong>");
@@ -264,8 +322,21 @@ internal sealed class MarkdownHtmlConverter
             case MarkdownInlineType.RawHtml:
                 sb.Append(inline.Text ?? "");
                 break;
+            case MarkdownInlineType.AutoLink:
+                var href2 = inline.Href ?? inline.Text ?? "";
+                sb.Append("<a href=\"").Append(HtmlEncode(href2)).Append("\">")
+                  .Append(HtmlEncode(inline.Text ?? "")).Append("</a>");
+                break;
+            case MarkdownInlineType.MathInline:
+                sb.Append("<span class=\"math\">$").Append(HtmlEncode(inline.Text ?? "")).Append("$</span>");
+                break;
+            case MarkdownInlineType.FootnoteRef:
+                sb.Append("<sup><a href=\"#fn-").Append(HtmlEncode(inline.Text ?? "")).Append("\" id=\"fnref-")
+                  .Append(HtmlEncode(inline.Text ?? "")).Append("\">[")
+                  .Append(HtmlEncode(inline.Text ?? "")).Append("]</a></sup>");
+                break;
             default:
-                sb.Append(HtmlEncode(inline.Text ?? ""));
+                RenderTextWithAbbr(sb, inline.Text ?? "");
                 break;
         }
     }
@@ -322,7 +393,7 @@ internal sealed class MarkdownHtmlConverter
     /// <summary>HTML编码文本内容</summary>
     /// <param name="text">原始文本</param>
     /// <returns>编码后文本</returns>
-    private static String HtmlEncode(String text)
+    internal static String HtmlEncode(String text)
     {
         if (text == null || text.Length == 0) return "";
         return text
@@ -349,6 +420,92 @@ internal sealed class MarkdownHtmlConverter
     {
         if (String.IsNullOrEmpty(url)) return false;
         return url.StartsWith("http://") || url.StartsWith("https://") || url.StartsWith("//");
+    }
+    /// <summary>生成块级元素的属性字符串 (MD05-06)</summary>
+    private static String BlockAttributes(MarkdownBlock block)
+    {
+        if (String.IsNullOrEmpty(block.Attributes)) return String.Empty;
+
+        var attr = block.Attributes;
+        var sb = new StringBuilder();
+        var parts = attr.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var classes = new List<String>();
+        var id = String.Empty;
+
+        foreach (var part in parts)
+        {
+            if (part.StartsWith("."))
+            {
+                var cls = part[1..];
+                if (cls.Length > 0) classes.Add(cls);
+            }
+            else if (part.StartsWith("#"))
+            {
+                id = part[1..];
+            }
+            else if (part.Contains('='))
+            {
+                var eqIdx = part.IndexOf('=');
+                var key = part[..eqIdx];
+                var value = part[(eqIdx + 1)..].Trim('"', '\'');
+                sb.Append(' ').Append(key).Append("=\"").Append(HtmlEncode(value)).Append('"');
+            }
+        }
+
+        if (classes.Count > 0)
+            sb.Append(" class=\"").Append(HtmlEncode(String.Join(" ", classes))).Append('"');
+        if (id.Length > 0)
+            sb.Append(" id=\"").Append(HtmlEncode(id)).Append('"');
+
+        return sb.ToString();
+    }
+
+    /// <summary>渲染文本，对已知缩写自动添加 &lt;abbr&gt; 标签 (MD05-08)</summary>
+    private void RenderTextWithAbbr(StringBuilder sb, String text)
+    {
+        if (String.IsNullOrEmpty(text))
+        {
+            sb.Append(HtmlEncode(text));
+            return;
+        }
+
+        var abbrs = _options.Abbreviations;
+        if (abbrs == null || abbrs.Count == 0)
+        {
+            sb.Append(HtmlEncode(text));
+            return;
+        }
+
+        // 简单替换：按缩写文本长度降序排列，避免短缩写误匹配
+        var sorted = abbrs.OrderByDescending(kv => kv.Key.Length).ToList();
+        var i = 0;
+        while (i < text.Length)
+        {
+            var matched = false;
+            foreach (var kv in sorted)
+            {
+                if (i + kv.Key.Length <= text.Length &&
+                    String.Compare(text, i, kv.Key, 0, kv.Key.Length, StringComparison.Ordinal) == 0)
+                {
+                    // 确保是单词边界
+                    var beforeOk = i == 0 || !Char.IsLetterOrDigit(text[i - 1]);
+                    var afterOk = i + kv.Key.Length >= text.Length || !Char.IsLetterOrDigit(text[i + kv.Key.Length]);
+                    if (beforeOk && afterOk)
+                    {
+                        sb.Append("<abbr title=\"").Append(HtmlEncode(kv.Value)).Append("\">")
+                          .Append(HtmlEncode(kv.Key)).Append("</abbr>");
+                        i += kv.Key.Length;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if (!matched)
+            {
+                sb.Append(HtmlEncode(text[i].ToString()));
+                i++;
+            }
+        }
     }
     #endregion
 }

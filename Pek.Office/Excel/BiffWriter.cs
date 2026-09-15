@@ -3,8 +3,9 @@ using System.Data;
 using System.Reflection;
 using System.Text;
 using NewLife.Buffers;
+using NewLife.Office.Ole2;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Excel;
 
 /// <summary>xls（BIFF8）格式写入器</summary>
 /// <remarks>
@@ -38,6 +39,24 @@ public sealed class BiffWriter : IDisposable
     private const UInt16 RecFont = 0x0031;
     private const UInt16 RecFormat = 0x041E;
     private const UInt16 RecContinue = 0x003C;
+    private const UInt16 RecColInfo = 0x007D;
+    private const UInt16 RecFormula = 0x0006;
+    private const UInt16 RecString = 0x0207;
+    private const UInt16 RecWindow2 = 0x023E;
+    private const UInt16 RecMergedCells = 0x00E5;
+    private const UInt16 RecHyperlink = 0x01B8;
+    private const UInt16 RecAutoFilter = 0x009E;
+    private const UInt16 RecSetup = 0x00A1;
+    private const UInt16 RecHeader = 0x0014;
+    private const UInt16 RecFooter = 0x0015;
+    private const UInt16 RecDefColWidth = 0x0055;
+    private const UInt16 RecProtect = 0x0012;
+    private const UInt16 RecPassword = 0x0013;
+    private const UInt16 RecDv = 0x01BE;
+    private const UInt16 RecDval = 0x02B2;
+    private const UInt16 RecSupBook = 0x01AE;
+    private const UInt16 RecExternSheet = 0x0017;
+    private const UInt16 RecName = 0x0018;
     private const Int32 MaxRecordDataSize = 8224;
 
     // BIFF8 日期纪元：1900-01-01（含 1900 闰年兼容性偏移 +1）
@@ -68,11 +87,50 @@ public sealed class BiffWriter : IDisposable
     #region 私有字段
 
     private readonly List<String> _sheetNames = [];
-    private readonly Dictionary<String, List<List<Object?>>> _sheetData = new(StringComparer.Ordinal);
+    private readonly Dictionary<String, List<(List<Object?> Values, CellFormat? Style)>> _sheetData = new(StringComparer.Ordinal);
 
     // 共享字符串表
     private readonly List<String> _sst = [];
     private readonly Dictionary<String, Int32> _sstIndex = new(StringComparer.Ordinal);
+
+    // 列宽：Key = sheetName, Value = (colIndex → width)
+    private readonly Dictionary<String, Dictionary<Int32, Int32>> _sheetColWidths = new(StringComparer.Ordinal);
+
+    // 列数字格式：Key = sheetName, Value = (colIndex → formatString)
+    private readonly Dictionary<String, Dictionary<Int32, String>> _columnFormats = new(StringComparer.Ordinal);
+
+    // 冻结窗格：Key = sheetName, Value = (freezeRow, freezeCol)
+    private readonly Dictionary<String, (Int32 Row, Int32 Col)> _sheetFreezePanes = new(StringComparer.Ordinal);
+
+    // 合并单元格：Key = sheetName, Value = List of (r1,c1,r2,c2)
+    private readonly Dictionary<String, List<(Int32 R1, Int32 C1, Int32 R2, Int32 C2)>> _sheetMergedCells = new(StringComparer.Ordinal);
+
+    // 行高：Key = sheetName, Value = (rowIndex → heightTwips)，默认 255 twips = 约 12.75pt
+    private readonly Dictionary<String, Dictionary<Int32, Int32>> _sheetRowHeights = new(StringComparer.Ordinal);
+
+    // 超链接：Key = sheetName, Value = List of (row, col, url, displayText)
+    private readonly Dictionary<String, List<(Int32 Row, Int32 Col, String Url, String? DisplayText)>> _sheetHyperlinks = new(StringComparer.Ordinal);
+
+    // 自动筛选：Key = sheetName, Value = (firstRow, lastRow, firstCol, lastCol)
+    private readonly Dictionary<String, (Int32 FirstRow, Int32 LastRow, Int32 FirstCol, Int32 LastCol)> _sheetAutoFilters = new(StringComparer.Ordinal);
+
+    // 页面设置：Key = sheetName
+    private readonly Dictionary<String, (Boolean Landscape, Int32 PaperSize, Double HeaderMargin, Double FooterMargin)> _sheetPageSetups = new(StringComparer.Ordinal);
+
+    // 页眉页脚：Key = sheetName, Value = (header, footer)
+    private readonly Dictionary<String, (String Header, String Footer)> _sheetHeaderFooters = new(StringComparer.Ordinal);
+
+    // 默认列宽：Key = sheetName, Value = width（1/256 字符宽度单位）
+    private readonly Dictionary<String, UInt16> _sheetDefColWidths = new(StringComparer.Ordinal);
+
+    // 工作表保护：Key = sheetName, Value = 密码（null = 无密码保护）
+    private readonly Dictionary<String, String?> _sheetProtection = new(StringComparer.Ordinal);
+
+    // 数据验证（下拉列表）：Key = sheetName, Value = (range, items)
+    private readonly Dictionary<String, List<(String Range, String[] Items)>> _sheetValidations = new(StringComparer.Ordinal);
+
+    // 命名范围/打印区域：工作簿级，(名称, 公式如 Sheet1!A1:B2)
+    private readonly List<(String Name, String Formula)> _definedNames = [];
 
     private String _currentSheet = "Sheet1";
     private Boolean _disposed;
@@ -113,8 +171,16 @@ public sealed class BiffWriter : IDisposable
     /// <param name="values">单元格值序列（支持 String/Int32/Double/DateTime/Boolean/null）</param>
     public void WriteRow(IEnumerable<Object?> values)
     {
+        WriteRow(values, null);
+    }
+
+    /// <summary>写入一行数据（带样式）</summary>
+    /// <param name="values">单元格值序列</param>
+    /// <param name="style">行级单元格样式（字体/填充/边框），null 使用默认样式</param>
+    public void WriteRow(IEnumerable<Object?> values, CellFormat? style)
+    {
         var sheet = GetCurrentSheet();
-        sheet.Add(values.ToList());
+        sheet.Add((values.ToList(), style));
     }
 
     /// <summary>将对象集合写入当前工作表（第一行为属性名标题）</summary>
@@ -146,6 +212,168 @@ public sealed class BiffWriter : IDisposable
         {
             WriteRow(row.ItemArray.Cast<Object?>());
         }
+    }
+
+    /// <summary>设置当前工作表中指定列的宽度</summary>
+    /// <param name="columnIndex">列索引（0基）</param>
+    /// <param name="width">列宽（单位：字符宽度，约等于默认字体字符宽度）</param>
+    /// <remarks>
+    /// 列宽以最大字符宽度（256分之一的字符宽度）为单位存储。
+    /// 例如 width=10 表示约 10 个字符宽度，内部存储为 10*256=2560。
+    /// </remarks>
+    public void SetColumnWidth(Int32 columnIndex, Double width)
+    {
+        if (!_sheetColWidths.TryGetValue(_currentSheet, out var colMap))
+        {
+            colMap = [];
+            _sheetColWidths[_currentSheet] = colMap;
+        }
+        // BIFF8 COLINFO 使用 1/256 字符宽度为单位
+        colMap[columnIndex] = (Int32)(width * 256);
+    }
+
+    /// <summary>设置当前工作表中指定列的数字格式</summary>
+    /// <param name="columnIndex">列索引（0基）</param>
+    /// <param name="format">Excel 数字格式字符串（如 yyyy-mm-dd、#,##0.00、0%）</param>
+    public void SetColumnNumberFormat(Int32 columnIndex, String format)
+    {
+        if (!_columnFormats.TryGetValue(_currentSheet, out var colMap))
+        {
+            colMap = [];
+            _columnFormats[_currentSheet] = colMap;
+        }
+        colMap[columnIndex] = format;
+    }
+
+    /// <summary>设置当前工作表的冻结窗格</summary>
+    /// <param name="freezeRow">冻结行数（0 不冻结行），标题行下方的行数</param>
+    /// <param name="freezeCol">冻结列数（0 不冻结列），左侧的列数</param>
+    /// <remarks>例如 SetFreezePane(1, 0) 冻结首行；SetFreezePane(1, 2) 冻结首行和前两列</remarks>
+    public void SetFreezePane(Int32 freezeRow, Int32 freezeCol)
+    {
+        _sheetFreezePanes[_currentSheet] = (freezeRow, freezeCol);
+    }
+
+    /// <summary>合并当前工作表中指定区域的单元格</summary>
+    /// <param name="firstRow">起始行（0基）</param>
+    /// <param name="firstCol">起始列（0基）</param>
+    /// <param name="lastRow">结束行（含）</param>
+    /// <param name="lastCol">结束列（含）</param>
+    public void MergeCells(Int32 firstRow, Int32 firstCol, Int32 lastRow, Int32 lastCol)
+    {
+        if (!_sheetMergedCells.TryGetValue(_currentSheet, out var list))
+        {
+            list = [];
+            _sheetMergedCells[_currentSheet] = list;
+        }
+        list.Add((firstRow, firstCol, lastRow, lastCol));
+    }
+
+    /// <summary>设置当前工作表中指定行的高度</summary>
+    /// <param name="rowIndex">行索引（0基）</param>
+    /// <param name="heightPoints">行高（磅值），如 20=20pt</param>
+    public void SetRowHeight(Int32 rowIndex, Double heightPoints)
+    {
+        if (!_sheetRowHeights.TryGetValue(_currentSheet, out var map))
+        {
+            map = [];
+            _sheetRowHeights[_currentSheet] = map;
+        }
+        // BIFF8 行高单位：twips（1pt = 20 twips）
+        map[rowIndex] = (Int32)(heightPoints * 20);
+    }
+
+    /// <summary>在当前工作表末尾添加超链接</summary>
+    /// <param name="url">目标 URL</param>
+    /// <param name="rowIndex">行索引（0基）</param>
+    /// <param name="colIndex">列索引（0基）</param>
+    /// <param name="displayText">显示文本（可选，不指定则使用 URL）</param>
+    public void AddHyperlink(String url, Int32 rowIndex, Int32 colIndex, String? displayText = null)
+    {
+        if (!_sheetHyperlinks.TryGetValue(_currentSheet, out var list))
+        {
+            list = [];
+            _sheetHyperlinks[_currentSheet] = list;
+        }
+        list.Add((rowIndex, colIndex, url, displayText));
+    }
+
+    /// <summary>在当前工作表设置自动筛选区域</summary>
+    /// <param name="firstRow">起始行（0基）</param>
+    /// <param name="firstCol">起始列（0基）</param>
+    /// <param name="lastRow">结束行（含）</param>
+    /// <param name="lastCol">结束列（含）</param>
+    public void SetAutoFilter(Int32 firstRow, Int32 firstCol, Int32 lastRow, Int32 lastCol)
+    {
+        _sheetAutoFilters[_currentSheet] = (firstRow, lastRow, firstCol, lastCol);
+    }
+
+    /// <summary>在当前工作表设置页面属性</summary>
+    /// <param name="landscape">横向（true）或纵向（false），默认纵向</param>
+    /// <param name="paperSize">纸张大小（9=Letter, 11=Legal, 1=A5, 5=A4, 8=A3，默认 A4=5）</param>
+    /// <param name="headerMargin">页眉边距（英寸，默认 0.3）</param>
+    /// <param name="footerMargin">页脚边距（英寸，默认 0.3）</param>
+    public void SetPageSetup(Boolean landscape = false, Int32 paperSize = 5, Double headerMargin = 0.3, Double footerMargin = 0.3)
+    {
+        _sheetPageSetups[_currentSheet] = (landscape, paperSize, headerMargin, footerMargin);
+    }
+
+    /// <summary>设置当前工作表的页眉和页脚文本</summary>
+    /// <param name="header">页眉文本（支持 &amp;L左对齐 &amp;C居中 &amp;R右对齐 &amp;P页码 &amp;D日期）</param>
+    /// <param name="footer">页脚文本</param>
+    public void SetHeaderFooter(String? header = null, String? footer = null)
+    {
+        _sheetHeaderFooters[_currentSheet] = (header ?? String.Empty, footer ?? String.Empty);
+    }
+
+    /// <summary>设置当前工作表的默认列宽</summary>
+    /// <param name="width">列宽（1/256 字符宽度单位），Excel 默认约 2048（8 字符宽）</param>
+    public void SetDefaultColumnWidth(Int32 width = 2048)
+    {
+        _sheetDefColWidths[_currentSheet] = (UInt16)width;
+    }
+
+    /// <summary>保护当前工作表（可选密码，Excel 97-2003 采用 15 位 XOR 哈希）</summary>
+    /// <param name="password">保护密码（可空，null 时仅启用保护无密码）</param>
+    public void ProtectSheet(String? password = null)
+    {
+        _sheetProtection[_currentSheet] = password;
+    }
+
+    /// <summary>为当前工作表指定区域添加下拉列表数据验证</summary>
+    /// <param name="cellRange">应用范围（如 "A2:A100"）</param>
+    /// <param name="items">下拉选项列表</param>
+    public void AddDropdownValidation(String cellRange, String[] items)
+    {
+        if (cellRange.IsNullOrEmpty()) throw new ArgumentNullException(nameof(cellRange));
+        if (items == null || items.Length == 0) throw new ArgumentNullException(nameof(items));
+        if (!_sheetValidations.TryGetValue(_currentSheet, out var list))
+        {
+            list = [];
+            _sheetValidations[_currentSheet] = list;
+        }
+        list.Add((cellRange, items));
+    }
+
+    /// <summary>添加用户自定义命名范围</summary>
+    /// <param name="name">名称（须符合 Excel 命名规则，不可以 _xlnm. 开头）</param>
+    /// <param name="formula">公式或范围引用（如 "Sheet1!$A$1:$B$10" 或 "'数据'!$C:$C"）</param>
+    public void AddDefinedName(String name, String formula)
+    {
+        if (name.IsNullOrEmpty()) throw new ArgumentNullException(nameof(name));
+        if (formula.IsNullOrEmpty()) throw new ArgumentNullException(nameof(formula));
+        _definedNames.Add((name, formula));
+    }
+
+    /// <summary>设置当前工作表的打印区域</summary>
+    /// <param name="range">区域引用（如 "A1:F50"，不含工作表名）</param>
+    public void SetPrintArea(String range)
+    {
+        if (range.IsNullOrEmpty()) throw new ArgumentNullException(nameof(range));
+        if (!range.Contains('!'))
+            range = $"'{_currentSheet}'!{range}";
+        _definedNames.RemoveAll(dn => dn.Name.EqualIgnoreCase("_xlnm.Print_Area") && dn.Formula.Contains($"'{_currentSheet}'!"));
+        AddDefinedName("_xlnm.Print_Area", range);
     }
 
     #endregion
@@ -193,12 +421,14 @@ public sealed class BiffWriter : IDisposable
         foreach (var sheetName in _sheetNames)
         {
             if (!_sheetData.TryGetValue(sheetName, out var rows)) continue;
-            foreach (var row in rows)
+            foreach (var (values, _) in rows)
             {
-                foreach (var cell in row)
+                foreach (var cell in values)
                 {
                     if (cell is String s && !_sstIndex.ContainsKey(s))
                     {
+                        // 公式不加入 SST（以 = 开头）
+                        if (s.Length > 0 && s[0] == '=') continue;
                         _sstIndex[s] = _sst.Count;
                         _sst.Add(s);
                     }
@@ -209,111 +439,353 @@ public sealed class BiffWriter : IDisposable
 
     private Byte[] BuildWorkbookStream()
     {
-        using var ms = new MemoryStream();
-        using var bw = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true);
+        // 收集所有不重复的行样式，分配字体/XF 索引
+        var styleMap = new Dictionary<CellFormat, Int32>(); // style → xfIndex (1基，0=默认)
+        var styleFonts = new List<CellFormat>();
+        var nextXfIndex = 21; // 0-20 为内置默认
+        var nextFontIndex = 6;  // 0-5 为默认字体
 
-        // 1. Globals BOF
-        WriteRecord(bw, RecBof, BuildBofData(0x0005)); // 0x0005 = Workbook Globals
-
-        // 2. 默认字体（BIFF8 要求至少 5 个 FONT 记录，index 0-4，index 4 为保留）
-        for (var fi = 0; fi < 6; fi++)
-        {
-            WriteRecord(bw, RecFont, BuildFontRecord());
-        }
-
-        // 3. 默认格式（Format record，数值日期格式索引）
-        WriteRecord(bw, RecFormat, BuildFormatRecord(164, "yyyy/mm/dd")); // 自定义日期格式
-
-        // 4. XF（扩展格式）记录：最少 21 条（BIFF8 基本样式）
-        WriteXfRecords(bw);
-
-        // 5. BoundSheet：每个工作表一条，先填 0 偏移占位
-        var boundSheetPositions = new List<Int64>();
         foreach (var sheetName in _sheetNames)
         {
-            boundSheetPositions.Add(ms.Position + 4); // +4 跳过记录头
-            WriteRecord(bw, RecBoundSheet, BuildBoundSheetData(sheetName, 0));
-        }
-
-        // 6. 共享字符串表（SST）
-        WriteRecord(bw, RecSst, BuildSstRecord());
-
-        // 7. Globals EOF
-        WriteRecord(bw, RecEof, []);
-
-        // 8. 写入各工作表，并回填 BoundSheet 偏移
-        for (var si = 0; si < _sheetNames.Count; si++)
-        {
-            var sheetName = _sheetNames[si];
-            var sheetBofOffset = (Int32)ms.Position;
-
-            // 回填 BoundSheet 中的 BOF 偏移
-            var savedPos = ms.Position;
-            ms.Position = boundSheetPositions[si];
-            bw.Write(sheetBofOffset);
-            ms.Position = savedPos;
-
-            // 写入工作表数据
-            WriteSheetStream(bw, sheetName);
-        }
-
-        bw.Flush();
-        return ms.ToArray();
-    }
-
-    private void WriteSheetStream(BinaryWriter bw, String sheetName)
-    {
-        var rows = _sheetData.TryGetValue(sheetName, out var r) ? r : [];
-
-        // Sheet BOF
-        WriteRecord(bw, RecBof, BuildBofData(0x0010)); // 0x0010 = Worksheet
-
-        // DIMENSIONS 记录
-        var rowCount = rows.Count;
-        var colCount = rows.Count > 0 ? rows.Max(r2 => r2.Count) : 0;
-        WriteRecord(bw, RecDimensions, BuildDimensionsData(rowCount, colCount));
-
-        // ROW + 单元格记录
-        for (var ri = 0; ri < rows.Count; ri++)
-        {
-            var row = rows[ri];
-            var colMax = row.Count;
-
-            // ROW 描述记录
-            WriteRecord(bw, RecRow, BuildRowData(ri, 0, colMax));
-
-            // 单元格数据
-            for (var ci = 0; ci < row.Count; ci++)
+            if (!_sheetData.TryGetValue(sheetName, out var rows)) continue;
+            foreach (var (_, style) in rows)
             {
-                var cell = row[ci];
-                if (cell == null)
+                if (style != null && !styleMap.ContainsKey(style))
                 {
-                    WriteRecord(bw, RecBlank, BuildBlankData(ri, ci));
-                }
-                else if (cell is String strVal)
-                {
-                    var sstIdx = _sstIndex.TryGetValue(strVal, out var idx) ? idx : 0;
-                    WriteRecord(bw, RecLabelSst, BuildLabelSstData(ri, ci, sstIdx));
-                }
-                else if (cell is Boolean boolVal)
-                {
-                    WriteRecord(bw, RecBoolErr, BuildBoolErrData(ri, ci, boolVal ? (Byte)1 : (Byte)0, false));
-                }
-                else if (cell is DateTime dtVal)
-                {
-                    var serial = DateToSerial(dtVal);
-                    WriteRecord(bw, RecNumber, BuildNumberData(ri, ci, serial, xfIndex: 1)); // XF index 1 = 日期格式
-                }
-                else
-                {
-                    var dbl = ConvertToDouble(cell);
-                    WriteRecord(bw, RecNumber, BuildNumberData(ri, ci, dbl));
+                    styleMap[style] = nextXfIndex++;
+                    styleFonts.Add(style);
                 }
             }
         }
 
+        using var ms = new MemoryStream();
+
+        // 提前收集格式映射（需要先于字体/XF 记录使用）
+        var formatMap = new Dictionary<String, Int32>(); // formatString → formatIndex
+        var nextFormatIdx = 165;
+        foreach (var sheetName in _sheetNames)
+        {
+            if (!_columnFormats.TryGetValue(sheetName, out var colFmts)) continue;
+            foreach (var kv in colFmts)
+            {
+                var fmt = kv.Value;
+                if (!formatMap.ContainsKey(fmt))
+                    formatMap[fmt] = nextFormatIdx++;
+            }
+        }
+
+        // 为每个自定义格式创建 XF 索引
+        var formatXfIndex = new Dictionary<Int32, Int32>(); // formatIndex → xfIndex
+        foreach (var kv in formatMap)
+        {
+            formatXfIndex[kv.Value] = nextXfIndex;
+            nextFontIndex++; // 每个格式需要自己的字体槽位
+            nextXfIndex++;
+        }
+
+        // 1. Globals BOF
+        WriteRecord(ms, RecBof, BuildBofData(0x0005));
+
+        // 2. 字体记录（6默认 + 样式字体 + 每自定义格式一个字体槽位）
+        for (var fi = 0; fi < 6; fi++)
+            WriteRecord(ms, RecFont, BuildFontRecord(null));
+        foreach (var s in styleFonts)
+            WriteRecord(ms, RecFont, BuildFontRecord(s));
+        // 为每个自定义格式写一个默认字体
+        foreach (var _ in formatMap)
+            WriteRecord(ms, RecFont, BuildFontRecord(null));
+
+        // 3. 格式记录（默认日期格式 + 自定义数字格式）
+        // 写入内置日期格式
+        WriteRecord(ms, RecFormat, BuildFormatRecord(164, "yyyy/mm/dd"));
+        // 写入自定义列格式
+        foreach (var kv in formatMap)
+            WriteRecord(ms, RecFormat, BuildFormatRecord(kv.Value, kv.Key));
+
+        // 4. XF 记录：21 条内置 + N 条自定义样式
+        WriteXfRecords(ms, styleMap, nextFontIndex, formatXfIndex);
+
+        // 5. 命名范围：SUPBOOK + EXTERNSHEET + NAME（位于 Globals 段）
+        if (_definedNames.Count > 0)
+        {
+            WriteRecord(ms, RecSupBook, BuildSupBookData());
+            WriteRecord(ms, RecExternSheet, BuildExternSheetData());
+            foreach (var (name, formula) in _definedNames)
+                WriteRecord(ms, RecName, BuildNameData(name, formula));
+        }
+
+        // 6. BoundSheet
+        var boundSheetPositions = new List<Int64>();
+        foreach (var sheetName in _sheetNames)
+        {
+            boundSheetPositions.Add(ms.Position + 4);
+            WriteRecord(ms, RecBoundSheet, BuildBoundSheetData(sheetName, 0));
+        }
+
+        // 7. SST
+        WriteRecord(ms, RecSst, BuildSstRecord());
+
+        // 8. Globals EOF
+        WriteRecord(ms, RecEof, []);
+
+        // 8. 写入各工作表
+        var intBuf = new Byte[4];
+        for (var si = 0; si < _sheetNames.Count; si++)
+        {
+            var sheetName = _sheetNames[si];
+            var sheetBofOffset = (Int32)ms.Position;
+            var savedPos = ms.Position;
+            ms.Position = boundSheetPositions[si];
+            var sw = new SpanWriter(intBuf);
+            sw.Write(sheetBofOffset);
+            ms.Write(intBuf, 0, 4);
+            ms.Position = savedPos;
+            WriteSheetStream(ms, sheetName, styleMap, formatMap, formatXfIndex);
+        }
+
+        return ms.ToArray();
+    }
+
+    /// <summary>构建内部引用 SUPBOOK 记录（cSheets + grbit=0x0101）</summary>
+    private Byte[] BuildSupBookData()
+    {
+        using var ms = new MemoryStream();
+        WriteLE2(ms, (UInt16)_sheetNames.Count);
+        WriteLE2(ms, 0x0101);
+        return ms.ToArray();
+    }
+
+    /// <summary>构建 EXTERNSHEET 记录：每个内部工作表一个 XTI（cTab=1, iSupBook=0）</summary>
+    private Byte[] BuildExternSheetData()
+    {
+        using var ms = new MemoryStream();
+        WriteLE2(ms, (UInt16)_sheetNames.Count); // cXTI
+        for (var i = 0; i < _sheetNames.Count; i++)
+        {
+            WriteLE2(ms, 1);        // cTab
+            WriteLE2(ms, 0);        // iSupBook = 0（第一个 SUPBOOK 为内部引用）
+            WriteLE2(ms, (UInt16)i); // itabFirst
+            WriteLE2(ms, (UInt16)i); // itabLast
+        }
+        return ms.ToArray();
+    }
+
+    /// <summary>构建 NAME 记录（命名范围/打印区域），公式为 RgceArea3d</summary>
+    private Byte[] BuildNameData(String name, String formula)
+    {
+        var (sheetName, range) = ParseFormulaRef(formula);
+        var itab = 0;
+        if (sheetName != null)
+        {
+            var idx = _sheetNames.IndexOf(sheetName);
+            if (idx >= 0) itab = idx;
+        }
+
+        var (r1, c1, r2, c2) = ParseRange(range);
+
+        // option bit0：名称编码（1=UTF-16）；bit5：常量/区域引用
+        var isUtf16 = name.Any(ch => ch > 0x7F);
+        var option = (UInt16)(0x0020 | (isUtf16 ? 0x01 : 0x00));
+        var nameBytes = isUtf16 ? Encoding.Unicode.GetBytes(name) : Encoding.ASCII.GetBytes(name);
+
+        // 公式：grbit(2) + ptgArea3d(1=0x3B) + ixti(2) + r1(2)+c1(2)+r2(2)+c2(2)，行列 0 基无绝对标志（与读取端一致）
+        using var fms = new MemoryStream();
+        WriteLE2(fms, 0);
+        fms.WriteByte(0x3B);
+        WriteLE2(fms, (UInt16)itab);
+        WriteLE2(fms, (UInt16)r1);
+        WriteLE2(fms, (UInt16)c1);
+        WriteLE2(fms, (UInt16)r2);
+        WriteLE2(fms, (UInt16)c2);
+        var formulaBytes = fms.ToArray();
+
+        using var ms = new MemoryStream();
+        WriteLE2(ms, option);
+        ms.WriteByte(0);                    // keyboard
+        ms.WriteByte((Byte)name.Length);    // cch
+        WriteLE2(ms, (UInt16)formulaBytes.Length); // cce
+        WriteLE2(ms, 0);                    // ixals
+        WriteLE2(ms, 0);                    // reserved
+        WriteLE2(ms, 0);                    // cce2
+        ms.WriteByte((Byte)formulaBytes.Length); // cceFormula
+        ms.WriteByte(0);                    // padding（读取端 namePos=14）
+        ms.Write(nameBytes, 0, nameBytes.Length);
+        ms.Write(formulaBytes, 0, formulaBytes.Length);
+        return ms.ToArray();
+    }
+
+    /// <summary>解析公式引用（"Sheet1!A1:B2" 或 "'My Sheet'!A1:B2"）为工作表名与范围</summary>
+    private static (String? Sheet, String Range) ParseFormulaRef(String formula)
+    {
+        var idx = formula.IndexOf('!');
+        if (idx < 0) return (null, formula);
+        var sheet = formula[..idx];
+        if (sheet.Length >= 2 && sheet[0] == '\'' && sheet[^1] == '\'')
+            sheet = sheet[1..^1];
+        var range = formula[(idx + 1)..];
+        return (sheet, range);
+    }
+
+    /// <summary>写入小端 UInt16</summary>
+    private static void WriteLE2(Stream stream, UInt16 value)
+    {
+        stream.WriteByte((Byte)(value & 0xFF));
+        stream.WriteByte((Byte)(value >> 8));
+    }
+
+    private void WriteSheetStream(Stream stream, String sheetName, Dictionary<CellFormat, Int32> styleMap,
+        Dictionary<String, Int32> formatMap, Dictionary<Int32, Int32> formatXfIndex)
+    {
+        var rows = _sheetData.TryGetValue(sheetName, out var r) ? r : [];
+
+        // Sheet BOF
+        WriteRecord(stream, RecBof, BuildBofData(0x0010));
+
+        // DIMENSIONS
+        var rowCount = rows.Count;
+        var colCount = rows.Count > 0 ? rows.Max(r2 => r2.Values.Count) : 0;
+        WriteRecord(stream, RecDimensions, BuildDimensionsData(rowCount, colCount));
+
+        // WINDOW2 — 冻结窗格
+        if (_sheetFreezePanes.TryGetValue(sheetName, out var freeze))
+            WriteRecord(stream, RecWindow2, BuildWindow2Data(freeze.Row, freeze.Col));
+        else
+            WriteRecord(stream, RecWindow2, BuildWindow2Data(0, 0));
+
+        // COLINFO — 列宽
+        if (_sheetColWidths.TryGetValue(sheetName, out var colWidths))
+        {
+            foreach (var kv in colWidths.OrderBy(kv => kv.Key))
+            {
+                WriteRecord(stream, RecColInfo, BuildColInfoData(kv.Key, kv.Key, kv.Value));
+            }
+        }
+
+        // 获取当前工作表的列格式映射
+        _columnFormats.TryGetValue(sheetName, out var sheetColFmts);
+
+        // 获取当前工作表的行高映射
+        _sheetRowHeights.TryGetValue(sheetName, out var rowHeights);
+
+        // ROW + 单元格记录
+        for (var ri = 0; ri < rows.Count; ri++)
+        {
+            var (values, style) = rows[ri];
+            var colMax = values.Count;
+
+            // 确定此行的 XF 索引基础值
+            var baseXf = 15; // 默认
+            if (style != null && styleMap.TryGetValue(style, out var sx))
+                baseXf = sx;
+
+            // 使用自定义行高或默认值
+            var rowHeight = rowHeights?.TryGetValue(ri, out var h) == true ? h : 0x00FF;
+            WriteRecord(stream, RecRow, BuildRowData(ri, 0, colMax, rowHeight));
+
+            for (var ci = 0; ci < values.Count; ci++)
+            {
+                // 获取此列的 XF 索引（格式优先于行样式）
+                var cellXf = baseXf;
+                if (sheetColFmts != null && sheetColFmts.TryGetValue(ci, out var colFmt) &&
+                    formatMap.TryGetValue(colFmt, out var fmtIdx) &&
+                    formatXfIndex.TryGetValue(fmtIdx, out var fmtXf))
+                    cellXf = fmtXf;
+
+                var cell = values[ci];
+                if (cell == null)
+                {
+                    WriteRecord(stream, RecBlank, BuildBlankData(ri, ci, cellXf));
+                }
+                else if (cell is String strVal)
+                {
+                    // 检测公式：以 = 开头的字符串视为公式
+                    if (strVal.Length > 0 && strVal[0] == '=')
+                    {
+                        WriteRecord(stream, RecFormula, BuildFormulaData(ri, ci, cellXf, strVal));
+                    }
+                    else
+                    {
+                        var sstIdx = _sstIndex.TryGetValue(strVal, out var idx) ? idx : 0;
+                        WriteRecord(stream, RecLabelSst, BuildLabelSstData(ri, ci, sstIdx, cellXf));
+                    }
+                }
+                else if (cell is Boolean boolVal)
+                {
+                    WriteRecord(stream, RecBoolErr, BuildBoolErrData(ri, ci, boolVal ? (Byte)1 : (Byte)0, false, cellXf));
+                }
+                else if (cell is DateTime dtVal)
+                {
+                    var serial = DateToSerial(dtVal);
+                    // 日期使用列格式 XF 或内置日期 XF(1)
+                    var dateXf = cellXf != 15 ? cellXf : 1;
+                    WriteRecord(stream, RecNumber, BuildNumberData(ri, ci, serial, xfIndex: dateXf));
+                }
+                else
+                {
+                    var dbl = ConvertToDouble(cell);
+                    WriteRecord(stream, RecNumber, BuildNumberData(ri, ci, dbl, cellXf));
+                }
+            }
+        }
+
+        // MERGEDCELLS — 合并单元格
+        if (_sheetMergedCells.TryGetValue(sheetName, out var merges) && merges.Count > 0)
+        {
+            WriteRecord(stream, RecMergedCells, BuildMergedCellsData(merges));
+        }
+
+        // HYPERLINK — 超链接
+        if (_sheetHyperlinks.TryGetValue(sheetName, out var hyperlinks) && hyperlinks.Count > 0)
+        {
+            foreach (var (row, col, url, text) in hyperlinks)
+            {
+                WriteRecord(stream, RecHyperlink, BuildHyperlinkData(row, col, row, col, url, text));
+            }
+        }
+
+        // AUTO FILTER — 自动筛选
+        if (_sheetAutoFilters.TryGetValue(sheetName, out var af))
+        {
+            WriteRecord(stream, RecAutoFilter, BuildAutoFilterData(af.FirstRow, af.LastRow, af.FirstCol, af.LastCol));
+        }
+
+        // SETUP — 页面设置
+        if (_sheetPageSetups.TryGetValue(sheetName, out var ps))
+        {
+            WriteRecord(stream, RecSetup, BuildSetupData(ps.Landscape, ps.PaperSize, ps.HeaderMargin, ps.FooterMargin));
+        }
+
+        // HEADER/FOOTER — 页眉页脚
+        if (_sheetHeaderFooters.TryGetValue(sheetName, out var hf))
+        {
+            if (hf.Header.Length > 0) WriteRecord(stream, RecHeader, BuildHeaderFooterData(hf.Header));
+            if (hf.Footer.Length > 0) WriteRecord(stream, RecFooter, BuildHeaderFooterData(hf.Footer));
+        }
+
+        // DEFCOLWIDTH — 默认列宽
+        if (_sheetDefColWidths.TryGetValue(sheetName, out var defColWidth))
+        {
+            WriteRecord(stream, RecDefColWidth, BuildDefColWidthData(defColWidth));
+        }
+
+        // PROTECT / PASSWORD — 工作表保护
+        if (_sheetProtection.TryGetValue(sheetName, out var pwd))
+        {
+            WriteRecord(stream, RecProtect, BuildProtectData());
+            if (!pwd.IsNullOrEmpty())
+                WriteRecord(stream, RecPassword, BuildPasswordData(HashPassword(pwd!)));
+        }
+
+        // DV + DVAL — 数据验证（下拉列表）
+        if (_sheetValidations.TryGetValue(sheetName, out var validations) && validations.Count > 0)
+        {
+            foreach (var (range, items) in validations)
+                WriteRecord(stream, RecDv, BuildDvData(range, items));
+            WriteRecord(stream, RecDval, BuildDvalData(validations.Count));
+        }
+
         // Sheet EOF
-        WriteRecord(bw, RecEof, []);
+        WriteRecord(stream, RecEof, []);
     }
 
     #endregion
@@ -349,26 +821,30 @@ public sealed class BiffWriter : IDisposable
 
     private Byte[] BuildSstRecord()
     {
-        using var ms = new MemoryStream();
-        using var bw = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true);
+        // 预计算总大小
+        var totalSize = 8; // totalRefs(4) + uniqueCount(4)
+        foreach (var s in _sst)
+            totalSize += 3 + s.Length * 2; // cch(2) + flags(1) + UTF-16LE chars
 
-        // 总字符串引用数 + 唯一字符串数
-        var totalRefs = _sst.Count; // 简化：引用数 = 唯一数
-        bw.Write(totalRefs);
-        bw.Write(_sst.Count);
+        using var ms = new MemoryStream(totalSize);
+        var header = new Byte[8];
+        var writer = new SpanWriter(header);
+        writer.Write(_sst.Count); // total refs
+        writer.Write(_sst.Count); // unique count
+        ms.Write(header, 0, 8);
 
         foreach (var s in _sst)
         {
             // XLUnicodeString：cch(2) + flags(1) + UTF-16LE 数据
-            bw.Write((UInt16)s.Length);
-            bw.Write((Byte)0x01); // fHighByte = 1（UTF-16LE）
-            foreach (var ch in s)
-            {
-                bw.Write((UInt16)ch);
-            }
+            var strHeader = new Byte[3];
+            var sw = new SpanWriter(strHeader);
+            sw.Write((UInt16)s.Length);
+            sw.Write((Byte)0x01);
+            ms.Write(strHeader, 0, 3);
+            var charBytes = Encoding.Unicode.GetBytes(s);
+            ms.Write(charBytes, 0, charBytes.Length);
         }
 
-        bw.Flush();
         return ms.ToArray();
     }
 
@@ -384,14 +860,43 @@ public sealed class BiffWriter : IDisposable
         return buf;
     }
 
-    private static Byte[] BuildRowData(Int32 row, Int32 firstCol, Int32 lastCol)
+    private static Byte[] BuildColInfoData(Int32 firstCol, Int32 lastCol, Int32 width)
+    {
+        // COLINFO 记录：colFirst(2) + colLast(2) + coldx(2) + ixfe(2) + grbit(2)
+        var buf = new Byte[12];
+        var writer = new SpanWriter(buf, 0, buf.Length);
+        writer.Write((UInt16)firstCol);
+        writer.Write((UInt16)lastCol);
+        writer.Write((UInt16)width);     // 1/256 字符宽度
+        writer.Write((UInt16)0x000F);    // XF index (default=15)
+        writer.Write((UInt16)0x0000);    // grbit (not hidden, default)
+        return buf;
+    }
+
+    private static Byte[] BuildFormulaData(Int32 row, Int32 col, Int32 xfIndex, String formula)
+    {
+        var formulaBytes = Encoding.UTF8.GetBytes(formula);
+        var buf = new Byte[6 + 8 + 2 + 4 + 2 + formulaBytes.Length];
+        var writer = new SpanWriter(buf);
+        writer.Write((UInt16)row);
+        writer.Write((UInt16)col);
+        writer.Write((UInt16)xfIndex);
+        writer.Write(0L);              // Result: 0 = string/empty result
+        writer.Write((UInt16)0x0001);  // Options: recalc always
+        writer.Write(0u);              // Not used
+        writer.Write((UInt16)formulaBytes.Length);
+        formulaBytes.CopyTo(buf.AsSpan(writer.Position));
+        return buf;
+    }
+
+    private static Byte[] BuildRowData(Int32 row, Int32 firstCol, Int32 lastCol, Int32 rowHeight = 0x00FF)
     {
         var buf = new Byte[16];
         var writer = new SpanWriter(buf, 0, buf.Length);
         writer.Write((UInt16)row);
         writer.Write((UInt16)firstCol);
         writer.Write((UInt16)lastCol);
-        writer.Write((UInt16)0x00FF); // row height = 255 twips (default)
+        writer.Write((UInt16)rowHeight); // row height in twips (0x00FF = 255 twips = 12.75pt default)
         writer.Write((UInt16)0);      // unused
         writer.Write((UInt16)0);      // unused
         writer.Write((UInt16)0x0100); // default row attributes
@@ -399,13 +904,13 @@ public sealed class BiffWriter : IDisposable
         return buf;
     }
 
-    private static Byte[] BuildLabelSstData(Int32 row, Int32 col, Int32 sstIndex)
+    private static Byte[] BuildLabelSstData(Int32 row, Int32 col, Int32 sstIndex, Int32 xfIndex = 15)
     {
         var buf = new Byte[10];
         var writer = new SpanWriter(buf, 0, buf.Length);
         writer.Write((UInt16)row);
         writer.Write((UInt16)col);
-        writer.Write((UInt16)0x000F);    // XF index 15
+        writer.Write((UInt16)xfIndex);
         writer.Write((UInt32)sstIndex);
         return buf;
     }
@@ -421,49 +926,294 @@ public sealed class BiffWriter : IDisposable
         return buf;
     }
 
-    private static Byte[] BuildBoolErrData(Int32 row, Int32 col, Byte value, Boolean isError)
+    private static Byte[] BuildBoolErrData(Int32 row, Int32 col, Byte value, Boolean isError, Int32 xfIndex = 15)
     {
         var buf = new Byte[8];
         var writer = new SpanWriter(buf, 0, buf.Length);
         writer.Write((UInt16)row);
         writer.Write((UInt16)col);
-        writer.Write((UInt16)0x000F); // XF index 15
+        writer.Write((UInt16)xfIndex);
         writer.Write(value);
         writer.Write(isError ? (Byte)1 : (Byte)0);
         return buf;
     }
 
-    private static Byte[] BuildBlankData(Int32 row, Int32 col)
+    private static Byte[] BuildBlankData(Int32 row, Int32 col, Int32 xfIndex = 15)
     {
         var buf = new Byte[6];
         var writer = new SpanWriter(buf, 0, buf.Length);
         writer.Write((UInt16)row);
         writer.Write((UInt16)col);
-        writer.Write((UInt16)0x000F); // XF index 15
+        writer.Write((UInt16)xfIndex);
         return buf;
     }
 
-    private static Byte[] BuildFontRecord()
+    /// <summary>构建 WINDOW2 记录（含冻结窗格信息）</summary>
+    /// <param name="freezeRow">冻结行数（0=不冻结）</param>
+    /// <param name="freezeCol">冻结列数（0=不冻结）</param>
+    private static Byte[] BuildWindow2Data(Int32 freezeRow, Int32 freezeCol)
     {
-        // 默认字体：Arial 10pt（BIFF8 FONT 记录结构）
-        var name = "Arial";
+        var buf = new Byte[18];
+        var writer = new SpanWriter(buf, 0, buf.Length);
+        // grbit: bit3(0x08)=frozen, bit4(0x10)=no split panes
+        var flags = freezeRow > 0 || freezeCol > 0 ? (UInt16)0x0018 : (UInt16)0x0000;
+        writer.Write(flags);
+        writer.Write((UInt16)freezeRow);  // top row visible in frozen pane
+        writer.Write((UInt16)freezeCol);  // left column visible in frozen pane
+        writer.Write((UInt16)0x0040);     // color index (default: system foreground)
+        writer.Write((UInt16)0x0000);     // reserved
+        writer.Write((UInt16)0x0000);     // frozen scroll row (0 = not split)
+        writer.Write((UInt16)0x0000);     // frozen scroll column
+        writer.Write((UInt16)0x0040);     // Use gridline color
+        return buf;
+    }
+
+    /// <summary>构建 MERGEDCELLS 记录</summary>
+    private static Byte[] BuildMergedCellsData(List<(Int32 R1, Int32 C1, Int32 R2, Int32 C2)> merges)
+    {
+        var buf = new Byte[2 + merges.Count * 8];
+        var writer = new SpanWriter(buf, 0, buf.Length);
+        writer.Write((UInt16)merges.Count);
+        foreach (var (r1, c1, r2, c2) in merges)
+        {
+            writer.Write((UInt16)r1);
+            writer.Write((UInt16)r2);
+            writer.Write((UInt16)c1);
+            writer.Write((UInt16)c2);
+        }
+        return buf;
+    }
+
+    /// <summary>构建 HYPERLINK 记录</summary>
+    private static Byte[] BuildHyperlinkData(Int32 firstRow, Int32 firstCol, Int32 lastRow, Int32 lastCol, String url, String? description)
+    {
+        // BIFF8 HYPERLINK: 固定28字节头部 + URL + 可选描述
+        var urlBytes = Encoding.UTF8.GetBytes(url);
+        var descBytes = description != null ? Encoding.UTF8.GetBytes(description) : [];
+        var buf = new Byte[28 + urlBytes.Length + descBytes.Length];
+        var writer = new SpanWriter(buf, 0, buf.Length);
+        writer.Write((UInt16)firstRow);
+        writer.Write((UInt16)lastRow);
+        writer.Write((UInt16)firstCol);
+        writer.Write((UInt16)lastCol);
+        writer.Write(0u);            // guid[0-3] = 0 (standard URL)
+        writer.Write(0u);            // guid[4-7]
+        writer.Write(0u);            // guid[8-11]
+        writer.Write(0u);            // guid[12-15]
+        writer.Write((UInt32)0);     // stream byte count (0 = no moniker stream)
+        writer.Write((UInt16)urlBytes.Length);
+        if (urlBytes.Length > 0)
+        {
+            Array.Copy(urlBytes, 0, buf, 28, urlBytes.Length);
+        }
+        return buf;
+    }
+
+    private static Byte[] BuildAutoFilterData(Int32 firstRow, Int32 lastRow, Int32 firstCol, Int32 lastCol)
+    {
+        // BIFF8 AUTO FILTER: 2(rowCount) + 2(colCount) + 2(dataRowCount) = 6 bytes
+        var buf = new Byte[6];
+        var writer = new SpanWriter(buf, 0, 6);
+        writer.Write((UInt16)(lastRow - firstRow + 1));
+        writer.Write((UInt16)(lastCol - firstCol + 1));
+        writer.Write((UInt16)(lastRow - firstRow + 1));
+        return buf;
+    }
+
+    private static Byte[] BuildSetupData(Boolean landscape, Int32 paperSize, Double headerMargin, Double footerMargin)
+    {
+        // BIFF8 SETUP (0x00A1): 固定 34 字节
+        // 字 段: 2(papSize)+2(scale)+2(pgStart)+2(fitWidth)+2(fitHeight)+2(grbit)+
+        //          2(sclNum)+2(sclDen)+2(marginH)+2(marginH2)+2(marginF)+2(marginF2)+
+        //          2(copies)+2(fface)+4(reserved)
+        var buf = new Byte[34];
+        var writer = new SpanWriter(buf, 0, 34);
+        writer.Write((UInt16)paperSize);              // 0-1: paper size (5=A4)
+        writer.Write((UInt16)100);                     // 2-3: scale = 100%
+        writer.Write((UInt16)1);                       // 4-5: page start = 1
+        writer.Write((UInt16)1);                       // 6-7: fit width = 1
+        writer.Write((UInt16)1);                       // 8-9: fit height = 1
+        var grbit = (UInt16)(landscape ? 0x0001 : 0x0000);
+        writer.Write(grbit);                           // 10-11: grbit (bit0=landscape)
+        writer.Write((UInt16)100);                     // 12-13: sclNum (numerator)
+        writer.Write((UInt16)100);                     // 14-15: sclDen (denominator)
+        writer.Write((UInt16)(headerMargin * 100));    // 16-17: header margin (0.01" units)
+        writer.Write((UInt16)0);                       // 18-19: header margin 2
+        writer.Write((UInt16)(footerMargin * 100));    // 20-21: footer margin
+        writer.Write((UInt16)0);                       // 22-23: footer margin 2
+        writer.Write((UInt16)1);                       // 24-25: copies
+        writer.Write((UInt16)0);                       // 26-27: fface (first page number? 0=auto)
+        writer.Write(0u);                              // 28-31: reserved
+        writer.Write((UInt16)0);                       // 32-33: reserved
+        return buf;
+    }
+
+    private static Byte[] BuildHeaderFooterData(String text)
+    {
+        // BIFF8 HEADER/FOOTER: 2(cch) + Unicode string
+        var bytes = Encoding.Unicode.GetBytes(text);
+        var buf = new Byte[2 + bytes.Length];
+        var writer = new SpanWriter(buf, 0, buf.Length);
+        writer.Write((UInt16)text.Length);
+        if (bytes.Length > 0)
+            Array.Copy(bytes, 0, buf, 2, bytes.Length);
+        return buf;
+    }
+
+    private static Byte[] BuildDefColWidthData(UInt16 width)
+    {
+        // BIFF8 DEFCOLWIDTH: 2(gc12) = 2 bytes
+        var buf = new Byte[2];
+        var writer = new SpanWriter(buf, 0, 2);
+        writer.Write(width);
+        return buf;
+    }
+
+    /// <summary>构建 PROTECT 记录（fLock=1 表示受保护）</summary>
+    private static Byte[] BuildProtectData()
+    {
+        var buf = new Byte[2];
+        var writer = new SpanWriter(buf, 0, 2);
+        writer.Write((UInt16)1);
+        return buf;
+    }
+
+    /// <summary>构建 PASSWORD 记录（15 位密码哈希）</summary>
+    private static Byte[] BuildPasswordData(UInt16 hash)
+    {
+        var buf = new Byte[2];
+        var writer = new SpanWriter(buf, 0, 2);
+        writer.Write(hash);
+        return buf;
+    }
+
+    /// <summary>构建 DV 记录（数据验证，当前支持 list 下拉列表）</summary>
+    private static Byte[] BuildDvData(String range, String[] items)
+    {
+        var (r1, c1, r2, c2) = ParseRange(range);
+        // formula1 = "item1,item2"（带引号，UTF-16LE），与 xlsx 约定一致
+        var formula = "\"" + String.Join(",", items) + "\"";
+        var formulaBytes = Encoding.Unicode.GetBytes(formula);
+
+        var buf = new Byte[22 + formulaBytes.Length];
+        var writer = new SpanWriter(buf, 0, buf.Length);
+        writer.Write((UInt16)0x0000);                        // fOption1: type=0(list), operator=0
+        writer.Write((UInt16)0x0000);                        // fOption2
+        writer.Write((UInt16)0);                             // ixfe
+        writer.Write((UInt16)r1);
+        writer.Write((UInt16)c1);
+        writer.Write((UInt16)r2);
+        writer.Write((UInt16)c2);
+        writer.Write((UInt16)0);                             // titleCch
+        writer.Write((UInt16)0);                             // promptCch
+        writer.Write((UInt16)formulaBytes.Length);           // cch1（公式1字节长度）
+        writer.Write((UInt16)0);                             // cch2
+        Array.Copy(formulaBytes, 0, buf, 22, formulaBytes.Length);
+        return buf;
+    }
+
+    /// <summary>构建 DVAL 记录（引用数据验证范围）</summary>
+    private static Byte[] BuildDvalData(Int32 count)
+    {
+        var buf = new Byte[10];
+        var writer = new SpanWriter(buf, 0, 10);
+        writer.Write((UInt16)0);                             // fOption
+        writer.Write((UInt16)count);                         // cDv
+        writer.Write((UInt16)(count > 0 ? 0 : 0xFFFF));      // dvFirst（首个 DV 索引，无则为 -1）
+        writer.Write(0u);                                    // reserved
+        return buf;
+    }
+
+    /// <summary>BIFF8 密码哈希（15 位 XOR 算法）</summary>
+    private static UInt16 HashPassword(String password)
+    {
+        UInt16 hash = 0;
+        for (var i = password.Length - 1; i >= 0; i--)
+        {
+            hash = (UInt16)((hash >> 14) & 0x01);
+            hash = (UInt16)((hash << 1) & 0x7FFF);
+            hash ^= password[i];
+        }
+        hash = (UInt16)((((hash >> 14) & 0x01) | ((hash << 1) & 0x7FFF)) ^ (UInt16)(password.Length ^ 0xCE4B));
+        return hash;
+    }
+
+    /// <summary>解析单元格范围（如 "A1:F5"）为 (r1, c1, r2, c2)，均 0 基</summary>
+    private static (Int32 R1, Int32 C1, Int32 R2, Int32 C2) ParseRange(String range)
+    {
+        var parts = range.Split(':');
+        var (r1, c1) = ParseCellRef(parts[0]);
+        if (parts.Length > 1)
+        {
+            var (r2, c2) = ParseCellRef(parts[1]);
+            return (r1, c1, r2, c2);
+        }
+        return (r1, c1, r1, c1);
+    }
+
+    /// <summary>解析单元格引用（如 "A1"）为 (行, 列)，均 0 基</summary>
+    private static (Int32 Row, Int32 Col) ParseCellRef(String cellRef)
+    {
+        var col = 0;
+        var row = 0;
+        foreach (var ch in cellRef)
+        {
+            if (ch is >= 'A' and <= 'Z' or >= 'a' and <= 'z')
+                col = col * 26 + (Char.ToUpper(ch) - 'A' + 1);
+            else if (ch is >= '0' and <= '9')
+                row = row * 10 + (ch - '0');
+        }
+        return (row - 1, col - 1);
+    }
+
+    private static Byte[] BuildFontRecord(CellFormat? style = null)
+    {
+        var name = style?.FontName.IsNullOrEmpty() != false ? "Arial" : style.FontName!;
         var nameBytes = Encoding.Unicode.GetBytes(name);
-        // dyHeight(2)+grbit(2)+icv(2)+bls(2)+sss(2)+uls(1)+bFamily(1)+bCharSet(1)+reserved(1)+cch(1)+fHighByte(1)+name(n)
+        var size = style?.FontSize > 0 ? (Int32)(style.FontSize * 20) : 200; // 200 = 10pt
+        var bold = style?.Bold == true ? 0x02BC : 0x0190; // 700 vs 400
+        var italic = style?.Italic == true ? (UInt16)0x0002 : (UInt16)0;
+        var colorIdx = MapColorToIndex(style?.FontColor);
         var buf = new Byte[16 + nameBytes.Length];
         var writer = new SpanWriter(buf, 0, buf.Length);
-        writer.Write((UInt16)200);    // dyHeight: 200 = 10pt (in 1/20 pt units)
-        writer.Write((UInt16)0);      // grbit
-        writer.Write((UInt16)0x7FFF); // icv: colour index (default/auto)
-        writer.Write((UInt16)0x0190); // bls: bold weight (400 = normal)
-        writer.Write((UInt16)0);      // sss: super/sub script
-        writer.Write((Byte)0);        // uls: underline type
-        writer.Write((Byte)0);        // bFamily: font family
-        writer.Write((Byte)0);        // bCharSet: charset
-        writer.Write((Byte)0);        // reserved
-        writer.Write((Byte)name.Length); // cch: character count of font name
-        writer.Write((Byte)0x01);     // fHighByte: 1 = UTF-16LE
+        writer.Write((UInt16)size);
+        writer.Write((UInt16)italic);
+        writer.Write((UInt16)colorIdx);
+        writer.Write((UInt16)bold);
+        writer.Write((UInt16)0);
+        writer.Write((Byte)0);
+        writer.Write((Byte)0);
+        writer.Write((Byte)0);
+        writer.Write((Byte)0);
+        writer.Write((Byte)name.Length);
+        writer.Write((Byte)0x01);
         Array.Copy(nameBytes, 0, buf, 16, nameBytes.Length);
         return buf;
+    }
+
+    // 简单映射：常用颜色 → BIFF8 颜色索引
+    private static UInt16 MapColorToIndex(String? rgb)
+    {
+        if (rgb.IsNullOrEmpty()) return 0x7FFF;
+        return rgb?.ToUpper() switch
+        {
+            "000000" => 0x7FFF, // black → auto
+            "FF0000" => 10,      // red
+            "00FF00" => 11,      // bright green
+            "0000FF" => 12,      // blue
+            "FFFF00" => 13,      // yellow
+            "FF00FF" => 14,      // magenta
+            "00FFFF" => 15,      // cyan
+            "800000" => 16,      // dark red
+            "008000" => 17,      // dark green
+            "000080" => 18,      // dark blue
+            "808000" => 19,      // dark yellow
+            "800080" => 20,      // dark magenta
+            "008080" => 21,      // dark cyan
+            "C0C0C0" => 22,      // silver
+            "808080" => 23,      // gray
+            _ => 0x7FFF,
+        };
     }
 
     private static Byte[] BuildFormatRecord(Int32 formatIndex, String formatString)
@@ -475,45 +1225,96 @@ public sealed class BiffWriter : IDisposable
         writer.Write((UInt16)formatIndex);       // format index
         writer.Write((UInt16)formatString.Length); // character count
         writer.Write((Byte)0x01);                 // fHighByte = UTF-16LE
-        Array.Copy(fmtBytes, 0, buf, 5, fmtBytes.Length);
+        fmtBytes.CopyTo(buf.AsSpan(5));
         return buf;
     }
 
-    private static void WriteXfRecords(BinaryWriter bw)
+    private static void WriteXfRecords(Stream stream, Dictionary<CellFormat, Int32> styleMap, Int32 startFontIndex, Dictionary<Int32, Int32> formatXfIndex)
     {
-        // BIFF8 要求至少 21 个内置 XF 记录（样式索引 0-14 = 普通，15 = 默认单元格格式，16-20 = 标题）
-        // 索引 1：日期格式（formatIndex = 14 = "m/d/yy"）
+        // 21 内置 XF：索引 0-14 = 普通, 15 = 默认, 16-20 = 标题
         for (var i = 0; i < 21; i++)
         {
-            var xfData = BuildXfRecord(i);
-            WriteRecord(bw, RecXf, xfData);
+            var xfData = BuildBuiltinXfRecord(i);
+            WriteRecord(stream, RecXf, xfData);
+        }
+        // 自定义样式 XF
+        foreach (var kv in styleMap)
+        {
+            var style = kv.Key;
+            var fontIdx = startFontIndex + styleMap.Keys.ToList().IndexOf(style);
+            var bgColor = style.BackgroundColor.IsNullOrEmpty() ? 0x40u : 0u;
+            var xfData = BuildStyledXfRecord((UInt16)fontIdx, bgColor, style.Border != BorderStyle.None);
+            WriteRecord(stream, RecXf, xfData);
+        }
+        // 自定义格式 XF（每个格式一个简约 XF 记录，仅设置格式索引）
+        var fmtFontIdx = (UInt16)(startFontIndex + styleMap.Count);
+        foreach (var kv in formatXfIndex)
+        {
+            var xfData = BuildFormatXfRecord(fmtFontIdx, (UInt16)kv.Key);
+            WriteRecord(stream, RecXf, xfData);
+            fmtFontIdx++;
         }
     }
 
-    private static Byte[] BuildXfRecord(Int32 index)
+    private static Byte[] BuildBuiltinXfRecord(Int32 index)
     {
         var buf = new Byte[22];
         var writer = new SpanWriter(buf, 0, buf.Length);
-        writer.Write((UInt16)0); // font index
-        // Format index: 1 = 日期格式自定义索引 164
+        writer.Write((UInt16)0);
         writer.Write(index == 1 ? (UInt16)164 : (UInt16)0);
-        writer.Write(index < 16 ? (UInt16)0xFFF5 : (UInt16)0x0001); // style flag
-        writer.Write((UInt16)0x20C0); // alignment
-        writer.Write((UInt16)0);      // rotation
-        writer.Write((UInt16)0);      // text properties
-        writer.Write((UInt16)0);      // used attribute
-        writer.Write(0u);             // border lines
-        writer.Write(0u);             // colour / pattern
+        writer.Write(index < 16 ? (UInt16)0xFFF5 : (UInt16)0x0001);
+        writer.Write((UInt16)0x20C0);
+        writer.Write((UInt16)0);
+        writer.Write((UInt16)0);
+        writer.Write((UInt16)0);
+        writer.Write(0u);
+        writer.Write(0u);
         return buf;
     }
 
-    private static void WriteRecord(BinaryWriter bw, UInt16 recType, Byte[] data)
+    private static Byte[] BuildStyledXfRecord(UInt16 fontIndex, UInt32 bgColor, Boolean hasBorder)
     {
+        var buf = new Byte[22];
+        var writer = new SpanWriter(buf, 0, buf.Length);
+        writer.Write(fontIndex);
+        writer.Write((UInt16)0); // format index
+        writer.Write((UInt16)0xFFF5); // cell style
+        writer.Write((UInt16)0x20C0); // default alignment (center-vert, no-wrap)
+        writer.Write((UInt16)0);
+        writer.Write((UInt16)0);
+        writer.Write((UInt16)0);
+        writer.Write(hasBorder ? 0x0000000Fu : 0u); // thin borders (4 nibbles)
+        writer.Write(bgColor); // fill pattern + bg color
+        return buf;
+    }
+
+    private static Byte[] BuildFormatXfRecord(UInt16 fontIndex, UInt16 formatIndex)
+    {
+        var buf = new Byte[22];
+        var writer = new SpanWriter(buf, 0, buf.Length);
+        writer.Write(fontIndex);
+        writer.Write(formatIndex);     // 指向 FORMAT 记录的索引
+        writer.Write((UInt16)0xFFF5);  // cell style
+        writer.Write((UInt16)0x20C0);  // default alignment
+        writer.Write((UInt16)0);
+        writer.Write((UInt16)0);
+        writer.Write((UInt16)0);
+        writer.Write(0u);              // no borders
+        writer.Write(0x40u);           // no fill
+        return buf;
+    }
+
+    private static void WriteRecord(Stream stream, UInt16 recType, Byte[] data)
+    {
+        var header = new Byte[4];
         if (data.Length <= MaxRecordDataSize)
         {
-            bw.Write(recType);
-            bw.Write((UInt16)data.Length);
-            bw.Write(data);
+            header[0] = (Byte)recType;
+            header[1] = (Byte)(recType >> 8);
+            header[2] = (Byte)data.Length;
+            header[3] = (Byte)(data.Length >> 8);
+            stream.Write(header, 0, 4);
+            stream.Write(data, 0, data.Length);
             return;
         }
 
@@ -523,9 +1324,13 @@ public sealed class BiffWriter : IDisposable
         while (offset < data.Length)
         {
             var chunk = Math.Min(MaxRecordDataSize, data.Length - offset);
-            bw.Write(first ? recType : RecContinue);
-            bw.Write((UInt16)chunk);
-            bw.Write(data, offset, chunk);
+            var rt = first ? recType : RecContinue;
+            header[0] = (Byte)rt;
+            header[1] = (Byte)(rt >> 8);
+            header[2] = (Byte)chunk;
+            header[3] = (Byte)(chunk >> 8);
+            stream.Write(header, 0, 4);
+            stream.Write(data, offset, chunk);
             offset += chunk;
             first = false;
         }
@@ -535,7 +1340,7 @@ public sealed class BiffWriter : IDisposable
 
     #region 辅助
 
-    private List<List<Object?>> GetCurrentSheet()
+    private List<(List<Object?> Values, CellFormat? Style)> GetCurrentSheet()
     {
         if (!_sheetData.TryGetValue(_currentSheet, out var rows))
         {

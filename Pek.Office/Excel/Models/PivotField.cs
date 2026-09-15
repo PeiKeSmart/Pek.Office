@@ -1,4 +1,4 @@
-﻿namespace NewLife.Office;
+﻿namespace NewLife.Office.Excel;
 
 /// <summary>Excel 数据透视表字段配置</summary>
 public class PivotField

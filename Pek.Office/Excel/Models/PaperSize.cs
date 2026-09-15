@@ -1,4 +1,4 @@
-﻿namespace NewLife.Office;
+﻿namespace NewLife.Office.Excel;
 
 /// <summary>纸张大小</summary>
 public enum PaperSize

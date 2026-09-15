@@ -1,17 +1,18 @@
 ﻿using System.Data;
 using System.IO.Compression;
 using System.Security;
+using System.Xml.Linq;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Excel;
 
 partial class ExcelWriter
 {
     #region 样式管理
     /// <summary>根据用户样式和数字格式，查找或创建 XF 条目并返回索引</summary>
-    private Int32 GetOrCreateXf(CellStyle cs, Int32 numFmtId)
+    private Int32 GetOrCreateXf(CellFormat cs, Int32 numFmtId)
     {
         // 找或创建字体
-        var font = new FontEntry(cs.FontName, cs.FontSize, cs.Bold, cs.Italic, cs.Underline, cs.FontColor);
+        var font = new FontEntry(cs.FontName, cs.FontSize, cs.Bold, cs.Italic, cs.Underline, cs.FontColor, cs.Strike, cs.VerticalAlign);
         var fontId = FindOrAdd(_fonts, font);
 
         // 找或创建填充
@@ -21,20 +22,43 @@ partial class ExcelWriter
             var fill = new FillEntry(cs.BackgroundColor, "solid");
             fillId = FindOrAdd(_fills, fill);
         }
-
-        // 找或创建边框
-        var borderId = 0;
-        if (cs.Border != CellBorderStyle.None)
+        else if (!cs.GradientColor1.IsNullOrEmpty() && !cs.GradientColor2.IsNullOrEmpty())
         {
-            var border = new BorderEntry(cs.Border, cs.BorderColor);
+            var gradType = cs.GradientType.EqualIgnoreCase("radial") ? "radial" : "linear";
+            var fill = new FillEntry(null, "gradient", gradType, cs.GradientColor1, cs.GradientColor2);
+            fillId = FindOrAdd(_fills, fill);
+        }
+        else if (!cs.PatternType.IsNullOrEmpty())
+        {
+            var fill = new FillEntry(null, "pattern", PatternFgColor: cs.PatternFgColor, PatternTypeName: cs.PatternType);
+            fillId = FindOrAdd(_fills, fill);
+        }
+
+        // 找或创建边框：单边属性优先，回退到全局 Border
+        var borderId = 0;
+        var leftStyle   = cs.LeftBorder   != BorderStyle.None ? cs.LeftBorder   : cs.Border;
+        var rightStyle  = cs.RightBorder  != BorderStyle.None ? cs.RightBorder  : cs.Border;
+        var topStyle    = cs.TopBorder    != BorderStyle.None ? cs.TopBorder    : cs.Border;
+        var bottomStyle = cs.BottomBorder != BorderStyle.None ? cs.BottomBorder : cs.Border;
+        var leftColor   = cs.LeftBorderColor   ?? cs.BorderColor;
+        var rightColor  = cs.RightBorderColor  ?? cs.BorderColor;
+        var topColor    = cs.TopBorderColor    ?? cs.BorderColor;
+        var bottomColor = cs.BottomBorderColor ?? cs.BorderColor;
+        var diagonalStyle = cs.DiagonalBorder;
+        var diagonalColor = cs.DiagonalBorderColor;
+        if (leftStyle != BorderStyle.None || rightStyle != BorderStyle.None ||
+            topStyle  != BorderStyle.None || bottomStyle != BorderStyle.None ||
+            diagonalStyle != BorderStyle.None)
+        {
+            var border = new BorderEntry(leftStyle, leftColor, rightStyle, rightColor, topStyle, topColor, bottomStyle, bottomColor, diagonalStyle, diagonalColor);
             borderId = FindOrAdd(_borders, border);
         }
 
         // 复合键去重
-        var key = $"{numFmtId}-{fontId}-{fillId}-{borderId}-{(Int32)cs.HAlign}-{(Int32)cs.VAlign}-{(cs.WrapText ? 1 : 0)}";
+        var key = $"{numFmtId}-{fontId}-{fillId}-{borderId}-{(Int32)cs.HAlign}-{(Int32)cs.VAlign}-{(cs.WrapText ? 1 : 0)}-{cs.TextRotation}-{cs.Indent}-{(cs.ShrinkToFit ? 1 : 0)}";
         if (_xfCache.TryGetValue(key, out var idx)) return idx;
 
-        var xf = new XfEntry(numFmtId, fontId, fillId, borderId, cs.HAlign, cs.VAlign, cs.WrapText);
+        var xf = new XfEntry(numFmtId, fontId, fillId, borderId, cs.HAlign, cs.VAlign, cs.WrapText, cs.TextRotation, cs.Indent, cs.ShrinkToFit);
         idx = _xfEntries.Count;
         _xfEntries.Add(xf);
         _xfCache[key] = idx;
@@ -89,17 +113,310 @@ partial class ExcelWriter
     /// <summary>生成单元格引用（如 "A1"），行列均为 0 基</summary>
     private static String MakeCellRef(Int32 row, Int32 col) => GetColumnName(col) + (row + 1);
 
-    /// <summary>获取边框 OOXML 样式名</summary>
-    private static String GetBorderStyleName(CellBorderStyle style) => style switch
+    #region 切片器辅助（M28）
+    /// <summary>按工作表 + 名称查找结构化表格</summary>
+    private Table? FindTable(String sheet, String tableName)
     {
-        CellBorderStyle.Thin => "thin",
-        CellBorderStyle.Medium => "medium",
-        CellBorderStyle.Thick => "thick",
-        CellBorderStyle.Dashed => "dashed",
-        CellBorderStyle.Dotted => "dotted",
-        CellBorderStyle.DoubleLine => "double",
+        if (_sheetTables.TryGetValue(sheet, out var tables))
+            return tables.FirstOrDefault(t => t.Name.EqualIgnoreCase(tableName));
+        return null;
+    }
+
+    /// <summary>解析表格范围（如 "A1:E10"）返回 0 基行列区间</summary>
+    private static (Int32 R1, Int32 C1, Int32 R2, Int32 C2) ParseTableRange(String range)
+    {
+        var parts = range.Split(':');
+        if (parts.Length != 2) return (0, 0, 0, 0);
+        var (r1, c1) = ParseCellRef(parts[0]);
+        var (r2, c2) = ParseCellRef(parts[1]);
+        return (r1, c1, r2, c2);
+    }
+
+    /// <summary>解析列名 → 列索引（0 基），优先表格 ColumnNames，其次表头行文本</summary>
+    private Int32 ResolveColumnIndex(String sheet, Table table, String columnName, Int32 r1, Int32 c1, Int32 r2, Int32 c2)
+    {
+        if (table.ColumnNames is { Length: > 0 })
+        {
+            for (var i = 0; i < table.ColumnNames.Length; i++)
+            {
+                if (table.ColumnNames[i].EqualIgnoreCase(columnName))
+                    return c1 + i;
+            }
+        }
+        // 从表头行（r1，0 基）解析列名
+        if (_sheetRows.TryGetValue(sheet, out var rows))
+        {
+            foreach (var rowXml in rows)
+            {
+                var (rowNum, cells) = ParseRowCells(rowXml);
+                if (rowNum != r1) continue;
+                foreach (var (refName, type, value) in cells)
+                {
+                    var (cr, cc) = ParseCellRef(refName);
+                    if (cc < c1 || cc > c2) continue;
+                    var text = ResolveCellText(type, value);
+                    if (text.EqualIgnoreCase(columnName))
+                        return cc;
+                }
+                break;
+            }
+        }
+        // 兜底：列名匹配失败，返回起始列（表头第一列）
+        return c1;
+    }
+
+    /// <summary>从表格数据列提取唯一值（用于 slicerCache items）</summary>
+    private List<String> ExtractColumnItems(String sheet, Int32 colIdx, Int32 r1, Int32 r2)
+    {
+        var set = new List<String>();
+        if (_sheetRows.TryGetValue(sheet, out var rows))
+        {
+            foreach (var rowXml in rows)
+            {
+                var (rowNum, cells) = ParseRowCells(rowXml);
+                if (rowNum <= r1 || rowNum > r2) continue; // 跳过表头行
+                foreach (var (refName, type, value) in cells)
+                {
+                    var (_, cc) = ParseCellRef(refName);
+                    if (cc != colIdx) continue;
+                    var text = ResolveCellText(type, value);
+                    if (!text.IsNullOrEmpty() && !set.Contains(text))
+                        set.Add(text);
+                    break;
+                }
+            }
+        }
+        return set;
+    }
+
+    /// <summary>解析行 XML，返回 (行号0基, 单元格列表(ref, type, value))</summary>
+    private static (Int32 Row, List<(String Ref, String? Type, String Value)> Cells) ParseRowCells(String rowXml)
+    {
+        var cells = new List<(String, String?, String)>();
+        var rowNum = 0;
+        try
+        {
+            var doc = XDocument.Parse(rowXml);
+            var rowEl = doc.Root;
+            if (rowEl == null) return (rowNum, cells);
+            rowNum = rowEl.Attribute("r")?.Value.ToInt(-1) ?? -1;
+            if (rowNum > 0) rowNum--;
+            foreach (var c in rowEl.Elements().Where(e => e.Name.LocalName == "c"))
+            {
+                var refName = c.Attribute("r")?.Value ?? String.Empty;
+                var type = c.Attribute("t")?.Value;
+                var v = c.Elements().FirstOrDefault(e => e.Name.LocalName == "v")?.Value ?? String.Empty;
+                cells.Add((refName, type, v));
+            }
+        }
+        catch
+        {
+            // 忽略解析失败行
+        }
+        return (rowNum, cells);
+    }
+
+    /// <summary>将单元格类型 + 原始值转换为文本（共享字符串查 _shared）</summary>
+    private String ResolveCellText(String? type, String value)
+    {
+        if (value.IsNullOrEmpty()) return String.Empty;
+        if (type == "s" && Int32.TryParse(value, out var idx))
+        {
+            foreach (var kv in _shared)
+            {
+                if (kv.Value == idx) return kv.Key;
+            }
+            return String.Empty;
+        }
+        return value;
+    }
+    #endregion
+
+    /// <summary>生成结构化表格 XML（xl/tables/tableN.xml）</summary>
+    private void WriteTableXml(StreamWriter sw, Table tbl, Int32 tableId)
+    {
+        sw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sw.Write("<table xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"");
+        var eName = SecurityElement.Escape(tbl.Name) ?? tbl.Name;
+        sw.Write($" id=\"{tableId}\" name=\"{eName}\" displayName=\"{eName}\" ref=\"{tbl.Range}\">");
+
+        // autoFilter（仅当有筛选按钮时）
+        if (tbl.ShowFilterButton)
+            sw.Write($"<autoFilter ref=\"{tbl.Range}\"/>");
+
+        // 解析列数
+        var colCount = ParseRangeColumnCount(tbl.Range);
+        sw.Write($"<tableColumns count=\"{colCount}\">");
+        for (var c = 0; c < colCount; c++)
+        {
+            var colName = tbl.ColumnNames != null && c < tbl.ColumnNames.Length
+                ? SecurityElement.Escape(tbl.ColumnNames[c]) ?? tbl.ColumnNames[c]
+                : $"Column{c + 1}";
+            sw.Write($"<tableColumn id=\"{c + 1}\" name=\"{colName}\"/>");
+        }
+        sw.Write("</tableColumns>");
+
+        // 样式
+        var styleName = tbl.StyleName.IsNullOrEmpty() ? "TableStyleMedium9" : SecurityElement.Escape(tbl.StyleName) ?? tbl.StyleName;
+        var first  = tbl.ShowFirstColumn ? "1" : "0";
+        var last   = tbl.ShowLastColumn  ? "1" : "0";
+        var rowStr = tbl.ShowRowStripes  ? "1" : "0";
+        var colStr = tbl.ShowColumnStripes ? "1" : "0";
+        sw.Write($"<tableStyleInfo name=\"{styleName}\" showFirstColumn=\"{first}\" showLastColumn=\"{last}\" showRowStripes=\"{rowStr}\" showColumnStripes=\"{colStr}\"/>");
+
+        sw.Write("</table>");
+    }
+
+    /// <summary>从 Excel 范围字符串（如 "A1:E10" 或 "B3:D8"）解析列数</summary>
+    private static Int32 ParseRangeColumnCount(String range)
+    {
+        if (range.IsNullOrEmpty()) return 1;
+        var sep = range.IndexOf(':');
+        if (sep < 0) return 1;
+        var (_, startCol) = ParseCellRef(range[..sep]);
+        var (_, endCol)   = ParseCellRef(range[(sep + 1)..]);
+        return Math.Max(1, endCol - startCol + 1);
+    }
+
+    /// <summary>条件格式是否需要 dxf 槽位（cellIs 类型与带样式的 expression）</summary>
+    private static Boolean IsDxfEligible(ConditionalFormatEntry cf) =>
+        cf.Type < ConditionalFormatValues.DataBar ||
+        (cf.Type == ConditionalFormatValues.Expression && HasDxfStyle(cf));
+
+    /// <summary>条件格式是否携带 dxf 样式（填充色/字体颜色/加粗/边框色）</summary>
+    private static Boolean HasDxfStyle(ConditionalFormatEntry cf) =>
+        !cf.Color.IsNullOrEmpty() || !cf.FontColor.IsNullOrEmpty() || !cf.BorderColor.IsNullOrEmpty() || cf.IsBold;
+
+    /// <summary>计算指定工作表的 dxf 起始索引（全局顺序：按工作表顺序累计之前所有符合条件的槽位）</summary>
+    private Int32 GetDxfBase(String sheet)
+    {
+        var dxf = 0;
+        foreach (var sn in _sheetNames)
+        {
+            if (sn == sheet) break;
+            if (!_sheetCondFormats.TryGetValue(sn, out var list)) continue;
+            dxf += list.Count(IsDxfEligible);
+        }
+        return dxf;
+    }
+
+    /// <summary>生成图表 XML（xl/charts/chartN.xml）</summary>
+    private static void WriteChartXml(StreamWriter sw, ExcelChart chart, Int32 chartId)
+    {
+        const String C = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+        const String A = "http://schemas.openxmlformats.org/drawingml/2006/main";
+        sw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sw.Write($"<c:chartSpace xmlns:c=\"{C}\" xmlns:a=\"{A}\">");
+        sw.Write("<c:date1904 val=\"0\"/>");
+        sw.Write("<c:chart>");
+        if (!chart.Title.IsNullOrEmpty())
+        {
+            var et = SecurityElement.Escape(chart.Title!) ?? chart.Title;
+            sw.Write($"<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"zh-CN\"/><a:t>{et}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title>");
+        }
+        sw.Write("<c:autoTitleDeleted val=\"0\"/>");
+        sw.Write("<c:plotArea>");
+
+        var chartElem = chart.Type switch
+        {
+            "line" => "lineChart",
+            "pie"  => "pieChart",
+            "doughnut" => "doughnutChart",
+            "area" => "areaChart",
+            "scatter" => "scatterChart",
+            _ => "barChart",
+        };
+        // pie/doughnut 无坐标轴，其余类型带 catAx/valAx
+        var isPieLike = chart.Type is "pie" or "doughnut";
+        sw.Write($"<c:{chartElem}>");
+        if (chart.Type == "bar") sw.Write("<c:barDir val=\"col\"/><c:grouping val=\"clustered\"/>");
+        else if (chart.Type == "line") sw.Write("<c:grouping val=\"standard\"/>");
+
+        var serColors = new[] { "4F81BD", "C0504D", "9BBB59", "8064A2", "4BACC6", "F79646" };
+        var categories = chart.Categories ?? [];
+        for (var si = 0; si < chart.Series.Count; si++)
+        {
+            var ser = chart.Series[si];
+            var color = serColors[si % serColors.Length];
+            sw.Write("<c:ser>");
+            sw.Write($"<c:idx val=\"{si}\"/><c:order val=\"{si}\"/>");
+            var eName = SecurityElement.Escape(ser.Name) ?? ser.Name ?? "";
+            sw.Write($"<c:tx><c:strRef><c:f/><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{eName}</c:v></c:pt></c:strCache></c:strRef></c:tx>");
+            sw.Write($"<c:spPr><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></c:spPr>");
+            if (categories.Length > 0)
+            {
+                sw.Write("<c:cat><c:strRef><c:f/><c:strCache>");
+                sw.Write($"<c:ptCount val=\"{categories.Length}\"/>");
+                for (var ci = 0; ci < categories.Length; ci++)
+                    sw.Write($"<c:pt idx=\"{ci}\"><c:v>{SecurityElement.Escape(categories[ci]) ?? categories[ci]}</c:v></c:pt>");
+                sw.Write("</c:strCache></c:strRef></c:cat>");
+            }
+            sw.Write("<c:val><c:numRef><c:f/><c:numCache>");
+            sw.Write($"<c:ptCount val=\"{ser.Data.Length}\"/>");
+            for (var vi = 0; vi < ser.Data.Length; vi++)
+                sw.Write($"<c:pt idx=\"{vi}\"><c:v>{ser.Data[vi]}</c:v></c:pt>");
+            sw.Write("</c:numCache></c:numRef></c:val>");
+            sw.Write("</c:ser>");
+        }
+        if (!isPieLike)
+        {
+            sw.Write("<c:axId val=\"1\"/><c:axId val=\"2\"/>");
+            sw.Write($"</c:{chartElem}>");
+            sw.Write("<c:catAx><c:axId val=\"1\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"2\"/></c:catAx>");
+            sw.Write("<c:valAx><c:axId val=\"2\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:crossAx val=\"1\"/></c:valAx>");
+        }
+        else
+        {
+            sw.Write($"</c:{chartElem}>");
+        }
+        sw.Write("</c:plotArea>");
+        sw.Write("<c:legend><c:legendPos val=\"b\"/></c:legend>");
+        sw.Write("</c:chart></c:chartSpace>");
+    }
+
+    /// <summary>写出单边边框 XML（style 为 None 时输出自关闭空元素）</summary>
+    private static void WriteBorderSide(StreamWriter sw, String tag, BorderStyle style, String? color)
+    {
+        if (style == BorderStyle.None)
+        {
+            sw.Write($"<{tag}/>");
+        }
+        else
+        {
+            var sn = GetBorderStyleName(style);
+            sw.Write($"<{tag} style=\"{sn}\">");
+            WriteColorXml(sw, color);
+            sw.Write($"</{tag}>");
+        }
+    }
+
+    /// <summary>获取边框 OOXML 样式名</summary>
+    private static String GetBorderStyleName(BorderStyle style) => style switch
+    {
+        BorderStyle.Thin => "thin",
+        BorderStyle.Medium => "medium",
+        BorderStyle.Thick => "thick",
+        BorderStyle.Dashed => "dashed",
+        BorderStyle.Dotted => "dotted",
+        BorderStyle.DoubleLine => "double",
         _ => "thin",
     };
+
+    /// <summary>将颜色字符串（RGB 六位 或 "theme:N"）写入 StreamWriter 为 &lt;color .../&gt;</summary>
+    private static void WriteColorXml(StreamWriter sw, String? color)
+    {
+        if (color.IsNullOrEmpty()) return;
+        sw.Write($"<color {FormatColorAttr(color)}/>");
+    }
+
+    /// <summary>将颜色字符串格式化为 color 元素的属性片段（不含尖括号）</summary>
+    private static String FormatColorAttr(String? color)
+    {
+        if (color.IsNullOrEmpty()) return String.Empty;
+        if (color!.StartsWith("theme:", StringComparison.Ordinal))
+            return $"theme=\"{color[6..]}\"";
+        return $"rgb=\"FF{color}\"";
+    }
     #endregion
 
     #region 保存
@@ -151,12 +468,58 @@ partial class ExcelWriter
                 sheetsWithComments.Add(i);
         }
 
+        // 判断哪些 sheet 有线程化批注（M27）
+        var sheetsWithThreadedComments = new HashSet<Int32>();
+        for (var i = 0; i < _sheetNames.Count; i++)
+        {
+            if (_threadedComments.Any(c => c.Sheet.EqualIgnoreCase(_sheetNames[i])))
+                sheetsWithThreadedComments.Add(i);
+        }
+
+        // 统一作者 → PersonId（同一作者共享一个 person，M27）
+        var personMap = new Dictionary<String, String>(StringComparer.OrdinalIgnoreCase);
+        foreach (var tc in _threadedComments)
+        {
+            var key = tc.Author + "\u0001" + (tc.UserId ?? "");
+            if (!personMap.TryGetValue(key, out var pid))
+            {
+                pid = tc.PersonId;
+                personMap[key] = pid;
+            }
+            tc.PersonId = pid;
+        }
+
+        // 判断哪些 sheet 有表格
+        var sheetsWithTables = new Dictionary<Int32, List<Table>>();
+        var globalTableIndex = 0; // 全局表格编号（1基）
+        for (var i = 0; i < _sheetNames.Count; i++)
+        {
+            if (_sheetTables.TryGetValue(_sheetNames[i], out var tbls) && tbls.Count > 0)
+                sheetsWithTables[i] = tbls;
+        }
+
+        // 判断哪些 sheet 有图表
+        var sheetsWithCharts = new Dictionary<Int32, List<ExcelChart>>();
+        for (var i = 0; i < _sheetNames.Count; i++)
+        {
+            if (_sheetCharts.TryGetValue(_sheetNames[i], out var chs) && chs.Count > 0)
+                sheetsWithCharts[i] = chs;
+        }
+        var globalChartId = 0; // 全局图表编号（1基）
+
         using var za = new ZipArchive(target, ZipArchiveMode.Create, leaveOpen: Stream != null, entryNameEncoding: Encoding);
+
+        // docProps/core.xml (document properties)
+        var props = DocumentProperties;
+        var hasProps = props != null && (props.Title != null || props.Creator != null || props.Subject != null || props.Description != null);
 
         // _rels/.rels
         using (var sw = new StreamWriter(za.CreateEntry("_rels/.rels").Open(), Encoding))
         {
-            sw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>");
+            sw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>");
+            if (hasProps)
+                sw.Write("<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>");
+            sw.Write("</Relationships>");
         }
 
         // [Content_Types].xml
@@ -203,7 +566,56 @@ partial class ExcelWriter
                 if (sheetsWithComments.Contains(i))
                     sw.Write($"<Override PartName=\"/xl/comments{i + 1}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml\"/>");
             }
+            // 线程化批注（M27）：threadedComment 部件 + person 部件
+            if (sheetsWithThreadedComments.Count > 0)
+            {
+                for (var i = 0; i < _sheetNames.Count; i++)
+                {
+                    if (sheetsWithThreadedComments.Contains(i))
+                        sw.Write($"<Override PartName=\"/xl/threadedComments/threadedComment{i + 1}.xml\" ContentType=\"application/vnd.ms-excel.threadedcomments+xml\"/>");
+                }
+                sw.Write("<Override PartName=\"/xl/persons/person.xml\" ContentType=\"application/vnd.ms-excel.person+xml\"/>");
+            }
+            // 切片器（M28）：slicer 部件 + slicerCache 部件
+            if (_slicers.Count > 0)
+            {
+                for (var i = 0; i < _slicers.Count; i++)
+                {
+                    sw.Write($"<Override PartName=\"/xl/slicers/slicer{i + 1}.xml\" ContentType=\"application/vnd.ms-excel.slicer+xml\"/>");
+                    sw.Write($"<Override PartName=\"/xl/slicerCaches/slicerCache{i + 1}.xml\" ContentType=\"application/vnd.ms-excel.slicerCache+xml\"/>");
+                }
+            }
+            // 结构化表格
+            foreach (var kv in sheetsWithTables)
+            {
+                foreach (var tbl in kv.Value)
+                    sw.Write($"<Override PartName=\"/xl/tables/table{++globalTableIndex}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml\"/>");
+            }
+            globalTableIndex = 0; // 重置
+            // 图表
+            foreach (var kv in sheetsWithCharts)
+            {
+                foreach (var c in kv.Value)
+                    sw.Write($"<Override PartName=\"/xl/charts/chart{++globalChartId}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/>");
+            }
+            globalChartId = 0; // 重置
+            if (hasProps)
+                sw.Write("<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>");
             sw.Write("</Types>");
+        }
+
+        // docProps/core.xml
+        if (hasProps)
+        {
+            using var sw = new StreamWriter(za.CreateEntry("docProps/core.xml").Open(), Encoding);
+            sw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+            sw.Write("<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">");
+            if (props!.Title != null) sw.Write($"<dc:title>{XmlEscape(props.Title)}</dc:title>");
+            if (props.Creator != null) sw.Write($"<dc:creator>{XmlEscape(props.Creator)}</dc:creator>");
+            if (props.Subject != null) sw.Write($"<dc:subject>{XmlEscape(props.Subject)}</dc:subject>");
+            if (props.Description != null) sw.Write($"<dc:description>{XmlEscape(props.Description)}</dc:description>");
+            sw.Write($"<dcterms:created xsi:type=\"dcterms:W3CDTF\">{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ}</dcterms:created>");
+            sw.Write("</cp:coreProperties>");
         }
 
         // workbook.xml
@@ -213,21 +625,40 @@ partial class ExcelWriter
             for (var i = 0; i < _sheetNames.Count; i++)
             {
                 var name = SecurityElement.Escape(_sheetNames[i]) ?? _sheetNames[i];
-                sw.Write($"<sheet name=\"{name}\" sheetId=\"{i + 1}\" r:id=\"rId{i + 1}\"/>");
+                var stateAttr = _sheetStates.TryGetValue(_sheetNames[i], out var st) ? $" state=\"{st}\"" : "";
+                sw.Write($"<sheet name=\"{name}\" sheetId=\"{i + 1}\" r:id=\"rId{i + 1}\"{stateAttr}/>");
             }
             sw.Write("</sheets>");
-            // 打印标题行的 definedNames
-            if (sheetsWithPrintTitles.Count > 0)
+            // definedNames（打印标题行 + 用户自定义命名范围）
+            var hasDefinedNames = sheetsWithPrintTitles.Count > 0 || _definedNames.Count > 0;
+            if (hasDefinedNames)
             {
                 sw.Write("<definedNames>");
                 foreach (var si in sheetsWithPrintTitles)
                 {
                     var ps = _sheetPageSetups[_sheetNames[si]];
                     var sn = SecurityElement.Escape(_sheetNames[si]) ?? _sheetNames[si];
-                    sw.Write($"<definedName name=\"_xlnm.Print_Titles\" localSheetId=\"{si}\">'{sn}'!${ ps.PrintTitleStartRow}:${ps.PrintTitleEndRow}</definedName>");
+                    sw.Write($"<definedName name=\"_xlnm.Print_Titles\" localSheetId=\"{si}\">'{sn}'!${ps.PrintTitleStartRow}:${ps.PrintTitleEndRow}</definedName>");
+                }
+                foreach (var (dnName, dnFormula) in _definedNames)
+                {
+                    var en = SecurityElement.Escape(dnName) ?? dnName;
+                    var ef = SecurityElement.Escape(dnFormula) ?? dnFormula;
+                    sw.Write($"<definedName name=\"{en}\">{ef}</definedName>");
                 }
                 sw.Write("</definedNames>");
             }
+            // 工作簿保护
+            if (_workbookProtectionHash != null)
+            {
+                sw.Write("<workbookProtection");
+                if (_workbookLockStructure) sw.Write(" lockStructure=\"1\"");
+                if (_workbookLockWindows) sw.Write(" lockWindows=\"1\"");
+                if (_workbookProtectionHash.Length > 0) sw.Write($" workbookPassword=\"{_workbookProtectionHash}\"");
+                sw.Write("/>");
+            }
+            // 计算选项（确保 Excel 打开时自动重算）
+            sw.Write("<calcPr calcId=\"191029\" fullCalcOnLoad=\"1\"/>");
             sw.Write("</workbook>");
         }
 
@@ -238,7 +669,13 @@ partial class ExcelWriter
             for (var i = 0; i < _sheetNames.Count; i++) sw.Write($"<Relationship Id=\"rId{i + 1}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{i + 1}.xml\"/>");
             var nextId = _sheetNames.Count + 1;
             sw.Write($"<Relationship Id=\"rId{nextId++}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>");
-            if (_shared.Count > 0) sw.Write($"<Relationship Id=\"rId{nextId}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>");
+            if (_shared.Count > 0) sw.Write($"<Relationship Id=\"rId{nextId++}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>");
+            // 线程化批注：person 部件（工作簿级，M27）
+            if (personMap.Count > 0)
+                sw.Write($"<Relationship Id=\"rId{nextId}\" Type=\"http://schemas.microsoft.com/office/2017/10/relationships/person\" Target=\"persons/person.xml\"/>");
+            // 切片器缓存关系（M28）
+            for (var i = 0; i < _slicers.Count; i++)
+                sw.Write($"<Relationship Id=\"rId{++nextId}\" Type=\"http://schemas.microsoft.com/office/2007/relationships/slicerCache\" Target=\"slicerCaches/slicerCache{i + 1}.xml\"/>");
             sw.Write("</Relationships>");
         }
 
@@ -268,58 +705,114 @@ partial class ExcelWriter
             using var sw = new StreamWriter(entry.Open(), Encoding);
             sw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:etc=\"http://www.wps.cn/officeDocument/2017/etCustomData\">");
 
-            // sheetViews（冻结窗格）
-            if (_sheetFreezes.TryGetValue(sheet, out var freeze) && (freeze.Rows > 0 || freeze.Cols > 0))
+            // sheetPr（标签颜色 + 大纲属性）
+            var hasTabColor = _sheetTabColors.TryGetValue(sheet, out var tabColor) && !tabColor.IsNullOrEmpty();
+            var hasColOl = _sheetColOutlines.ContainsKey(sheet);
+            var hasRowOl = _sheetRowOutlines.ContainsKey(sheet);
+            if (hasTabColor || hasColOl || hasRowOl)
             {
-                sw.Write("<sheetViews><sheetView tabSelected=\"1\" workbookViewId=\"0\">");
-                var topLeft = MakeCellRef(freeze.Rows, freeze.Cols);
-                if (freeze.Rows > 0 && freeze.Cols > 0)
+                sw.Write("<sheetPr>");
+                if (hasTabColor) sw.Write($"<tabColor rgb=\"FF{tabColor}\"/>");
+                if (hasColOl || hasRowOl) sw.Write("<outlinePr summaryBelow=\"1\" summaryRight=\"1\"/>");
+                sw.Write("</sheetPr>");
+            }
+
+            // sheetFormatPr（默认行高）
+            if (_sheetDefaultRowHeights.TryGetValue(sheet, out var defRowH))
+            {
+                sw.Write($"<sheetFormatPr defaultRowHeight=\"{defRowH:0.##}\"/>");
+            }
+
+            // sheetViews（冻结窗格 + 网格线 + 缩放）
+            var hasFreeze = _sheetFreezes.TryGetValue(sheet, out var freeze) && (freeze.Rows > 0 || freeze.Cols > 0);
+            var hasHiddenGrid = _sheetGridlines.TryGetValue(sheet, out var gridlines) && !gridlines;
+            var hasZoom = _sheetZooms.TryGetValue(sheet, out var zoom) && zoom != 100;
+            if (hasFreeze || hasHiddenGrid || hasZoom)
+            {
+                sw.Write("<sheetViews><sheetView tabSelected=\"1\" workbookViewId=\"0\"");
+                if (hasHiddenGrid) sw.Write(" showGridLines=\"0\"");
+                if (hasZoom) sw.Write($" zoomScale=\"{zoom}\"");
+                sw.Write(">");
+                if (hasFreeze)
                 {
-                    sw.Write($"<pane xSplit=\"{freeze.Cols}\" ySplit=\"{freeze.Rows}\" topLeftCell=\"{topLeft}\" activePane=\"bottomRight\" state=\"frozen\"/>");
-                }
-                else if (freeze.Rows > 0)
-                {
-                    sw.Write($"<pane ySplit=\"{freeze.Rows}\" topLeftCell=\"{topLeft}\" activePane=\"bottomLeft\" state=\"frozen\"/>");
-                }
-                else
-                {
-                    sw.Write($"<pane xSplit=\"{freeze.Cols}\" topLeftCell=\"{topLeft}\" activePane=\"topRight\" state=\"frozen\"/>");
+                    var topLeft = MakeCellRef(freeze.Rows, freeze.Cols);
+                    if (freeze.Rows > 0 && freeze.Cols > 0)
+                    {
+                        sw.Write($"<pane xSplit=\"{freeze.Cols}\" ySplit=\"{freeze.Rows}\" topLeftCell=\"{topLeft}\" activePane=\"bottomRight\" state=\"frozen\"/>");
+                    }
+                    else if (freeze.Rows > 0)
+                    {
+                        sw.Write($"<pane ySplit=\"{freeze.Rows}\" topLeftCell=\"{topLeft}\" activePane=\"bottomLeft\" state=\"frozen\"/>");
+                    }
+                    else
+                    {
+                        sw.Write($"<pane xSplit=\"{freeze.Cols}\" topLeftCell=\"{topLeft}\" activePane=\"topRight\" state=\"frozen\"/>");
+                    }
                 }
                 sw.Write("</sheetView></sheetViews>");
             }
 
-            // cols（列宽）
-            if (AutoFitColumnWidth && _sheetColWidths.TryGetValue(sheet, out var widths) && widths.Count > 0)
+            // cols（列宽 + 列大纲级别 + 隐藏列）——有自定义列宽、列分组或隐藏列时始终写入
+            var hasColOutlines = _sheetColOutlines.TryGetValue(sheet, out var colOutlines) && colOutlines.Count > 0;
+            var hasHiddenCols = _sheetHiddenCols.TryGetValue(sheet, out var hiddenCols) && hiddenCols.Count > 0;
+            if ((_sheetColWidths.TryGetValue(sheet, out var widths) && widths.Any(e => e > 0)) || hasColOutlines || hasHiddenCols)
             {
-                if (widths.Any(e => e > 0))
+                // 收集所有需要输出的列索引
+                var colSet = new SortedSet<Int32>();
+                if (widths != null)
+                    for (var c = 0; c < widths.Count; c++) if (widths[c] > 0) colSet.Add(c);
+                if (hasColOutlines)
+                    foreach (var c in colOutlines!.Keys) colSet.Add(c);
+                if (hasHiddenCols)
+                    foreach (var c in hiddenCols!) colSet.Add(c);
+
+                if (colSet.Count > 0)
                 {
                     sw.Write("<cols>");
-                    for (var c = 0; c < widths.Count; c++)
+                    foreach (var c in colSet)
                     {
-                        var w = widths[c];
-                        if (w <= 0) continue;
-                        sw.Write($"<col min=\"{c + 1}\" max=\"{c + 1}\" width=\"{w:0.##}\" customWidth=\"1\"/>");
+                        var w = (widths != null && c < widths.Count) ? widths[c] : 0;
+                        var outline = (hasColOutlines && colOutlines!.TryGetValue(c, out var co)) ? co : (Level: 0, Collapsed: false);
+                        sw.Write($"<col min=\"{c + 1}\" max=\"{c + 1}\"");
+                        if (w > 0) sw.Write($" width=\"{w:0.##}\" customWidth=\"1\"");
+                        if (outline.Level > 0) sw.Write($" outlineLevel=\"{outline.Level}\"");
+                        if (outline.Collapsed) sw.Write(" collapsed=\"1\"");
+                        if (hasHiddenCols && hiddenCols!.Contains(c)) sw.Write(" hidden=\"1\"");
+                        sw.Write("/>");
                     }
                     sw.Write("</cols>");
                 }
             }
 
-            // sheetData（带行高注入）
+            // sheetData（带行高和行大纲级别注入）
             sw.Write("<sheetData>");
             if (_sheetRows.TryGetValue(sheet, out var list))
             {
                 var hasHeights = _sheetRowHeights.TryGetValue(sheet, out var heights) && heights.Count > 0;
+                var hasRowOutlines = _sheetRowOutlines.TryGetValue(sheet, out var rowOutlines) && rowOutlines.Count > 0;
+                var hasHiddenRows = _sheetHiddenRows.TryGetValue(sheet, out var hiddenRows) && hiddenRows.Count > 0;
                 var rowNum = 1;
                 foreach (var r in list)
                 {
+                    var rowTag = $"<row r=\"{rowNum}\"";
+                    var replacement = rowTag;
                     if (hasHeights && heights!.TryGetValue(rowNum, out var ht))
+                        replacement = $"<row r=\"{rowNum}\" ht=\"{ht:0.##}\" customHeight=\"1\"";
+                    if (hasRowOutlines && rowOutlines!.TryGetValue(rowNum, out var ro) && ro.Level > 0)
                     {
-                        sw.Write(r.Replace($"<row r=\"{rowNum}\"", $"<row r=\"{rowNum}\" ht=\"{ht:0.##}\" customHeight=\"1\""));
+                        var tag = replacement == rowTag
+                            ? $"<row r=\"{rowNum}\""
+                            : replacement.TrimEnd('"');
+                        replacement = tag + $" outlineLevel=\"{ro.Level}\"" + (ro.Collapsed ? " collapsed=\"1\"" : "") + (replacement == rowTag ? "" : "\"");
                     }
-                    else
+                    if (hasHiddenRows && hiddenRows!.Contains(rowNum))
                     {
-                        sw.Write(r);
+                        var tag = replacement == rowTag
+                            ? $"<row r=\"{rowNum}\""
+                            : replacement.TrimEnd('"');
+                        replacement = tag + " hidden=\"1\"" + (replacement == rowTag ? "" : "\"");
                     }
+                    sw.Write(r.Replace(rowTag, replacement));
                     rowNum++;
                 }
             }
@@ -354,33 +847,83 @@ partial class ExcelWriter
                 sw.Write("</mergeCells>");
             }
 
+            // rowBreaks（水平分页符）
+            if (_sheetPageBreaks.TryGetValue(sheet, out var rowBreaks) && rowBreaks.Count > 0)
+            {
+                rowBreaks.Sort();
+                sw.Write($"<rowBreaks count=\"{rowBreaks.Count}\" manualBreakCount=\"{rowBreaks.Count}\">");
+                foreach (var r in rowBreaks)
+                    sw.Write($"<brk id=\"{r - 1}\" max=\"16383\" man=\"1\"/>");
+                sw.Write("</rowBreaks>");
+            }
+
+            // colBreaks（垂直分页符）——OOXML 规范 id 为 0基列号，与 rowBreaks 保持一致（2026-08-07 修复 off-by-one）
+            if (_sheetColPageBreaks.TryGetValue(sheet, out var colBreaks) && colBreaks.Count > 0)
+            {
+                colBreaks.Sort();
+                sw.Write($"<colBreaks count=\"{colBreaks.Count}\" manualBreakCount=\"{colBreaks.Count}\">");
+                foreach (var c in colBreaks)
+                    sw.Write($"<brk id=\"{c - 1}\" max=\"1048575\" man=\"1\"/>");
+                sw.Write("</colBreaks>");
+            }
+
             // conditionalFormatting
             if (_sheetCondFormats.TryGetValue(sheet, out var conds) && conds.Count > 0)
             {
                 var priority = 1;
+                var dxfId = GetDxfBase(sheet);
                 foreach (var cf in conds)
                 {
+                    var ruleDxfId = IsDxfEligible(cf) ? dxfId : -1;
+                    if (IsDxfEligible(cf)) dxfId++;
                     sw.Write($"<conditionalFormatting sqref=\"{cf.Range}\">");
                     switch (cf.Type)
                     {
-                        case ConditionalFormatType.GreaterThan:
-                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"0\" priority=\"{priority++}\" operator=\"greaterThan\"><formula>{SecurityElement.Escape(cf.Value)}</formula></cfRule>");
+                        case ConditionalFormatValues.GreaterThan:
+                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"{ruleDxfId}\" priority=\"{priority++}\" operator=\"greaterThan\"><formula>{SecurityElement.Escape(cf.Value)}</formula></cfRule>");
                             break;
-                        case ConditionalFormatType.LessThan:
-                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"0\" priority=\"{priority++}\" operator=\"lessThan\"><formula>{SecurityElement.Escape(cf.Value)}</formula></cfRule>");
+                        case ConditionalFormatValues.LessThan:
+                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"{ruleDxfId}\" priority=\"{priority++}\" operator=\"lessThan\"><formula>{SecurityElement.Escape(cf.Value)}</formula></cfRule>");
                             break;
-                        case ConditionalFormatType.Equal:
-                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"0\" priority=\"{priority++}\" operator=\"equal\"><formula>{SecurityElement.Escape(cf.Value)}</formula></cfRule>");
+                        case ConditionalFormatValues.Equal:
+                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"{ruleDxfId}\" priority=\"{priority++}\" operator=\"equal\"><formula>{SecurityElement.Escape(cf.Value)}</formula></cfRule>");
                             break;
-                        case ConditionalFormatType.Between:
-                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"0\" priority=\"{priority++}\" operator=\"between\"><formula>{SecurityElement.Escape(cf.Value)}</formula><formula>{SecurityElement.Escape(cf.Value2)}</formula></cfRule>");
+                        case ConditionalFormatValues.Between:
+                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"{ruleDxfId}\" priority=\"{priority++}\" operator=\"between\"><formula>{SecurityElement.Escape(cf.Value)}</formula><formula>{SecurityElement.Escape(cf.Value2)}</formula></cfRule>");
                             break;
-                        case ConditionalFormatType.DataBar:
+                        case ConditionalFormatValues.NotEqual:
+                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"{ruleDxfId}\" priority=\"{priority++}\" operator=\"notEqual\"><formula>{SecurityElement.Escape(cf.Value)}</formula></cfRule>");
+                            break;
+                        case ConditionalFormatValues.NotBetween:
+                            sw.Write($"<cfRule type=\"cellIs\" dxfId=\"{ruleDxfId}\" priority=\"{priority++}\" operator=\"notBetween\"><formula>{SecurityElement.Escape(cf.Value)}</formula><formula>{SecurityElement.Escape(cf.Value2)}</formula></cfRule>");
+                            break;
+                        case ConditionalFormatValues.DataBar:
                             sw.Write($"<cfRule type=\"dataBar\" priority=\"{priority++}\"><dataBar><cfvo type=\"min\"/><cfvo type=\"max\"/><color rgb=\"FF{cf.Color ?? "4472C4"}\"/></dataBar></cfRule>");
                             break;
-                        case ConditionalFormatType.ColorScale:
+                        case ConditionalFormatValues.ColorScale:
                             sw.Write($"<cfRule type=\"colorScale\" priority=\"{priority++}\"><colorScale><cfvo type=\"min\"/><cfvo type=\"max\"/><color rgb=\"FFFFFFFF\"/><color rgb=\"FF{cf.Color ?? "4472C4"}\"/></colorScale></cfRule>");
                             break;
+                        case ConditionalFormatValues.IconSet:
+                            {
+                                var its = cf.IconSetType ?? "3Arrows";
+                                var count = its[0] - '0'; // 取前缀数字
+                                if (count < 3 || count > 5) count = 3;
+                                sw.Write($"<cfRule type=\"iconSet\" priority=\"{priority++}\"><iconSet iconSet=\"{SecurityElement.Escape(its)}\">");
+                                for (var p = 0; p < count; p++)
+                                {
+                                    var pct = p == 0 ? 0 : (Int32)Math.Round(100.0 * p / count);
+                                    sw.Write($"<cfvo type=\"percent\" val=\"{pct}\"/>");
+                                }
+                                sw.Write("</iconSet></cfRule>");
+                                break;
+                            }
+                        case ConditionalFormatValues.Expression:
+                            {
+                                var esc = SecurityElement.Escape(cf.Formula) ?? cf.Formula ?? String.Empty;
+                                var dxfAttr = HasDxfStyle(cf) ? $" dxfId=\"{ruleDxfId}\"" : String.Empty;
+                                sw.Write($"<cfRule type=\"expression\"{dxfAttr} priority=\"{priority++}\"><formula>{esc}</formula></cfRule>");
+                                break;
+                            }
                     }
                     sw.Write("</conditionalFormatting>");
                 }
@@ -441,8 +984,9 @@ partial class ExcelWriter
                 }
             }
 
-            // drawing（图片引用）
-            if (sheetsWithImages.Contains(i))
+            // drawing（图片 + 图表引用）
+            var hasDrawing = sheetsWithImages.Contains(i) || sheetsWithCharts.ContainsKey(i);
+            if (hasDrawing)
             {
                 sw.Write($"<drawing r:id=\"rDr1\"/>");
             }
@@ -453,11 +997,84 @@ partial class ExcelWriter
                 sw.Write($"<legacyDrawing r:id=\"rVml1\"/>");
             }
 
+            // tableParts（结构化表格引用）
+            if (sheetsWithTables.TryGetValue(i, out var shTables))
+            {
+                sw.Write($"<tableParts count=\"{shTables.Count}\">");
+                for (var t = 0; t < shTables.Count; t++)
+                    sw.Write($"<tablePart r:id=\"rTbl{t + 1}\"/>");
+                sw.Write("</tableParts>");
+            }
+
+            // sparklineGroups（迷你图）
+            if (_sheetSparklineGroups.TryGetValue(sheet, out var sparkGroups) && sparkGroups.Count > 0)
+            {
+                sw.Write("<x14:sparklineGroups xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\" xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\">");
+                foreach (var sg in sparkGroups)
+                {
+                    sw.Write($"<x14:sparklineGroup displayEmptyCellsAs=\"gap\"");
+                    if (sg.MarkerColor != null) sw.Write($" markers=\"1\"");
+                    sw.Write(">");
+                    sw.Write($"<x14:colorSeries theme=\"4\"/>");
+                    sw.Write($"<x14:colorNegative theme=\"5\"/>");
+                    sw.Write($"<x14:colorAxis theme=\"4\" luminance=\"42\"/>");
+                    sw.Write($"<x14:colorMarkers theme=\"4\" luminance=\"42\"/>");
+                    sw.Write($"<x14:colorFirst theme=\"4\" luminance=\"42\"/>");
+                    sw.Write($"<x14:colorLast theme=\"4\" luminance=\"42\"/>");
+                    sw.Write($"<x14:colorHigh theme=\"4\"/>");
+                    sw.Write($"<x14:colorLow theme=\"4\"/>");
+                    // 数据系列
+                    sw.Write($"<xm:sqref>{XmlEscape(sg.DataRange)}</xm:sqref>");
+                    // 迷你图位置
+                    sw.Write("<x14:sparklines>");
+                    // 单个单元格或多个单元格
+                    var cells = sg.CellRange.Split(',', ' ');
+                    foreach (var cell in cells)
+                    {
+                        if (cell.Trim().Length == 0) continue;
+                        sw.Write($"<x14:sparkline><xm:f>{XmlEscape(cell.Trim())}</xm:f></x14:sparkline>");
+                    }
+                    sw.Write("</x14:sparklines>");
+                    sw.Write($"</x14:sparklineGroup>");
+                }
+                sw.Write("</x14:sparklineGroups>");
+            }
+
+            // 扩展引用（M27 线程化批注 + M28 切片器）：extLst + x14 扩展
+            var hasThreadedExt = sheetsWithThreadedComments.Contains(i);
+            var sheetSlicers = _slicers.Where(s => s.Sheet.EqualIgnoreCase(sheet)).ToList();
+            if (hasThreadedExt || sheetSlicers.Count > 0)
+            {
+                sw.Write("<extLst>");
+                if (hasThreadedExt)
+                {
+                    sw.Write("<ext uri=\"{0298E913-981F-46C6-9B23-F7C1E7E6C8F1}\">");
+                    sw.Write("<x14:commentList>");
+                    foreach (var tc in _threadedComments.Where(c => c.Sheet.EqualIgnoreCase(sheet)))
+                    {
+                        var cellRef = MakeCellRef(tc.Row - 1, tc.Col);
+                        sw.Write($"<x14:comment ref=\"{cellRef}\" authorId=\"0\" guid=\"{tc.Id}\" t=\"threaded\" w=\"0\" d=\"0\"/>");
+                    }
+                    sw.Write("</x14:commentList></ext>");
+                }
+                if (sheetSlicers.Count > 0)
+                {
+                    sw.Write("<ext uri=\"{A8765BA9-456A-4DAB-B4F3-ACF838C121DE}\">");
+                    sw.Write("<x14:slicerList>");
+                    for (var si = 0; si < sheetSlicers.Count; si++)
+                        sw.Write($"<x14:slicer r:id=\"rSlc{si + 1}\"/>");
+                    sw.Write("</x14:slicerList></ext>");
+                }
+                sw.Write("</extLst>");
+            }
+
             sw.Write("</worksheet>");
             sw.Dispose();
 
-            // sheet rels（超链接 + 图片 drawing + 批注关系）
-            if (sheetsWithHyperlinks.Contains(i) || sheetsWithImages.Contains(i) || sheetsWithComments.Contains(i))
+            // sheet rels（超链接 + 图片 drawing + 批注 + 表格 + 图表关系）
+            var needSheetRels = sheetsWithHyperlinks.Contains(i) || sheetsWithImages.Contains(i) ||
+                                sheetsWithComments.Contains(i) || sheetsWithTables.ContainsKey(i) || sheetsWithCharts.ContainsKey(i) || sheetsWithThreadedComments.Contains(i) || sheetSlicers.Count > 0;
+            if (needSheetRels)
             {
                 var relEntry = za.CreateEntry($"xl/worksheets/_rels/sheet{i + 1}.xml.rels");
                 using var rsw = new StreamWriter(relEntry.Open(), Encoding);
@@ -469,8 +1086,9 @@ partial class ExcelWriter
                         rsw.Write($"<Relationship Id=\"rHl{h + 1}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"{SecurityElement.Escape(rels[h].Url)}\" TargetMode=\"External\"/>");
                     }
                 }
-                if (sheetsWithImages.Contains(i))
+                if (sheetsWithImages.Contains(i) || sheetsWithCharts.ContainsKey(i))
                 {
+                    // 图表与图片共用 drawing：仅含图表时也必须写 rDr1 关系，否则 sheet 的 <drawing> 引用断链
                     rsw.Write($"<Relationship Id=\"rDr1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/drawing{i + 1}.xml\"/>");
                 }
                 if (sheetsWithComments.Contains(i))
@@ -478,56 +1096,127 @@ partial class ExcelWriter
                     rsw.Write($"<Relationship Id=\"rVml1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing\" Target=\"../drawings/vmlDrawing{i + 1}.vml\"/>");
                     rsw.Write($"<Relationship Id=\"rCmt1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments{i + 1}.xml\"/>");
                 }
+                // 线程化批注关系（M27）
+                if (sheetsWithThreadedComments.Contains(i))
+                {
+                    rsw.Write($"<Relationship Id=\"rTc1\" Type=\"http://schemas.microsoft.com/office/2017/10/relationships/threadedComment\" Target=\"../threadedComments/threadedComment{i + 1}.xml\"/>");
+                }
+                // 切片器关系（M28）
+                for (var si = 0; si < sheetSlicers.Count; si++)
+                {
+                    var sIdx = _slicers.IndexOf(sheetSlicers[si]) + 1;
+                    rsw.Write($"<Relationship Id=\"rSlc{si + 1}\" Type=\"http://schemas.microsoft.com/office/2007/relationships/slicer\" Target=\"../slicers/slicer{sIdx}.xml\"/>");
+                }
+                if (sheetsWithTables.TryGetValue(i, out var tblRels))
+                {
+                    for (var t = 0; t < tblRels.Count; t++)
+                    {
+                        rsw.Write($"<Relationship Id=\"rTbl{t + 1}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table{globalTableIndex + t + 1}.xml\"/>");
+                    }
+                    globalTableIndex += tblRels.Count;
+                }
+                // 图表关系
+                if (sheetsWithCharts.TryGetValue(i, out var chartRels))
+                {
+                    for (var c = 0; c < chartRels.Count; c++)
+                    {
+                        rsw.Write($"<Relationship Id=\"rCh{c + 1}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"../charts/chart{globalChartId + c + 1}.xml\"/>");
+                    }
+                    globalChartId += chartRels.Count;
+                }
                 rsw.Write("</Relationships>");
             }
         }
 
-        // Drawings 和媒体文件
+        // Drawings、媒体文件和图表
         for (var i = 0; i < _sheetNames.Count; i++)
         {
-            if (!sheetsWithImages.Contains(i)) continue;
+            var hasImages = sheetsWithImages.Contains(i);
+            var hasCharts = sheetsWithCharts.ContainsKey(i);
+            if (!hasImages && !hasCharts) continue;
             var sheet = _sheetNames[i];
-            var images = _sheetImages[sheet];
 
-            // drawing{i+1}.xml
+            // drawing{i+1}.xml（包含图片和图表锚点）
             var drawEntry = za.CreateEntry($"xl/drawings/drawing{i + 1}.xml");
             using (var dsw = new StreamWriter(drawEntry.Open(), Encoding))
             {
                 dsw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">");
-                for (var j = 0; j < images.Count; j++)
+                // 图片锚点
+                if (hasImages && _sheetImages.TryGetValue(sheet, out var images))
                 {
-                    var img = images[j];
-                    var emuW = (Int64)(img.Width * 9525); // px → EMU
-                    var emuH = (Int64)(img.Height * 9525);
-                    dsw.Write($"<xdr:twoCellAnchor><xdr:from><xdr:col>{img.Col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{img.Row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>");
-                    dsw.Write($"<xdr:to><xdr:col>{img.Col + 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{img.Row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>");
-                    dsw.Write($"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"{j + 2}\" name=\"Image{globalImageIndex + 1}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr>");
-                    dsw.Write($"<xdr:blipFill><a:blip r:embed=\"rImg{j + 1}\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>");
-                    dsw.Write($"<xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{emuW}\" cy=\"{emuH}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>");
-                    globalImageIndex++;
+                    for (var j = 0; j < images.Count; j++)
+                    {
+                        var img = images[j];
+                        var emuW = (Int64)(img.Width * 9525);
+                        var emuH = (Int64)(img.Height * 9525);
+                        var editAs = img.EditAs.IsNullOrEmpty() ? "oneCell" : img.EditAs;
+                        dsw.Write($"<xdr:twoCellAnchor editAs=\"{editAs}\">");
+                        dsw.Write($"<xdr:from><xdr:col>{img.Col}</xdr:col><xdr:colOff>{img.FromColOff}</xdr:colOff><xdr:row>{img.Row}</xdr:row><xdr:rowOff>{img.FromRowOff}</xdr:rowOff></xdr:from>");
+                        if (img.ToRow >= 0 && img.ToCol >= 0)
+                            dsw.Write($"<xdr:to><xdr:col>{img.ToCol}</xdr:col><xdr:colOff>{img.ToColOff}</xdr:colOff><xdr:row>{img.ToRow}</xdr:row><xdr:rowOff>{img.ToRowOff}</xdr:rowOff></xdr:to>");
+                        else
+                            dsw.Write($"<xdr:to><xdr:col>{img.Col + 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{img.Row + 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>");
+                        dsw.Write($"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"{j + 2}\" name=\"Image{globalImageIndex + 1}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr>");
+                        dsw.Write($"<xdr:blipFill><a:blip r:embed=\"rImg{j + 1}\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>");
+                        dsw.Write($"<xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{emuW}\" cy=\"{emuH}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>");
+                        globalImageIndex++;
+                    }
+                }
+                // 图表锚点
+                if (hasCharts && sheetsWithCharts.TryGetValue(i, out var charts))
+                {
+                    for (var c = 0; c < charts.Count; c++)
+                    {
+                        var chart = charts[c];
+                        var emuW = (Int64)(chart.WidthPx * 9525);
+                        var emuH = (Int64)(chart.HeightPx * 9525);
+                        dsw.Write("<xdr:twoCellAnchor>");
+                        dsw.Write($"<xdr:from><xdr:col>{chart.AnchorCol}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{chart.AnchorRow}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>");
+                        dsw.Write($"<xdr:to><xdr:col>{chart.AnchorCol + 8}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{chart.AnchorRow + 16}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>");
+                        var cNvPrId = 2 + (hasImages && _sheetImages.TryGetValue(sheet, out var ims) ? ims.Count : 0) + c;
+                        dsw.Write($"<xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{cNvPrId}\" name=\"Chart {c + 1}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>");
+                        dsw.Write($"<xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{emuW}\" cy=\"{emuH}\"/></xdr:xfrm>");
+                        dsw.Write($"<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rCh{c + 1}\"/></a:graphicData></a:graphic>");
+                        dsw.Write("</xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>");
+                    }
                 }
                 dsw.Write("</xdr:wsDr>");
             }
 
             // drawing rels
-            var drawRelEntry = za.CreateEntry($"xl/drawings/_rels/drawing{i + 1}.xml.rels");
-            using (var drsw = new StreamWriter(drawRelEntry.Open(), Encoding))
             {
-                drsw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
-                for (var j = 0; j < images.Count; j++)
+                _sheetImages.TryGetValue(sheet, out var drawImgs);
+                var hasDrawImgs = drawImgs != null && drawImgs.Count > 0;
+                var hasDrawCharts = sheetsWithCharts.TryGetValue(i, out var dCharts) && dCharts.Count > 0;
+                if (hasDrawImgs || hasDrawCharts)
                 {
-                    drsw.Write($"<Relationship Id=\"rImg{j + 1}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/image{globalImageIndex - images.Count + j + 1}.{images[j].Extension}\"/>");
+                    var drawRelEntry = za.CreateEntry($"xl/drawings/_rels/drawing{i + 1}.xml.rels");
+                    using var drsw = new StreamWriter(drawRelEntry.Open(), Encoding);
+                    drsw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+                    if (hasDrawImgs)
+                    {
+                        for (var j = 0; j < drawImgs!.Count; j++)
+                            drsw.Write($"<Relationship Id=\"rImg{j + 1}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/image{globalImageIndex - drawImgs.Count + j + 1}.{drawImgs[j].Extension}\"/>");
+                    }
+                    if (hasDrawCharts)
+                    {
+                        for (var c = 0; c < dCharts!.Count; c++)
+                            drsw.Write($"<Relationship Id=\"rCh{c + 1}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"../charts/chart{globalChartId - dCharts.Count + c + 1}.xml\"/>");
+                    }
+                    drsw.Write("</Relationships>");
                 }
-                drsw.Write("</Relationships>");
             }
 
-            // 媒体文件
-            for (var j = 0; j < images.Count; j++)
+            // 媒体文件（仅图片）
+            if (hasImages && _sheetImages.TryGetValue(sheet, out var mediaImgs))
             {
-                var img = images[j];
-                var mediaEntry = za.CreateEntry($"xl/media/image{globalImageIndex - images.Count + j + 1}.{img.Extension}");
-                using var ms2 = mediaEntry.Open();
-                ms2.Write(img.Data, 0, img.Data.Length);
+                for (var j = 0; j < mediaImgs.Count; j++)
+                {
+                    var img = mediaImgs[j];
+                    var mediaEntry = za.CreateEntry($"xl/media/image{globalImageIndex - mediaImgs.Count + j + 1}.{img.Extension}");
+                    using var ms2 = mediaEntry.Open();
+                    ms2.Write(img.Data, 0, img.Data.Length);
+                }
             }
         }
 
@@ -558,7 +1247,33 @@ partial class ExcelWriter
                     var cellRef = MakeCellRef(c.Row - 1, c.Col);
                     var authorId = authors.IndexOf(c.Author);
                     csw.Write($"<comment ref=\"{cellRef}\" authorId=\"{authorId}\">");
-                    csw.Write($"<text><r><t xml:space=\"preserve\">{SecurityElement.Escape(c.Text)}</t></r></text>");
+                    if (c.Segments is { Count: > 0 })
+                    {
+                        // 富文本批注：多段 + 独立样式
+                        csw.Write("<text>");
+                        foreach (var seg in c.Segments)
+                        {
+                            csw.Write("<r>");
+                            var hasPr = !String.IsNullOrEmpty(seg.FontName) || seg.FontSize > 0 || seg.Bold || seg.Italic || !String.IsNullOrEmpty(seg.Color);
+                            if (hasPr)
+                            {
+                                csw.Write("<rPr>");
+                                if (seg.Bold) csw.Write("<b/>");
+                                if (seg.Italic) csw.Write("<i/>");
+                                if (seg.FontSize > 0) csw.Write($"<sz val=\"{seg.FontSize:0.##}\"/>");
+                                if (!String.IsNullOrEmpty(seg.Color)) csw.Write($"<color rgb=\"{seg.Color}\"/>");
+                                if (!String.IsNullOrEmpty(seg.FontName)) csw.Write($"<rFont val=\"{SecurityElement.Escape(seg.FontName)}\"/>");
+                                csw.Write("</rPr>");
+                            }
+                            csw.Write($"<t xml:space=\"preserve\">{SecurityElement.Escape(seg.Text)}</t>");
+                            csw.Write("</r>");
+                        }
+                        csw.Write("</text>");
+                    }
+                    else
+                    {
+                        csw.Write($"<text><r><t xml:space=\"preserve\">{SecurityElement.Escape(c.Text)}</t></r></text>");
+                    }
                     csw.Write("</comment>");
                 }
                 csw.Write("</commentList></comments>");
@@ -574,8 +1289,9 @@ partial class ExcelWriter
                 for (var j = 0; j < comments.Count; j++)
                 {
                     var c = comments[j];
+                    var vis = c.Visible ? "visible" : "hidden";
                     vsw.Write($"<v:shape id=\"_x0000_s{1025 + j}\" type=\"#_x0000_t202\" " +
-                              "style=\"position:absolute;margin-left:59.25pt;margin-top:1.5pt;width:108pt;height:59.25pt;z-index:1;visibility:hidden\" " +
+                              $"style=\"position:absolute;margin-left:{c.Left:0.##}pt;margin-top:{c.Top:0.##}pt;width:{c.Width:0.##}pt;height:{c.Height:0.##}pt;z-index:1;visibility:{vis}\" " +
                               "fillcolor=\"#ffffe1\" o:insetmode=\"auto\">");
                     vsw.Write("<v:fill color2=\"#ffffe1\"/><v:shadow on=\"t\" color=\"black\" obscured=\"t\"/>");
                     vsw.Write("<v:path o:connecttype=\"none\"/><v:textbox style=\"mso-direction-alt:auto\"><div style=\"text-align:left\"/></v:textbox>");
@@ -587,7 +1303,200 @@ partial class ExcelWriter
             }
         }
 
+        // 线程化批注部件（M27）：xl/persons/person.xml + xl/threadedComments/threadedCommentN.xml
+        if (sheetsWithThreadedComments.Count > 0)
+        {
+            // person.xml（工作簿级，同一作者共享一个 person）
+            using (var psw = new StreamWriter(za.CreateEntry("xl/persons/person.xml").Open(), Encoding))
+            {
+                psw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+                psw.Write("<persons xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">");
+                foreach (var kv in personMap)
+                {
+                    var tc = _threadedComments.FirstOrDefault(c => c.Author + "\u0001" + (c.UserId ?? "") == kv.Key);
+                    var disp = SecurityElement.Escape(tc?.Author ?? kv.Key.Split('\u0001')[0]) ?? "";
+                    var uid = tc?.UserId ?? "";
+                    psw.Write($"<person displayName=\"{disp}\" id=\"{kv.Value}\" userId=\"{SecurityElement.Escape(uid)}\" providerId=\"None\"/>");
+                }
+                psw.Write("</persons>");
+            }
+
+            // threadedCommentN.xml（每个有线程化批注的 sheet 一个）
+            for (var i = 0; i < _sheetNames.Count; i++)
+            {
+                if (!sheetsWithThreadedComments.Contains(i)) continue;
+                var sheet = _sheetNames[i];
+                var tcs = _threadedComments.Where(c => c.Sheet.EqualIgnoreCase(sheet)).ToList();
+                using var tcsw = new StreamWriter(za.CreateEntry($"xl/threadedComments/threadedComment{i + 1}.xml").Open(), Encoding);
+                tcsw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+                tcsw.Write("<ThreadedComments xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">");
+                foreach (var tc in tcs)
+                {
+                    var cellRef = MakeCellRef(tc.Row - 1, tc.Col);
+                    tcsw.Write($"<threadedComment ref=\"{cellRef}\" personId=\"{tc.PersonId}\" dateTime=\"{tc.Time.ToUniversalTime():yyyy-MM-ddTHH:mm:ssZ}\" id=\"{tc.Id}\"");
+                    if (!tc.ParentId.IsNullOrEmpty()) tcsw.Write($" parentId=\"{tc.ParentId}\"");
+                    tcsw.Write(">");
+                    tcsw.Write($"<text>{SecurityElement.Escape(tc.Text)}</text>");
+                    tcsw.Write("<mentions/>");
+                    tcsw.Write("</threadedComment>");
+                }
+                tcsw.Write("</ThreadedComments>");
+            }
+        }
+
+        // 切片器部件（M28）：slicerCacheN.xml + slicerN.xml + slicer 关系
+        if (_slicers.Count > 0)
+        {
+            for (var si = 0; si < _slicers.Count; si++)
+            {
+                var slicer = _slicers[si];
+                var cacheName = $"Slicer_{slicer.Name}";
+                slicer.CacheName = cacheName;
+
+                // 解析表格列（range + 列索引 + 唯一值）
+                var table = FindTable(slicer.Sheet, slicer.TableName);
+                var colIdx = -1;
+                var items = new List<String>();
+                if (table != null)
+                {
+                    var (r1, c1, r2, c2) = ParseTableRange(table.Range);
+                    colIdx = ResolveColumnIndex(slicer.Sheet, table, slicer.ColumnName, r1, c1, r2, c2);
+                    if (colIdx >= c1 && colIdx <= c2)
+                        items = ExtractColumnItems(slicer.Sheet, colIdx, r1, r2);
+                }
+                if (items.Count == 0)
+                {
+                    // 兜底：至少一个占位项目，避免空缓存
+                    items.Add("(空白)");
+                }
+
+                // slicerCacheN.xml
+                using (var scsw = new StreamWriter(za.CreateEntry($"xl/slicerCaches/slicerCache{si + 1}.xml").Open(), Encoding))
+                {
+                    scsw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+                    scsw.Write($"<slicerCacheDefinition xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\" name=\"{SecurityElement.Escape(cacheName)}\">");
+                    scsw.Write($"<data cacheName=\"{SecurityElement.Escape(slicer.TableName)}\" sourceName=\"{SecurityElement.Escape(table?.Range ?? slicer.TableName)}\">");
+                    scsw.Write($"<columns count=\"1\"><column dataType=\"string\" name=\"{SecurityElement.Escape(slicer.ColumnName)}\" uniqueCount=\"{items.Count}\"/></columns>");
+                    scsw.Write($"<items count=\"{items.Count}\">");
+                    for (var x = 0; x < items.Count; x++)
+                        scsw.Write($"<i x=\"{x}\" s=\"0\" d=\"0\"/>");
+                    scsw.Write("</items>");
+                    scsw.Write("</data>");
+                    scsw.Write("<sortOrder>0</sortOrder>");
+                    scsw.Write("</slicerCacheDefinition>");
+                }
+
+                // slicerN.xml
+                using (var ssw = new StreamWriter(za.CreateEntry($"xl/slicers/slicer{si + 1}.xml").Open(), Encoding))
+                {
+                    ssw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+                    ssw.Write($"<slicer xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\" name=\"{SecurityElement.Escape(slicer.Name)}\" cache=\"{SecurityElement.Escape(cacheName)}\" caption=\"{SecurityElement.Escape(slicer.Caption)}\" uiLevel=\"2\" style=\"{SecurityElement.Escape(slicer.Style)}\" rowHeight=\"138\" columnCount=\"1\" showCaption=\"1\">");
+                    ssw.Write("<columns><column w=\"72\"/></columns>");
+                    ssw.Write("<data>");
+                    for (var x = 0; x < items.Count; x++)
+                        ssw.Write($"<dataItem x=\"{x}\" s=\"0\"/>");
+                    ssw.Write("</data>");
+                    ssw.Write("</slicer>");
+                }
+
+                // slicerN.xml.rels（关联 slicerCache）
+                using (var srsw = new StreamWriter(za.CreateEntry($"xl/slicers/_rels/slicer{si + 1}.xml.rels").Open(), Encoding))
+                {
+                    srsw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+                    srsw.Write("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+                    srsw.Write($"<Relationship Id=\"rId1\" Type=\"http://schemas.microsoft.com/office/2007/relationships/slicerCache\" Target=\"../slicerCaches/slicerCache{si + 1}.xml\"/>");
+                    srsw.Write("</Relationships>");
+                }
+            }
+        }
+
+        // 写入 OtherParts（Reader 收集的原始 ZIP 部件，确保往返不丢内容）
+        WriteOtherParts(za);
+
+        // 结构化表格 XML 文件
+        var tblIndex = 0;
+        foreach (var kv in sheetsWithTables)
+        {
+            foreach (var tbl in kv.Value)
+            {
+                tblIndex++;
+                using var tsw = new StreamWriter(za.CreateEntry($"xl/tables/table{tblIndex}.xml").Open(), Encoding);
+                WriteTableXml(tsw, tbl, tblIndex);
+            }
+        }
+
+        // 图表 XML 文件
+        var cIndex = 0;
+        foreach (var kv in sheetsWithCharts)
+        {
+            foreach (var chart in kv.Value)
+            {
+                cIndex++;
+                // 用块作用域限定图表流生命周期：ZipArchive 同一时刻仅允许一个打开的条目流，
+                // 必须等 chartN.xml 条目流关闭后才能创建其 rels 条目
+                {
+                    using var csw = new StreamWriter(za.CreateEntry($"xl/charts/chart{cIndex}.xml").Open(), Encoding);
+                    WriteChartXml(csw, chart, cIndex);
+                }
+                // chart rels
+                var cRelEntry = za.CreateEntry($"xl/charts/_rels/chart{cIndex}.xml.rels");
+                using var crsw = new StreamWriter(cRelEntry.Open(), Encoding);
+                crsw.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+                crsw.Write("</Relationships>");
+            }
+        }
+
         target.Flush();
+    }
+
+    /// <summary>写入 OtherParts 中未被显式处理过的部件</summary>
+    private void WriteOtherParts(ZipArchive za)
+    {
+        if (_otherParts.Count == 0) return;
+
+        // 已由 Writer 显式生成的部件
+        var generated = new HashSet<String>(StringComparer.OrdinalIgnoreCase)
+        {
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "xl/workbook.xml",
+            "xl/_rels/workbook.xml.rels",
+            "xl/styles.xml",
+            "xl/sharedStrings.xml",
+        };
+        for (var i = 0; i < _sheetNames.Count; i++)
+        {
+            generated.Add($"xl/worksheets/sheet{i + 1}.xml");
+            // 超链接/图片/批注产生的 rels 也跳过
+            if (_sheetHyperlinks.ContainsKey(_sheetNames[i]) ||
+                _sheetImages.ContainsKey(_sheetNames[i]) ||
+                _sheetComments.ContainsKey(_sheetNames[i]))
+            {
+                generated.Add($"xl/worksheets/_rels/sheet{i + 1}.xml.rels");
+            }
+            // 图片 drawing 和 rels
+            if (_sheetImages.TryGetValue(_sheetNames[i], out var imgs) && imgs.Count > 0)
+            {
+                generated.Add($"xl/drawings/drawing{i + 1}.xml");
+                generated.Add($"xl/drawings/_rels/drawing{i + 1}.xml.rels");
+            }
+            // 批注 comments 和 vml
+            if (_sheetComments.TryGetValue(_sheetNames[i], out var cmts) && cmts.Count > 0)
+            {
+                generated.Add($"xl/comments{i + 1}.xml");
+                generated.Add($"xl/drawings/vmlDrawing{i + 1}.vml");
+            }
+        }
+
+        foreach (var kv in _otherParts)
+        {
+            if (generated.Contains(kv.Key)) continue;
+            // 跳过媒体文件（Writer 已写入）
+            if (kv.Key.StartsWith("xl/media/", StringComparison.OrdinalIgnoreCase)) continue;
+
+            using var e = za.CreateEntry(kv.Key).Open();
+            e.Write(kv.Value, 0, kv.Value.Length);
+        }
     }
 
     /// <summary>生成完整的 styles.xml</summary>
@@ -615,8 +1524,10 @@ partial class ExcelWriter
             if (f.Bold) sw.Write("<b/>");
             if (f.Italic) sw.Write("<i/>");
             if (f.Underline) sw.Write("<u/>");
+            if (f.Strike) sw.Write("<strike/>");
+            if (!f.VerticalAlign.IsNullOrEmpty()) sw.Write($"<vertAlign val=\"{f.VerticalAlign}\"/>");
             if (f.Size > 0) sw.Write($"<sz val=\"{f.Size}\"/>");
-            if (!f.Color.IsNullOrEmpty()) sw.Write($"<color rgb=\"FF{f.Color}\"/>");
+            WriteColorXml(sw, f.Color);
             if (!f.Name.IsNullOrEmpty()) sw.Write($"<name val=\"{SecurityElement.Escape(f.Name)}\"/>");
             sw.Write("</font>");
         }
@@ -631,8 +1542,24 @@ partial class ExcelWriter
                 sw.Write("<patternFill patternType=\"none\"/>");
             else if (f.PatternType == "gray125")
                 sw.Write("<patternFill patternType=\"gray125\"/>");
+            else if (f.PatternType == "solid")
+                sw.Write($"<patternFill patternType=\"solid\"><fgColor {FormatColorAttr(f.BgColor)}/></patternFill>");
+            else if (f.PatternType == "gradient" && f.GradientType != null)
+            {
+                sw.Write($"<gradientFill {(f.GradientType == "radial" ? "type=\"path\"" : "type=\"linear\"")} degree=\"{(f.GradientType == "radial" ? 0 : 90)}\">");
+                sw.Write($"<stop position=\"0\"><color {FormatColorAttr(f.GradientColor1)}/></stop>");
+                sw.Write($"<stop position=\"1\"><color {FormatColorAttr(f.GradientColor2)}/></stop>");
+                sw.Write("</gradientFill>");
+            }
+            else if (f.PatternType == "pattern" && f.PatternTypeName != null)
+            {
+                sw.Write($"<patternFill patternType=\"{f.PatternTypeName}\">");
+                if (!f.PatternFgColor.IsNullOrEmpty()) sw.Write($"<fgColor {FormatColorAttr(f.PatternFgColor)}/>");
+                if (!f.BgColor.IsNullOrEmpty()) sw.Write($"<bgColor {FormatColorAttr(f.BgColor)}/>");
+                sw.Write("</patternFill>");
+            }
             else
-                sw.Write($"<patternFill patternType=\"solid\"><fgColor rgb=\"FF{f.BgColor}\"/></patternFill>");
+                sw.Write($"<patternFill patternType=\"solid\"><fgColor {FormatColorAttr(f.BgColor)}/></patternFill>");
             sw.Write("</fill>");
         }
         sw.Write("</fills>");
@@ -641,15 +1568,39 @@ partial class ExcelWriter
         sw.Write($"<borders count=\"{_borders.Count}\">");
         foreach (var b in _borders)
         {
-            if (b.Style == CellBorderStyle.None)
+            var hasAny = b.Left != BorderStyle.None || b.Right != BorderStyle.None ||
+                         b.Top  != BorderStyle.None || b.Bottom != BorderStyle.None ||
+                         b.Diagonal != BorderStyle.None;
+            if (!hasAny)
             {
                 sw.Write("<border><left/><right/><top/><bottom/><diagonal/></border>");
             }
             else
             {
-                var sn = GetBorderStyleName(b.Style);
-                var ca = b.Color.IsNullOrEmpty() ? "" : $"<color rgb=\"FF{b.Color}\"/>";
-                sw.Write($"<border><left style=\"{sn}\">{ca}</left><right style=\"{sn}\">{ca}</right><top style=\"{sn}\">{ca}</top><bottom style=\"{sn}\">{ca}</bottom><diagonal/></border>");
+                sw.Write("<border>");
+                WriteBorderSide(sw, "left",   b.Left,   b.LeftColor);
+                WriteBorderSide(sw, "right",  b.Right,  b.RightColor);
+                WriteBorderSide(sw, "top",    b.Top,    b.TopColor);
+                WriteBorderSide(sw, "bottom", b.Bottom, b.BottomColor);
+                if (b.Diagonal != BorderStyle.None)
+                {
+                    var diagStyle = b.Diagonal switch
+                    {
+                        BorderStyle.Thin => "thin",
+                        BorderStyle.Medium => "medium",
+                        BorderStyle.Thick => "thick",
+                        BorderStyle.Dashed => "dashed",
+                        BorderStyle.Dotted => "dotted",
+                        BorderStyle.DoubleLine => "double",
+                        _ => "thin"
+                    };
+                    sw.Write($"<diagonal style=\"{diagStyle}\">");
+                    if (!b.DiagonalColor.IsNullOrEmpty()) sw.Write($"<color rgb=\"FF{b.DiagonalColor}\"/>");
+                    sw.Write("</diagonal>");
+                }
+                else
+                    sw.Write("<diagonal/>");
+                sw.Write("</border>");
             }
         }
         sw.Write("</borders>");
@@ -663,12 +1614,17 @@ partial class ExcelWriter
             if (xf.FillId > 0) sw.Write(" applyFill=\"1\"");
             if (xf.BorderId > 0) sw.Write(" applyBorder=\"1\"");
             if (xf.NumFmtId > 0) sw.Write(" applyNumberFormat=\"1\"");
-            if (xf.HAlign != HorizontalAlignment.General || xf.VAlign != VerticalAlignment.Top || xf.WrapText)
+            var needAlignment = xf.HAlign != HorizontalAlignment.General || xf.VAlign != VerticalAlignment.Top ||
+                               xf.WrapText || xf.TextRotation != 0 || xf.Indent > 0 || xf.ShrinkToFit;
+            if (needAlignment)
             {
                 sw.Write(" applyAlignment=\"1\"><alignment");
                 if (xf.HAlign != HorizontalAlignment.General) sw.Write($" horizontal=\"{xf.HAlign.ToString().ToLower()}\"");
                 if (xf.VAlign != VerticalAlignment.Top) sw.Write($" vertical=\"{xf.VAlign.ToString().ToLower()}\"");
                 if (xf.WrapText) sw.Write(" wrapText=\"1\"");
+                if (xf.TextRotation != 0) sw.Write($" textRotation=\"{xf.TextRotation}\"");
+                if (xf.Indent > 0) sw.Write($" indent=\"{xf.Indent}\"");
+                if (xf.ShrinkToFit) sw.Write(" shrinkToFit=\"1\"");
                 sw.Write("/></xf>");
             }
             else
@@ -678,26 +1634,35 @@ partial class ExcelWriter
         }
         sw.Write("</cellXfs>");
 
-        // 条件格式需要的 dxf（差异格式）
+        // 条件格式需要的 dxf（差异格式）——按工作表顺序生成，与 cfRule dxfId 分配一致
         var totalDxf = 0;
-        foreach (var kv in _sheetCondFormats)
+        foreach (var sn in _sheetNames)
         {
-            foreach (var cf in kv.Value)
-            {
-                if (cf.Type < ConditionalFormatType.DataBar) totalDxf++;
-            }
+            if (!_sheetCondFormats.TryGetValue(sn, out var list)) continue;
+            totalDxf += list.Count(IsDxfEligible);
         }
         if (totalDxf > 0)
         {
             sw.Write($"<dxfs count=\"{totalDxf}\">");
-            foreach (var kv in _sheetCondFormats)
+            foreach (var sn in _sheetNames)
             {
-                foreach (var cf in kv.Value)
+                if (!_sheetCondFormats.TryGetValue(sn, out var list)) continue;
+                foreach (var cf in list)
                 {
-                    if (cf.Type >= ConditionalFormatType.DataBar) continue;
+                    if (!IsDxfEligible(cf)) continue;
                     sw.Write("<dxf>");
+                    if (HasDxfStyle(cf) && (!cf.FontColor.IsNullOrEmpty() || cf.IsBold))
+                    {
+                        sw.Write("<font>");
+                        if (cf.IsBold) sw.Write("<b/>");
+                        if (!cf.FontColor.IsNullOrEmpty())
+                            sw.Write($"<color rgb=\"FF{cf.FontColor}\"/>");
+                        sw.Write("</font>");
+                    }
                     if (!cf.Color.IsNullOrEmpty())
                         sw.Write($"<fill><patternFill><bgColor rgb=\"FF{cf.Color}\"/></patternFill></fill>");
+                    if (!cf.BorderColor.IsNullOrEmpty())
+                        sw.Write($"<border><left style=\"thin\"><color rgb=\"FF{cf.BorderColor}\"/></left><right style=\"thin\"><color rgb=\"FF{cf.BorderColor}\"/></right><top style=\"thin\"><color rgb=\"FF{cf.BorderColor}\"/></top><bottom style=\"thin\"><color rgb=\"FF{cf.BorderColor}\"/></bottom></border>");
                     sw.Write("</dxf>");
                 }
             }
@@ -719,6 +1684,17 @@ partial class ExcelWriter
         hash ^= password.Length;
         hash ^= 0xCE4B;
         return hash.ToString("X4");
+    }
+    /// <summary>XML 字符转义</summary>
+    private static String XmlEscape(String? text)
+    {
+        if (text.IsNullOrEmpty()) return String.Empty;
+        return text!
+            .Replace("&", "&amp;")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;")
+            .Replace("\"", "&quot;")
+            .Replace("'", "&apos;");
     }
     #endregion
 }

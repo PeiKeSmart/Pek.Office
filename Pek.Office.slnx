@@ -8,6 +8,9 @@
     <File Path="NuGet.config" />
     <File Path="Readme.MD" />
   </Folder>
+  <Project Path="Benchmark/MarkdownBenchmark/MarkdownBenchmark.csproj" />
+  <Project Path="Pek.Office.Cli/Pek.Office.Cli.csproj" />
+  <Project Path="Pek.Office.Rendering/Pek.Office.Rendering.csproj" />
   <Project Path="Pek.Office/Pek.Office.csproj" />
   <Project Path="Test/Test.csproj" />
   <Project Path="XUnitTest/XUnitTest.csproj" />

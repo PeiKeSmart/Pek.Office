@@ -1,4 +1,4 @@
-﻿namespace NewLife.Office;
+﻿namespace NewLife.Office.Excel;
 
 /// <summary>垂直对齐方式</summary>
 public enum VerticalAlignment

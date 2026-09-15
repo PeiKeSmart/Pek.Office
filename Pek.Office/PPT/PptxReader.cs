@@ -1,24 +1,40 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.IO.Compression;
 using System.Text;
 using System.Xml;
+using NewLife.Office.Markdown;
+using NewLife.Office.Word;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Ppt;
 
 /// <summary>PowerPoint pptx 读取器</summary>
 /// <remarks>
 /// 直接解析 Open XML（ZIP+XML）提取幻灯片文本、形状等内容。
 /// </remarks>
-public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
+public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable, IMarkdownDocumentExtractable
 {
     #region 属性
     /// <summary>源文件路径</summary>
     public String? FilePath { get; private set; }
+
+    /// <summary>幻灯片宽度（EMU），从 presentation.xml 的 sldSz 解析</summary>
+    public Int64 SlideWidth => _slideWidth ??= ParsePresentationInfo().width;
+
+    /// <summary>幻灯片高度（EMU），从 presentation.xml 的 sldSz 解析</summary>
+    public Int64 SlideHeight => _slideHeight ??= ParsePresentationInfo().height;
+
+    /// <summary>主题强调色（6个），从 theme1.xml 的 clrScheme 解析</summary>
+    public String[] AccentColors => _accentColors ??= ParseThemeColors();
     #endregion
 
     #region 私有字段
     private readonly ZipArchive _zip;
     private Boolean _disposed;
+
+    // 延迟加载字段
+    private Int64? _slideWidth;
+    private Int64? _slideHeight;
+    private String[]? _accentColors;
     #endregion
 
     #region 构造
@@ -27,14 +43,56 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
     public PptxReader(String path)
     {
         FilePath = path.GetFullPath();
-        _zip = ZipFile.OpenRead(FilePath);
+        _zip = OpenZip(File.ReadAllBytes(FilePath), null);
+    }
+
+    /// <summary>从文件路径打开（支持打开密码加密的 pptx，S17）</summary>
+    /// <param name="path">pptx 文件路径</param>
+    /// <param name="password">打开密码（加密文件必填）</param>
+    /// <exception cref="InvalidOperationException">加密文件未提供密码或密码错误</exception>
+    public PptxReader(String path, String password)
+    {
+        if (password == null) throw new ArgumentNullException(nameof(password));
+        FilePath = path.GetFullPath();
+        _zip = OpenZip(File.ReadAllBytes(FilePath), password);
     }
 
     /// <summary>从流打开</summary>
     /// <param name="stream">包含 pptx 内容的流</param>
     public PptxReader(Stream stream)
     {
-        _zip = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: true);
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        _zip = OpenZip(ms.ToArray(), null);
+    }
+
+    /// <summary>从流打开（支持打开密码加密的 pptx，S17）</summary>
+    /// <param name="stream">包含 pptx 内容的流</param>
+    /// <param name="password">打开密码（加密文件必填）</param>
+    /// <exception cref="InvalidOperationException">加密文件未提供密码或密码错误</exception>
+    public PptxReader(Stream stream, String password)
+    {
+        if (password == null) throw new ArgumentNullException(nameof(password));
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        _zip = OpenZip(ms.ToArray(), password);
+    }
+
+    /// <summary>打开 ZIP，检测 OLE2 加密容器并解密（S17）</summary>
+    /// <param name="data">文件字节</param>
+    /// <param name="password">密码（null 表示无密码）</param>
+    /// <returns>ZipArchive（内存流持有）</returns>
+    private static ZipArchive OpenZip(Byte[] data, String? password)
+    {
+        // OLE2 CFB 魔数：D0 CF 11 E0 A1 B1 1A E1
+        if (data.Length > 8 && data[0] == 0xD0 && data[1] == 0xCF && data[2] == 0x11 && data[3] == 0xE0)
+        {
+            if (password == null)
+                throw new InvalidOperationException("加密的 PPTX 需要提供打开密码");
+            data = WordEncryptor.Decrypt(data, password);
+        }
+        var ms = new MemoryStream(data);
+        return new ZipArchive(ms, ZipArchiveMode.Read, leaveOpen: false);
     }
 
     /// <summary>释放资源</summary>
@@ -90,7 +148,7 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
 
     /// <summary>读取所有幻灯片摘要</summary>
     /// <returns>幻灯片摘要序列</returns>
-    public IEnumerable<PptSlideSummary> ReadSlides()
+    public IEnumerable<SlideSummary> ReadSlides()
     {
         var count = GetSlideCount();
         for (var i = 0; i < count; i++)
@@ -98,7 +156,7 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
             var entry = _zip.GetEntry($"ppt/slides/slide{i + 1}.xml");
             if (entry == null) continue;
 
-            var summary = new PptSlideSummary { Index = i };
+            var summary = new SlideSummary { Index = i };
             var doc = LoadXml(entry);
             const String A = "http://schemas.openxmlformats.org/drawingml/2006/main";
             var ns = new XmlNamespaceManager(doc.NameTable);
@@ -132,7 +190,7 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
                 var xfrm = sp.SelectSingleNode(".//*[local-name()='xfrm']");
                 var off = xfrm?.SelectSingleNode(".//*[local-name()='off']");
                 var ext = xfrm?.SelectSingleNode(".//*[local-name()='ext']");
-                summary.Shapes.Add(new PptShape
+                summary.Shapes.Add(new Shape
                 {
                     Id = Int32.TryParse(id, out var idNum) ? idNum : 0,
                     ShapeType = spTypAttr,
@@ -170,7 +228,7 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
     /// 对生成工具创建的 pptx 文件，通常只有一个母版（slideMaster1.xml）。
     /// </remarks>
     /// <returns>母版信息列表</returns>
-    public IEnumerable<PptMasterInfo> ReadSlideMasters()
+    public IEnumerable<SlideMasterInfo> ReadSlideMasters()
     {
         ThrowIfDisposed();
         var masters = _zip.Entries
@@ -184,7 +242,7 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
         foreach (var entry in masters)
         {
             var doc = LoadXml(entry);
-            var mi = new PptMasterInfo { Index = idx++, Name = Path.GetFileNameWithoutExtension(entry.Name) };
+            var mi = new SlideMasterInfo { Index = idx++, Name = Path.GetFileNameWithoutExtension(entry.Name) };
 
             // 背景色
             var bgNode = doc.SelectSingleNode("//*[local-name()='bg']//*[local-name()='srgbClr']") as XmlElement;
@@ -213,7 +271,7 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
     /// 解析 ppt/slideLayouts/*.xml，返回版式名称及类型。
     /// </remarks>
     /// <returns>版式信息列表</returns>
-    public IEnumerable<PptLayoutInfo> ReadSlideLayouts()
+    public IEnumerable<SlideLayoutInfo> ReadSlideLayouts()
     {
         ThrowIfDisposed();
         var layouts = _zip.Entries
@@ -228,7 +286,7 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
         {
             var doc = LoadXml(entry);
             var root = doc.DocumentElement;
-            var li = new PptLayoutInfo
+            var li = new SlideLayoutInfo
             {
                 Index = idx++,
                 Name = Path.GetFileNameWithoutExtension(entry.Name),
@@ -246,7 +304,7 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
     /// </remarks>
     /// <param name="slideIndex">幻灯片索引（0 起始）</param>
     /// <returns>该页所有图表的数据集合</returns>
-    public IEnumerable<PptChartInfo> ReadChartData(Int32 slideIndex)
+    public IEnumerable<ChartInfo> ReadChartData(Int32 slideIndex)
     {
         ThrowIfDisposed();
         var relsEntry = _zip.GetEntry($"ppt/slides/_rels/slide{slideIndex + 1}.xml.rels");
@@ -269,7 +327,7 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
             const String C = "http://schemas.openxmlformats.org/drawingml/2006/chart";
             var cns = new XmlNamespaceManager(chartDoc.NameTable);
             cns.AddNamespace("c", C);
-            var info = new PptChartInfo { ChartNumber = ++chartNum };
+            var info = new ChartInfo { ChartNumber = ++chartNum };
             // 图表类型
             var chartTypeNode = chartDoc.SelectSingleNode("//*[substring(local-name(), string-length(local-name())-4) = 'Chart'][@*]", null);
             info.ChartType = chartTypeNode?.LocalName?.Replace("Chart", String.Empty) ?? "bar";
@@ -295,14 +353,239 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
                     if (Double.TryParse(v.InnerText, NumberStyles.Float, CultureInfo.InvariantCulture, out var d))
                         vals.Add(d);
                 }
-                info.Series.Add(new PptChartSeriesData { Name = serName, Values = vals.ToArray() });
+                info.Series.Add(new ChartSeriesData { Name = serName, Values = vals.ToArray() });
             }
             yield return info;
         }
     }
+
+    /// <summary>获取指定母版的原始 XML 内容（S04-Master）</summary>
+    /// <param name="index">母版索引（0起始）</param>
+    /// <returns>母版 XML 字符串，不存在则返回 null</returns>
+    public String? GetSlideMasterXml(Int32 index)
+    {
+        ThrowIfDisposed();
+        var entry = _zip.GetEntry($"ppt/slideMasters/slideMaster{index + 1}.xml");
+        if (entry == null) return null;
+        using var sr = new StreamReader(entry.Open(), Encoding.UTF8);
+        return sr.ReadToEnd();
+    }
+
+    /// <summary>获取指定幻灯片的原始 XML 内容</summary>
+    /// <param name="index">幻灯片索引（0起始）</param>
+    /// <returns>幻灯片 XML 字符串，不存在则返回 null</returns>
+    public String? GetSlideXml(Int32 index)
+    {
+        ThrowIfDisposed();
+        var entry = _zip.GetEntry($"ppt/slides/slide{index + 1}.xml");
+        if (entry == null) return null;
+        using var sr = new StreamReader(entry.Open(), Encoding.UTF8);
+        return sr.ReadToEnd();
+    }
+
+    /// <summary>获取指定版式的原始 XML 内容（S04-Master）</summary>
+    /// <param name="index">版式索引（0起始）</param>
+    /// <returns>版式 XML 字符串，不存在则返回 null</returns>
+    public String? GetSlideLayoutXml(Int32 index)
+    {
+        ThrowIfDisposed();
+        var entry = _zip.GetEntry($"ppt/slideLayouts/slideLayout{index + 1}.xml");
+        if (entry == null) return null;
+        using var sr = new StreamReader(entry.Open(), Encoding.UTF8);
+        return sr.ReadToEnd();
+    }
+
+    /// <summary>获取主题原始 XML 内容（S04-Master）</summary>
+    /// <returns>主题 XML 字符串，不存在则返回 null</returns>
+    public String? GetThemeXml()
+    {
+        ThrowIfDisposed();
+        var entry = _zip.GetEntry("ppt/theme/theme1.xml")
+            ?? _zip.Entries.FirstOrDefault(e =>
+                e.FullName.StartsWith("ppt/theme/", StringComparison.OrdinalIgnoreCase)
+                && e.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase));
+        if (entry == null) return null;
+        using var sr = new StreamReader(entry.Open(), Encoding.UTF8);
+        return sr.ReadToEnd();
+    }
+
+    /// <summary>完整读取指定幻灯片为内存对象（含文本框/形状/图片/表格/图表/组/备注/切换动画/超链接/视频）</summary>
+    /// <param name="slideIndex">幻灯片索引（0起始）</param>
+    /// <returns>完整的幻灯片对象</returns>
+    public Slide ReadSlide(Int32 slideIndex)
+    {
+        ThrowIfDisposed();
+        var entry = _zip.GetEntry($"ppt/slides/slide{slideIndex + 1}.xml");
+        if (entry == null) throw new ArgumentOutOfRangeException(nameof(slideIndex), $"幻灯片 {slideIndex} 不存在");
+
+        var slide = new Slide();
+        var doc = LoadXml(entry);
+        var rels = ReadSlideRels(slideIndex);
+
+        // 解析幻灯片隐藏属性（S12-04）
+        var show = doc.DocumentElement?.GetAttribute("show");
+        if (show == "0") slide.Hidden = true;
+
+        // 解析版式索引：从 slide rels 中查找 slideLayout 关系的 Target（如 ../slideLayouts/slideLayout{N}.xml），提取 N-1
+        ParseLayoutIndex(slide, rels);
+
+        // 读取版式的 lstStyle 字体默认值（占位符文本继承自版式，幻灯片自身 lstStyle 通常为空）
+        var layoutDefaults = ParseLayoutLstStyleDefaults(slide.LayoutIndex);
+
+        ParseSlideBackground(doc, slide, slideIndex, rels);
+
+        var spTree = doc.SelectSingleNode("//*[local-name()='spTree']");
+        if (spTree != null)
+        {
+            foreach (XmlNode child in spTree.ChildNodes)
+            {
+                if (child is not XmlElement el) continue;
+                switch (el.LocalName)
+                {
+                    case "sp": ParseShapeOrTextBox(el, slide, rels, layoutDefaults); break;
+                    case "pic": ParsePicture(el, slide, rels); break;
+                    case "graphicFrame": ParseGraphicFrame(el, slide, rels); break;
+                    case "grpSp": ParseGroup(el, slide, rels, layoutDefaults); break;
+                    case "cxnSp": ParseConnector(el, slide); break;
+                }
+            }
+        }
+
+        ParseNotes(doc, slide);
+        ParseTransition(doc, slide);
+        ParseSlideComments(slideIndex, slide);
+        ParseSlideAnimations(doc, slide);
+
+        return slide;
+    }
+
+    /// <summary>完整读取所有幻灯片为内存对象</summary>
+    /// <returns>幻灯片对象序列</returns>
+    public IEnumerable<Slide> ReadAllSlides()
+    {
+        var count = GetSlideCount();
+        for (var i = 0; i < count; i++)
+            yield return ReadSlide(i);
+    }
+
+    /// <summary>读取整个演示文稿为 Presentation 数据模型</summary>
+    /// <returns>包含全部幻灯片和文档属性的 Presentation</returns>
+    public Presentation ReadDocument()
+    {
+        var doc = new Presentation
+        {
+            SlideWidth  = SlideWidth,
+            SlideHeight = SlideHeight,
+            AccentColors = [.. AccentColors],
+        };
+        var count = GetSlideCount();
+        for (var i = 0; i < count; i++)
+            doc.Slides.Add(ReadSlide(i));
+        ParseDocProps(doc);
+        ParseHeaderFooter(doc);
+        doc.Sections = ParseSections();
+        return doc;
+    }
     #endregion
 
     #region 私有方法
+    /// <summary>从幻灯片关系文件解析所用版式索引</summary>
+    /// <param name="slide">目标幻灯片</param>
+    /// <param name="slideRels">幻灯片关系映射</param>
+    private static void ParseLayoutIndex(Slide slide, Dictionary<String, (String Target, String Type)> slideRels)
+    {
+        foreach (var kv in slideRels)
+        {
+            var rel = kv.Value;
+            if (!rel.Type.Contains("slideLayout", StringComparison.OrdinalIgnoreCase)) continue;
+            // Target 形如 ../slideLayouts/slideLayout{N}.xml
+            var name = Path.GetFileNameWithoutExtension(rel.Target);
+            if (name.StartsWith("slideLayout") && Int32.TryParse(name.Replace("slideLayout", ""), out var layoutNum))
+            {
+                slide.LayoutIndex = Math.Max(0, layoutNum - 1);
+                return;
+            }
+        }
+    }
+
+    /// <summary>从 presentation.xml 解析幻灯片尺寸（cx/cy）</summary>
+    /// <returns>(宽度, 高度) EMU</returns>
+    private (Int64 width, Int64 height) ParsePresentationInfo()
+    {
+        var width = 12192000L; // 默认 16:9
+        var height = 6858000L;
+        var entry = _zip.GetEntry("ppt/presentation.xml");
+        if (entry == null) return (width, height);
+        var doc = LoadXml(entry);
+        var sldSz = doc.SelectSingleNode("//*[local-name()='sldSz']") as XmlElement;
+        if (sldSz != null)
+        {
+            if (Int64.TryParse(sldSz.GetAttribute("cx"), out var cx)) width = cx;
+            if (Int64.TryParse(sldSz.GetAttribute("cy"), out var cy)) height = cy;
+        }
+        _slideWidth = width;
+        _slideHeight = height;
+        return (width, height);
+    }
+
+    /// <summary>从 presentation.xml 解析节（Section）信息</summary>
+    private List<Section>? ParseSections()
+    {
+        var entry = _zip.GetEntry("ppt/presentation.xml");
+        if (entry == null) return null;
+
+        var doc = LoadXml(entry);
+        var ns = new XmlNamespaceManager(doc.NameTable);
+        ns.AddNamespace("p14", "http://schemas.microsoft.com/office/powerpoint/2010/main");
+
+        var sectionNodes = doc.SelectNodes("//p14:section", ns);
+        if (sectionNodes == null || sectionNodes.Count == 0) return null;
+
+        var sections = new List<Section>();
+        foreach (XmlElement secEl in sectionNodes)
+        {
+            var name = secEl.GetAttribute("name");
+            if (String.IsNullOrEmpty(name)) name = "默认节";
+            var indices = new List<Int32>();
+
+            var sldNodes = secEl.SelectNodes("p14:sldIdLst/p14:sldId", ns);
+            if (sldNodes != null)
+            {
+                foreach (XmlElement sldEl in sldNodes)
+                {
+                    if (Int32.TryParse(sldEl.GetAttribute("id"), out var id) && id >= 256)
+                        indices.Add(id - 256);
+                }
+            }
+            sections.Add(new Section { Name = name, SlideIndices = indices });
+        }
+        return sections.Count > 0 ? sections : null;
+    }
+
+    /// <summary>从 theme1.xml 的 clrScheme 解析六个强调色</summary>
+    /// <returns>6个 accent 颜色（6位十六进制无#）</returns>
+    private String[] ParseThemeColors()
+    {
+        var colors = new[] { "4F81BD", "C0504D", "9BBB59", "8064A2", "4BACC6", "F79646" };
+        var entry = _zip.GetEntry("ppt/theme/theme1.xml")
+            ?? _zip.Entries.FirstOrDefault(e =>
+                e.FullName.StartsWith("ppt/theme/", StringComparison.OrdinalIgnoreCase)
+                && e.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase));
+        if (entry == null) return colors;
+        var doc = LoadXml(entry);
+        for (var i = 1; i <= 6; i++)
+        {
+            var accentNode = doc.SelectSingleNode($"//*[local-name()='accent{i}']/*[local-name()='srgbClr']") as XmlElement;
+            if (accentNode != null)
+            {
+                var val = accentNode.GetAttribute("val");
+                if (val.Length > 0) colors[i - 1] = val;
+            }
+        }
+        _accentColors = colors;
+        return colors;
+    }
+
     private void ThrowIfDisposed()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(PptxReader));
@@ -332,6 +615,1429 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
         doc.Load(s);
         return doc;
     }
+
+    /// <summary>解析幻灯片关系文件，返回 Id→(Target, Type) 映射</summary>
+    private Dictionary<String, (String Target, String Type)> ReadSlideRels(Int32 slideIndex)
+    {
+        var map = new Dictionary<String, (String, String)>();
+        var relsEntry = _zip.GetEntry($"ppt/slides/_rels/slide{slideIndex + 1}.xml.rels");
+        if (relsEntry == null) return map;
+        var doc = LoadXml(relsEntry);
+        const String PKGNS = "http://schemas.openxmlformats.org/package/2006/relationships";
+        var ns = new XmlNamespaceManager(doc.NameTable);
+        ns.AddNamespace("r", PKGNS);
+        foreach (XmlElement rel in doc.SelectNodes("//r:Relationship", ns)!)
+        {
+            var id = rel.GetAttribute("Id");
+            var target = rel.GetAttribute("Target");
+            var type = rel.GetAttribute("Type");
+            if (id.Length > 0) map[id] = (target, type);
+        }
+        return map;
+    }
+
+    /// <summary>解析幻灯片背景（纯色或图片），三级回退：slide rels → layout rels → master rels</summary>
+    private void ParseSlideBackground(XmlDocument doc, Slide slide, Int32 slideIndex,
+        Dictionary<String, (String Target, String Type)> slideRels)
+    {
+        var bg = doc.SelectSingleNode("//*[local-name()='bg']") as XmlElement;
+        if (bg == null) return;
+
+        // 纯色背景（仅 bgPr 的直接子 solidFill，排除嵌套在 gradFill 中的 srgbClr）
+        var solidFill = bg.SelectSingleNode("*[local-name()='bgPr']/*[local-name()='solidFill']") as XmlElement;
+        var bgClr = solidFill?.SelectSingleNode("*[local-name()='srgbClr']") as XmlElement;
+        var val = bgClr?.GetAttribute("val");
+        if (!String.IsNullOrEmpty(val)) { slide.BackgroundColor = val; return; }
+
+        // 渐变背景（S15-04）
+        var gradFill = bg.SelectSingleNode(".//*[local-name()='gradFill']") as XmlElement;
+        if (gradFill != null)
+        {
+            var stops = gradFill.SelectNodes(".//*[local-name()='gs']");
+            if (stops != null && stops.Count >= 2)
+            {
+                var c1 = (stops[0] as XmlElement)?.SelectSingleNode(".//*[local-name()='srgbClr']") as XmlElement;
+                var c2 = (stops[1] as XmlElement)?.SelectSingleNode(".//*[local-name()='srgbClr']") as XmlElement;
+                if (c1 != null && c2 != null)
+                {
+                    slide.BackgroundGradientColor1 = c1.GetAttribute("val");
+                    slide.BackgroundGradientColor2 = c2.GetAttribute("val");
+                    slide.BackgroundGradientType = "linear";
+                }
+            }
+            return;
+        }
+
+        // 图片背景
+        var blip = bg.SelectSingleNode(".//*[local-name()='blipFill']/*[local-name()='blip']") as XmlElement;
+        var embedId = blip?.GetAttribute("r:embed");
+        if (embedId == null) return;
+
+        // 三级回退查找背景图片关系：slide rels → layout rels → master rels
+        if (!TryResolveBgImage(embedId, slideRels, out var rel))
+        {
+            // 尝试从 slide layout rels 查找
+            var layoutRels = TryReadLayoutRelsFromSlide(slideRels);
+            if (layoutRels != null && !TryResolveBgImage(embedId, layoutRels, out rel))
+            {
+                // 尝试从 slide master rels 查找（最后一个回退级别）
+                var masterRels = ReadSlideMasterRels(0);
+                if (masterRels != null)
+                    TryResolveBgImage(embedId, masterRels, out rel);
+            }
+        }
+
+        if (rel.Target == null) return;
+        var mediaName = Path.GetFileName(rel.Target);
+        var mediaEntry = _zip.GetEntry($"ppt/media/{mediaName}");
+        if (mediaEntry == null) return;
+        var ext = Path.GetExtension(mediaName).TrimStart('.').ToLowerInvariant();
+        Byte[] data;
+        using (var ms = new MemoryStream())
+        using (var es = mediaEntry.Open()) { es.CopyTo(ms); data = ms.ToArray(); }
+        slide.BackgroundImage = new Picture { Data = data, Extension = ext, IsSvg = ext == "svg" };
+    }
+
+    private static Boolean TryResolveBgImage(String embedId,
+        Dictionary<String, (String Target, String Type)> rels,
+        out (String Target, String Type) rel)
+        => rels.TryGetValue(embedId, out rel);
+
+    /// <summary>从 slide rels 中提取 layout 引用，读取对应 layout 的 rels</summary>
+    private Dictionary<String, (String Target, String Type)>? TryReadLayoutRelsFromSlide(
+        Dictionary<String, (String Target, String Type)> slideRels)
+    {
+        foreach (var kv in slideRels)
+        {
+            if (kv.Value.Type.Contains("slideLayout", StringComparison.OrdinalIgnoreCase))
+            {
+                var target = kv.Value.Target; // 如 "../slideLayouts/slideLayout2.xml"
+                var name = Path.GetFileNameWithoutExtension(target); // "slideLayout2"
+                if (name.StartsWith("slideLayout") && Int32.TryParse(name.Replace("slideLayout", ""), out var layoutNum))
+                    return ReadLayoutRels(layoutNum - 1);
+            }
+        }
+        return null;
+    }
+
+    /// <summary>读取幻灯片版式关系文件</summary>
+    private Dictionary<String, (String Target, String Type)> ReadLayoutRels(Int32 layoutIndex)
+    {
+        var map = new Dictionary<String, (String, String)>();
+        var relsEntry = _zip.GetEntry($"ppt/slideLayouts/_rels/slideLayout{layoutIndex + 1}.xml.rels");
+        if (relsEntry == null) return map;
+        var doc = LoadXml(relsEntry);
+        const String PKGNS = "http://schemas.openxmlformats.org/package/2006/relationships";
+        var ns = new XmlNamespaceManager(doc.NameTable);
+        ns.AddNamespace("r", PKGNS);
+        foreach (XmlElement rel in doc.SelectNodes("//r:Relationship", ns)!)
+        {
+            var id = rel.GetAttribute("Id");
+            var target = rel.GetAttribute("Target");
+            var type = rel.GetAttribute("Type");
+            if (id.Length > 0) map[id] = (target, type);
+        }
+        return map;
+    }
+
+    /// <summary>读取幻灯片母版关系文件</summary>
+    private Dictionary<String, (String Target, String Type)>? ReadSlideMasterRels(Int32 masterIndex)
+    {
+        var map = new Dictionary<String, (String, String)>();
+        var relsEntry = _zip.GetEntry($"ppt/slideMasters/_rels/slideMaster{masterIndex + 1}.xml.rels");
+        if (relsEntry == null) return null;
+        var doc = LoadXml(relsEntry);
+        const String PKGNS = "http://schemas.openxmlformats.org/package/2006/relationships";
+        var ns = new XmlNamespaceManager(doc.NameTable);
+        ns.AddNamespace("r", PKGNS);
+        foreach (XmlElement rel in doc.SelectNodes("//r:Relationship", ns)!)
+        {
+            var id = rel.GetAttribute("Id");
+            var target = rel.GetAttribute("Target");
+            var type = rel.GetAttribute("Type");
+            if (id.Length > 0) map[id] = (target, type);
+        }
+        return map;
+    }
+
+    /// <summary>解析形状或文本框</summary>
+    private void ParseShapeOrTextBox(XmlElement sp, Slide slide, Dictionary<String, (String Target, String Type)> rels,
+        Dictionary<String, DefaultRunProps>? layoutDefaults = null)
+    {
+        var hasTxBody = sp.SelectSingleNode(".//*[local-name()='txBody']") != null;
+        var (left, top, width, height) = ParseXfrm(sp.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement);
+        var rotation = ParseRotation(sp.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement);
+        var shapeType = sp.SelectSingleNode(".//*[local-name()='prstGeom']")?.Attributes?["prst"]?.Value ?? "textBox";
+        // Alt Text（cNvPr descr）
+        var cNvPr = sp.SelectSingleNode(".//*[local-name()='cNvPr']") as XmlElement;
+        var altText = cNvPr?.GetAttribute("descr");
+        // Corner radius（仅 roundRect）
+        Int64 cornerRadius = 0;
+        if (shapeType == "roundRect")
+        {
+            var gd = sp.SelectSingleNode(".//*[local-name()='prstGeom']/*[local-name()='avLst']/*[local-name()='gd']") as XmlElement;
+            if (gd != null)
+            {
+                var fmla = gd.GetAttribute("fmla") ?? "";
+                var valStr = fmla.StartsWith("val ") ? fmla[4..] : fmla;
+                if (Int64.TryParse(valStr, out var adjVal) && adjVal > 0)
+                    cornerRadius = (Int64)Math.Round(adjVal * (Double)width / 50000); // 逆向 adj→EMU（四舍五入，与 Writer 一致保证往返）
+            }
+        }
+        var spPr = sp.SelectSingleNode(".//*[local-name()='spPr']") as XmlElement;
+        var fillColor = ParseFillColor(spPr);
+        var (lineColor, lineWidth) = ParseLine(spPr);
+        // 渐变填充（S16-03 Reader 侧）
+        var (gradType, gradC1, gradC2, gradAngle) = ParseShapeGradient(spPr);
+        // 虚线样式（S16-05 Reader 侧）
+        var dashStyle = ParseDashStyle(spPr);
+        // 翻转（S16-04 Reader 侧）
+        var xfrmEl = sp.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement;
+        var flipH = xfrmEl?.GetAttribute("flipH") == "1";
+        var flipV = xfrmEl?.GetAttribute("flipV") == "1";
+
+        // 形状级超链接（S20 Reader 侧）
+        String? shapeHyperlink = null;
+        var shHlink = sp.SelectSingleNode(".//*[local-name()='cNvPr']/*[local-name()='hlinkClick']") as XmlElement
+            ?? sp.SelectSingleNode(".//*[local-name()='spPr']/*[local-name()='hlinkClick']") as XmlElement;
+        if (shHlink != null)
+        {
+            var rid = shHlink.GetAttribute("r:id");
+            if (rid.Length > 0 && rels.TryGetValue(rid, out var rel))
+                shapeHyperlink = rel.Target;
+        }
+
+        // 文本框判定：cNvSpPr txBox="1" 或 prstGeom="textBox"；带文本的基本形状应读为 Shape 而非文本框
+        var isTextBox = hasTxBody && (shapeType == "textBox" || IsTxBox(sp));
+
+        if (isTextBox)
+        {
+            var tb = new TextBox { Left = left, Top = top, Width = width, Height = height, Rotation = rotation, AltText = altText };
+            if (fillColor != null) tb.BackgroundColor = fillColor;
+
+            // TextBox 整体超链接（S20，跳转 URL 或文件）
+            var tbHlink = sp.SelectSingleNode(".//*[local-name()='cNvPr']/*[local-name()='hlinkClick']") as XmlElement
+                ?? sp.SelectSingleNode(".//*[local-name()='spPr']/*[local-name()='hlinkClick']") as XmlElement;
+            if (tbHlink != null)
+            {
+                var rid = tbHlink.GetAttribute("r:id");
+                if (rid.Length > 0 && rels.TryGetValue(rid, out var rel))
+                    tb.HyperlinkUrl = rel.Target;
+            }
+
+            var txBody = sp.SelectSingleNode(".//*[local-name()='txBody']") as XmlElement;
+            if (txBody == null) { slide.TextBoxes.Add(tb); return; }
+
+            // bodyPr：auto-fit 模式 + 内边距 + anchor
+            var bodyPr = txBody.SelectSingleNode("*[local-name()='bodyPr']") as XmlElement;
+            if (bodyPr != null)
+            {
+                if (bodyPr.SelectSingleNode("*[local-name()='spAutoFit']") != null) tb.AutoFit = 1;
+                else if (bodyPr.SelectSingleNode("*[local-name()='noAutofit']") != null) tb.AutoFit = 2;
+                else tb.AutoFit = 0; // normAutofit
+                // 内边距（EMU）
+                var lIns = bodyPr.GetAttribute("lIns"); if (lIns.Length > 0 && Int32.TryParse(lIns, out var li)) tb.LeftInset = li;
+                var rIns = bodyPr.GetAttribute("rIns"); if (rIns.Length > 0 && Int32.TryParse(rIns, out var ri)) tb.RightInset = ri;
+                var tIns = bodyPr.GetAttribute("tIns"); if (tIns.Length > 0 && Int32.TryParse(tIns, out var ti)) tb.TopInset = ti;
+                var bIns = bodyPr.GetAttribute("bIns"); if (bIns.Length > 0 && Int32.TryParse(bIns, out var bi)) tb.BottomInset = bi;
+                // 垂直锁定方式
+                var anchor = bodyPr.GetAttribute("anchor");
+                if (anchor.Length > 0) tb.Anchor = anchor;
+                // 文本方向（vert 属性）
+                var vert = bodyPr.GetAttribute("vert");
+                if (vert.Length > 0) tb.TextDirection = vert;
+            }
+
+            var lstDefaults = ParseListStyleDefaults(txBody);
+            // 版式回退：幻灯片自身 lstStyle 为空时（占位符常见），使用版式定义的字体默认值
+            if (lstDefaults.Count == 0 && layoutDefaults != null && layoutDefaults.Count > 0)
+                lstDefaults = layoutDefaults;
+
+            var allText = new StringBuilder();
+            var hasAnyRuns = false;
+            var paraNodes = txBody.SelectNodes(".//*[local-name()='p']");
+            if (paraNodes != null)
+            {
+                foreach (XmlElement para in paraNodes)
+                {
+                    var pp = new Paragraph();
+                    var pPr = para.SelectSingleNode(".//*[local-name()='pPr']") as XmlElement;
+                    var lvl = pPr?.GetAttribute("lvl") ?? "0";
+                    if (Int32.TryParse(lvl, out var lv)) pp.Level = lv;
+                    var pDefRPr = pPr?.SelectSingleNode(".//*[local-name()='defRPr']") as XmlElement;
+
+                    // 段落级属性
+                    if (pPr != null)
+                    {
+                        var algn = pPr.GetAttribute("algn");
+                        if (algn.Length > 0) pp.Alignment = algn;
+                        // 行间距（spcPct 优先，其次 spcPts）
+                        var lnSpcPct = pPr.SelectSingleNode("*[local-name()='lnSpc']/*[local-name()='spcPct']") as XmlElement;
+                        if (lnSpcPct != null && Int32.TryParse(lnSpcPct.GetAttribute("val"), out var lsp)) pp.LineSpacingPct = lsp;
+                        var lnSpcPts = pPr.SelectSingleNode("*[local-name()='lnSpc']/*[local-name()='spcPts']") as XmlElement;
+                        if (lnSpcPts != null && Int32.TryParse(lnSpcPts.GetAttribute("val"), out var lpt)) pp.LineSpacingPts = lpt;
+                        // 段前距
+                        var spcBef = pPr.SelectSingleNode("*[local-name()='spcBef']/*[local-name()='spcPts']") as XmlElement;
+                        if (spcBef != null && Int32.TryParse(spcBef.GetAttribute("val"), out var sbv)) pp.SpaceBeforePt = sbv / 100;
+                        // 段后距
+                        var spcAft = pPr.SelectSingleNode("*[local-name()='spcAft']/*[local-name()='spcPts']") as XmlElement;
+                        if (spcAft != null && Int32.TryParse(spcAft.GetAttribute("val"), out var sav)) pp.SpaceAfterPt = sav / 100;
+                        // 项目符号
+                        var buChar = pPr.SelectSingleNode("*[local-name()='buChar']") as XmlElement;
+                        if (buChar != null) pp.BulletChar = buChar.GetAttribute("char");
+                        var buNone = pPr.SelectSingleNode("*[local-name()='buNone']") as XmlElement;
+                        if (buNone != null) pp.BulletNone = true;
+                    }
+
+                    var runs = para.SelectNodes(".//*[local-name()='r']");
+                    if (runs == null || runs.Count == 0)
+                    {
+                        var pt = new StringBuilder();
+                        foreach (XmlElement t in para.SelectNodes(".//*[local-name()='t']")!)
+                            pt.Append(t.InnerText);
+                        var text = pt.ToString();
+                        if (text.Length > 0)
+                        {
+                            var dr = CreateDefaultRun(text, lstDefaults, lvl, pDefRPr);
+                            pp.Runs.Add(dr);
+                            tb.Runs.Add(dr);  // 向后兼容
+                            allText.Append(text);
+                            hasAnyRuns = true;
+                        }
+                    }
+                    else
+                    {
+                        foreach (XmlElement r in runs)
+                        {
+                            var run = ParseRun(r, rels, lstDefaults, lvl, pDefRPr);
+                            if (run != null)
+                            {
+                                pp.Runs.Add(run);
+                                tb.Runs.Add(run);  // 向后兼容
+                                allText.Append(run.Text);
+                                hasAnyRuns = true;
+                            }
+                        }
+                    }
+
+                    // 始终添加段落（包括空段，保留段落结构）
+                    tb.Paragraphs.Add(pp);
+                }
+            }
+
+            // 无段落时的回退逻辑
+            if (tb.Paragraphs.Count == 0)
+            {
+                var ft = new StringBuilder();
+                foreach (XmlElement t in txBody.SelectNodes(".//*[local-name()='t']")!)
+                    ft.Append(t.InnerText);
+                var text = ft.ToString();
+                if (text.Length > 0)
+                {
+                    var pp = new Paragraph();
+                    var dr = new Run { Text = text, FontSize = 18 };
+                    if (lstDefaults.TryGetValue("0", out var ld) || lstDefaults.TryGetValue("", out ld))
+                    { if (ld.FontSize > 0) dr.FontSize = ld.FontSize; dr.LatinFontName = ld.LatinFontName; dr.EastAsianFontName = ld.EastAsianFontName; }
+                    pp.Runs.Add(dr);
+                    tb.Runs.Add(dr);
+                    tb.Paragraphs.Add(pp);
+                    allText.Append(text);
+                    hasAnyRuns = true;
+                }
+            }
+
+            // 向后兼容：从首段首 Run 提取 TextBox 级字体属性
+            if (hasAnyRuns)
+            {
+                var fr = tb.Runs[0];
+                tb.FontSize = fr.FontSize > 0 ? fr.FontSize : 18;
+                tb.Bold = fr.Bold;
+                tb.FontColor = fr.FontColor;
+                tb.LatinFontName = fr.LatinFontName;
+                tb.EastAsianFontName = fr.EastAsianFontName;
+                tb.ComplexScriptFontName = fr.ComplexScriptFontName;
+                tb.SymbolFontName = fr.SymbolFontName;
+                // TextBox 整体超链接（S20）：cNvPr/spPr 未命中时从首 run 提取
+                if (tb.HyperlinkUrl.IsNullOrEmpty() && !fr.HyperlinkUrl.IsNullOrEmpty())
+                    tb.HyperlinkUrl = fr.HyperlinkUrl;
+            }
+            // 向后兼容：从首段提取 TextBox 级段落属性
+            if (tb.Paragraphs.Count > 0)
+            {
+                var fp = tb.Paragraphs[0];
+                tb.Alignment = fp.Alignment;
+                tb.LineSpacingPct = fp.LineSpacingPct;
+                tb.SpaceBeforePt = fp.SpaceBeforePt;
+            }
+            tb.Text = allText.ToString();
+            tb.AltText = altText;
+            slide.TextBoxes.Add(tb);
+        }
+        else if (hasTxBody)
+        {
+            // 带文本的基本形状：读为 Shape + 文本 + 字体属性
+            var (text, fontSize, bold, fontColor, latinFn, eaFn, csFn, symFn) = ParseShapeText(sp);
+            if (text.Length == 0)
+            {
+                // 空文本的形状（仅有空 txBody 的格式骨架）：按普通形状处理，
+                // 避免重建时 Writer 因空文本省略 txBody 导致 FontSize 等格式属性不一致
+                slide.Shapes.Add(new Shape
+                {
+                    ShapeType = shapeType, Left = left, Top = top, Width = width, Height = height,
+                    FillColor = fillColor, LineColor = lineColor, LineWidth = (Int32)lineWidth,
+                    AltText = altText, CornerRadius = cornerRadius,
+                    Rotation = rotation, FlipHorizontal = flipH, FlipVertical = flipV,
+                    GradientType = gradType, GradientColor1 = gradC1, GradientColor2 = gradC2, GradientAngle = gradAngle,
+                    DashStyle = dashStyle, HyperlinkUrl = shapeHyperlink,
+                });
+            }
+            else
+            {
+                slide.Shapes.Add(new Shape
+                {
+                    ShapeType = shapeType, Left = left, Top = top, Width = width, Height = height,
+                    FillColor = fillColor, LineColor = lineColor, LineWidth = (Int32)lineWidth,
+                    AltText = altText, CornerRadius = cornerRadius,
+                    Rotation = rotation, FlipHorizontal = flipH, FlipVertical = flipV,
+                    GradientType = gradType, GradientColor1 = gradC1, GradientColor2 = gradC2, GradientAngle = gradAngle,
+                    DashStyle = dashStyle, HyperlinkUrl = shapeHyperlink,
+                    Text = text, FontSize = fontSize > 0 ? fontSize : 14, Bold = bold, FontColor = fontColor,
+                    LatinFontName = latinFn, EastAsianFontName = eaFn,
+                    ComplexScriptFontName = csFn, SymbolFontName = symFn,
+                });
+            }
+        }
+        else
+        {
+            var fillImage = ParseFillImage(spPr, rels);
+            slide.Shapes.Add(new Shape
+            {
+                ShapeType = shapeType, Left = left, Top = top, Width = width, Height = height,
+                FillColor = fillColor, LineColor = lineColor, LineWidth = (Int32)lineWidth,
+                AltText = altText, CornerRadius = cornerRadius,
+                Rotation = rotation, FlipHorizontal = flipH, FlipVertical = flipV,
+                GradientType = gradType, GradientColor1 = gradC1, GradientColor2 = gradC2, GradientAngle = gradAngle,
+                DashStyle = dashStyle, HyperlinkUrl = shapeHyperlink,
+                FillImage = fillImage,
+                FillImageExt = fillImage != null ? GetFillImageExt(spPr, rels) : "png",
+            });
+        }
+    }
+
+    /// <summary>解析形状图片填充（S18，blipFill）</summary>
+    /// <param name="spPr">形状属性元素</param>
+    /// <param name="rels">关系映射</param>
+    /// <returns>图片字节，无图片填充返回 null</returns>
+    private Byte[]? ParseFillImage(XmlElement? spPr, Dictionary<String, (String Target, String Type)> rels)
+    {
+        var blip = spPr?.SelectSingleNode(".//*[local-name()='blipFill']/*[local-name()='blip']") as XmlElement;
+        if (blip == null) return null;
+        var rId = blip.GetAttribute("r:embed");
+        if (rId.IsNullOrEmpty()) return null;
+        if (!rels.TryGetValue(rId, out var rel)) return null;
+        var entry = _zip.GetEntry("ppt/media/" + Path.GetFileName(rel.Target));
+        if (entry == null) return null;
+        using var ms = new MemoryStream();
+        using (var es = entry.Open())
+        {
+            es.CopyTo(ms);
+        }
+        return ms.ToArray();
+    }
+
+    /// <summary>获取图片填充扩展名（S18）</summary>
+    private static String GetFillImageExt(XmlElement? spPr, Dictionary<String, (String Target, String Type)> rels)
+    {
+        var blip = spPr?.SelectSingleNode(".//*[local-name()='blipFill']/*[local-name()='blip']") as XmlElement;
+        if (blip == null) return "png";
+        var rId = blip.GetAttribute("r:embed");
+        if (rId.IsNullOrEmpty()) return "png";
+        if (rels.TryGetValue(rId, out var rel))
+        {
+            var ext = Path.GetExtension(rel.Target).TrimStart('.');
+            if (!ext.IsNullOrEmpty()) return ext;
+        }
+        return "png";
+    }
+
+    /// <summary>解析单个文本片段（a:r），可接收段落级默认值</summary>
+    private static Run? ParseRun(XmlElement r, Dictionary<String, (String Target, String Type)> rels,
+        Dictionary<String, DefaultRunProps>? lstDefaults = null, String lvl = "0", XmlElement? pDefRPr = null)
+    {
+        var t = r.SelectSingleNode(".//*[local-name()='t']") as XmlElement;
+        var text = t?.InnerText;
+        if (text == null) return null;
+        var run = new Run { Text = text };
+        DefaultRunProps? defaults = null;
+        if (lstDefaults != null && lstDefaults.TryGetValue(lvl, out var ld)) defaults = ld;
+        var rPr = r.SelectSingleNode(".//*[local-name()='rPr']") as XmlElement;
+        var boldExplicit = false;
+        if (rPr != null)
+        {
+            var sz = rPr.GetAttribute("sz");
+            if (sz.Length > 0 && Int32.TryParse(sz, out var sv)) run.FontSize = sv / 100;
+            var bAttr = rPr.GetAttribute("b");
+            if (bAttr.Length > 0) { run.Bold = bAttr == "1"; boldExplicit = true; }
+            var iAttr = rPr.GetAttribute("i");
+            if (iAttr.Length > 0) run.Italic = iAttr == "1";
+            // 下划线
+            var uAttr = rPr.GetAttribute("u");
+            if (uAttr.Length > 0 && uAttr != "none") run.Underline = true;
+            // solidFill 颜色（srgbClr 或 schemeClr）
+            var sf = rPr.SelectSingleNode("*[local-name()='solidFill']") as XmlElement;
+            var fc = sf?.SelectSingleNode("*[local-name()='srgbClr']") as XmlElement;
+            if (fc != null) run.FontColor = fc.GetAttribute("val");
+            else
+            {
+                var sc = sf?.SelectSingleNode("*[local-name()='schemeClr']") as XmlElement;
+                if (sc != null) run.FontColor = "scheme:" + sc.GetAttribute("val");
+            }
+            // 渐变色（取各停靠点的 srgbClr，存为 hex 数组）
+            if (run.FontColor == null)
+            {
+                var gf = rPr.SelectSingleNode("*[local-name()='gradFill']") as XmlElement;
+                if (gf != null)
+                {
+                    var stops = new List<String>();
+                    var ang = gf.SelectSingleNode(".//*[local-name()='lin']") as XmlElement;
+                    var angVal = ang?.GetAttribute("ang") ?? "0";
+                    Int32.TryParse(angVal, out var angle);
+                    run.GradAngle = angle;
+                    foreach (XmlElement gs in gf.SelectNodes(".//*[local-name()='gs']")!)
+                    {
+                        var gsClr = gs.SelectSingleNode(".//*[local-name()='srgbClr']") as XmlElement;
+                        if (gsClr != null) stops.Add(gsClr.GetAttribute("val"));
+                    }
+                    if (stops.Count >= 2)
+                    {
+                        run.GradFillColors = stops.ToArray();
+                        run.FontColor = stops[0]; // 保留第一色作主色
+                    }
+                }
+            }
+            // 上标/下标（S15-06）：<a:rPr baseline="30000"> 为上标，baseline="-25000" 为下标
+            var baselineAttr = rPr.GetAttribute("baseline");
+            if (!String.IsNullOrEmpty(baselineAttr) && Int32.TryParse(baselineAttr, out var bv))
+            {
+                if (bv >= 20000) run.Superscript = true;
+                else if (bv <= -15000) run.Subscript = true;
+            }
+            var latin = rPr.SelectSingleNode(".//*[local-name()='latin']") as XmlElement;
+            var ea = rPr.SelectSingleNode(".//*[local-name()='ea']") as XmlElement;
+            var cs = rPr.SelectSingleNode(".//*[local-name()='cs']") as XmlElement;
+            var sym = rPr.SelectSingleNode(".//*[local-name()='sym']") as XmlElement;
+            run.LatinFontName = latin?.GetAttribute("typeface");
+            run.EastAsianFontName = ea?.GetAttribute("typeface");
+            run.ComplexScriptFontName = cs?.GetAttribute("typeface");
+            run.SymbolFontName = sym?.GetAttribute("typeface");
+            var hlink = rPr.SelectSingleNode(".//*[local-name()='hlinkClick']") as XmlElement;
+            if (hlink != null)
+            {
+                var rId = hlink.GetAttribute("r:id");
+                if (rId.Length > 0 && rels.TryGetValue(rId, out var rel)) run.HyperlinkUrl = rel.Target;
+            }
+        }
+        ApplyDefaults(run, pDefRPr, boldExplicit);
+        if (defaults != null) ApplyDefaults(run, defaults.Value, boldExplicit);
+        if (run.FontSize <= 0) run.FontSize = 18;
+        return run;
+    }
+
+    private static void ApplyDefaults(Run run, XmlElement? defRPr, Boolean boldExplicit = false)
+    {
+        if (defRPr == null) return;
+        if (run.FontSize <= 0)
+        {
+            var sz = defRPr.GetAttribute("sz");
+            if (sz.Length > 0 && Int32.TryParse(sz, out var sv)) run.FontSize = sv / 100;
+        }
+        if (!boldExplicit && !run.Bold) run.Bold = defRPr.GetAttribute("b") == "1";
+        if (run.LatinFontName == null)
+        {
+            var l = defRPr.SelectSingleNode(".//*[local-name()='latin']") as XmlElement;
+            run.LatinFontName = l?.GetAttribute("typeface");
+        }
+        if (run.EastAsianFontName == null)
+        {
+            var e = defRPr.SelectSingleNode(".//*[local-name()='ea']") as XmlElement;
+            run.EastAsianFontName = e?.GetAttribute("typeface");
+        }
+        if (run.ComplexScriptFontName == null)
+        {
+            var c = defRPr.SelectSingleNode(".//*[local-name()='cs']") as XmlElement;
+            run.ComplexScriptFontName = c?.GetAttribute("typeface");
+        }
+        if (run.SymbolFontName == null)
+        {
+            var s = defRPr.SelectSingleNode(".//*[local-name()='sym']") as XmlElement;
+            run.SymbolFontName = s?.GetAttribute("typeface");
+        }
+    }
+
+    private static void ApplyDefaults(Run run, DefaultRunProps def, Boolean boldExplicit = false)
+    {
+        if (run.FontSize <= 0 && def.FontSize > 0) run.FontSize = def.FontSize;
+        if (!boldExplicit && !run.Bold) run.Bold = def.Bold;
+        if (run.LatinFontName == null) run.LatinFontName = def.LatinFontName;
+        if (run.EastAsianFontName == null) run.EastAsianFontName = def.EastAsianFontName;
+        if (run.ComplexScriptFontName == null) run.ComplexScriptFontName = def.ComplexScriptFontName;
+        if (run.SymbolFontName == null) run.SymbolFontName = def.SymbolFontName;
+        if (run.FontColor == null) run.FontColor = def.FontColor;
+    }
+
+    private struct DefaultRunProps
+    {
+        public Int32 FontSize;
+        public Boolean Bold;
+        public String? FontColor;
+        public String? LatinFontName;
+        public String? EastAsianFontName;
+        public String? ComplexScriptFontName;
+        public String? SymbolFontName;
+        /// <summary>兼容属性：getter 返回 EastAsianFontName ?? LatinFontName</summary>
+        public readonly String? FontName => EastAsianFontName ?? LatinFontName;
+    }
+
+    private static Dictionary<String, DefaultRunProps> ParseListStyleDefaults(XmlElement txBody)
+    {
+        var r = new Dictionary<String, DefaultRunProps>();
+        var lst = txBody.SelectSingleNode(".//*[local-name()='lstStyle']") as XmlElement;
+        if (lst == null) return r;
+        var gd = lst.SelectSingleNode(".//*[local-name()='defPPr']/*[local-name()='defRPr']") as XmlElement;
+        if (gd != null) r[""] = PropsFromDefRPr(gd);
+        for (var i = 1; i <= 9; i++)
+        {
+            var ld = lst.SelectSingleNode($".//*[local-name()='lvl{i}pPr']/*[local-name()='defRPr']") as XmlElement;
+            if (ld != null) r[(i - 1).ToString()] = PropsFromDefRPr(ld);
+        }
+        return r;
+    }
+
+    /// <summary>从版式 XML 读取 lstStyle 字体默认值（占位符继承用）</summary>
+    /// <param name="layoutIndex">版式索引（0起始）</param>
+    /// <returns>lstStyle 默认值字典，版式不存在或没有 lstStyle 时返回空字典</returns>
+    private Dictionary<String, DefaultRunProps> ParseLayoutLstStyleDefaults(Int32 layoutIndex)
+    {
+        var r = new Dictionary<String, DefaultRunProps>();
+        var entry = _zip.GetEntry($"ppt/slideLayouts/slideLayout{layoutIndex + 1}.xml");
+        if (entry == null) return r;
+        var doc = LoadXml(entry);
+        var txBody = doc.SelectSingleNode("//*[local-name()='txBody']") as XmlElement;
+        if (txBody == null)
+        {
+            // 版式可能没有 txBody 或有多个，尝试取 cSld/spTree 下第一个含 lstStyle 的 txBody
+            var spTree = doc.SelectSingleNode("//*[local-name()='spTree']");
+            if (spTree != null)
+            {
+                foreach (XmlNode child in spTree.ChildNodes)
+                {
+                    if (child is not XmlElement el) continue;
+                    txBody = el.SelectSingleNode(".//*[local-name()='txBody']") as XmlElement;
+                    if (txBody != null && txBody.SelectSingleNode(".//*[local-name()='lstStyle']") != null) break;
+                    txBody = null;
+                }
+            }
+        }
+        if (txBody == null) return r;
+        return ParseListStyleDefaults(txBody);
+    }
+
+    private static DefaultRunProps PropsFromDefRPr(XmlElement defRPr)
+    {
+        var p = new DefaultRunProps();
+        var sz = defRPr.GetAttribute("sz");
+        if (sz.Length > 0 && Int32.TryParse(sz, out var sv)) p.FontSize = sv / 100;
+        p.Bold = defRPr.GetAttribute("b") == "1";
+        var sf = defRPr.SelectSingleNode("*[local-name()='solidFill']") as XmlElement;
+        var fc = sf?.SelectSingleNode("*[local-name()='srgbClr']") as XmlElement;
+        p.FontColor = fc?.GetAttribute("val");
+        var l = defRPr.SelectSingleNode(".//*[local-name()='latin']") as XmlElement;
+        var e = defRPr.SelectSingleNode(".//*[local-name()='ea']") as XmlElement;
+        var c = defRPr.SelectSingleNode(".//*[local-name()='cs']") as XmlElement;
+        var s = defRPr.SelectSingleNode(".//*[local-name()='sym']") as XmlElement;
+        p.LatinFontName = l?.GetAttribute("typeface");
+        p.EastAsianFontName = e?.GetAttribute("typeface");
+        p.ComplexScriptFontName = c?.GetAttribute("typeface");
+        p.SymbolFontName = s?.GetAttribute("typeface");
+        return p;
+    }
+
+    private static Run CreateDefaultRun(String text, Dictionary<String, DefaultRunProps> lstDefaults, String lvl, XmlElement? pDefRPr)
+    {
+        var run = new Run { Text = text, FontSize = 18 };
+        ApplyDefaults(run, pDefRPr);
+        if (lstDefaults.TryGetValue(lvl, out var ld)) ApplyDefaults(run, ld);
+        else if (lstDefaults.TryGetValue("", out var gd2)) ApplyDefaults(run, gd2);
+        return run;
+    }
+
+    /// <summary>解析图片或视频（p:pic）</summary>
+    private void ParsePicture(XmlElement pic, Slide slide, Dictionary<String, (String Target, String Type)> rels)
+    {
+        var xfrmEl = pic.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement;
+        var (left, top, width, height) = ParseXfrm(xfrmEl);
+        var rotation = ParseRotation(xfrmEl);
+        var videoFile = pic.SelectSingleNode(".//*[local-name()='videoFile']") as XmlElement;
+
+        // 读取缩略图/海报帧（图片用 blip embed，视频用 blip embed 作海报帧）
+        Byte[]? thumbData = null;
+        String? thumbExt = null;
+        var blip = pic.SelectSingleNode(".//*[local-name()='blip']") as XmlElement;
+        var embedId = blip?.GetAttribute("r:embed") ?? blip?.GetAttribute("embed");
+        if (embedId != null && rels.TryGetValue(embedId, out var thumbRel))
+        {
+            var thumbName = Path.GetFileName(thumbRel.Target);
+            var thumbEntry = _zip.GetEntry($"ppt/media/{thumbName}");
+            if (thumbEntry != null)
+            {
+                thumbExt = Path.GetExtension(thumbName).TrimStart('.').ToLowerInvariant();
+                using (var ms = new MemoryStream())
+                using (var es = thumbEntry.Open()) { es.CopyTo(ms); thumbData = ms.ToArray(); }
+            }
+        }
+
+        if (videoFile != null)
+        {
+            var vlId = videoFile.GetAttribute("r:link");
+            if (vlId.Length > 0 && rels.TryGetValue(vlId, out var vr))
+            {
+                var mn = Path.GetFileName(vr.Target);
+                var me = _zip.GetEntry($"ppt/media/{mn}");
+                if (me != null)
+                {
+                    var ext = Path.GetExtension(mn).TrimStart('.').ToLowerInvariant();
+                    Byte[] data;
+                    using (var ms = new MemoryStream())
+                    using (var es = me.Open()) { es.CopyTo(ms); data = ms.ToArray(); }
+                    var vid = new Video { Data = data, Extension = ext, Left = left, Top = top, Width = width, Height = height };
+                    if (thumbData != null)
+                    {
+                        vid.ThumbnailData = thumbData;
+                        vid.ThumbnailExtension = thumbExt!;
+                    }
+                    slide.Videos.Add(vid);
+                }
+            }
+            return;
+        }
+
+        // 纯图片
+        if (embedId == null || !rels.TryGetValue(embedId, out var rel)) return;
+        var iname = Path.GetFileName(rel.Target);
+        var ientry = _zip.GetEntry($"ppt/media/{iname}");
+        if (ientry == null) return;
+        var iext = Path.GetExtension(iname).TrimStart('.').ToLowerInvariant();
+        Byte[] idata;
+        using (var ms = new MemoryStream())
+        using (var es = ientry.Open()) { es.CopyTo(ms); idata = ms.ToArray(); }
+
+        var isSvg = iext == "svg";
+
+        // 检测 asvg:svgBlip（PowerPoint 2016+ SVG 标准格式），使用 SVG 数据覆盖 PNG 缩略图
+        var svgBlip = blip!.SelectSingleNode("*[local-name()='svgBlip']") as XmlElement;
+        if (svgBlip != null)
+        {
+            var svgEmbedId = svgBlip.GetAttribute("r:embed") ?? svgBlip.GetAttribute("embed");
+            if (svgEmbedId != null && rels.TryGetValue(svgEmbedId, out var svgRel))
+            {
+                var svgName = Path.GetFileName(svgRel.Target);
+                var svgEntry = _zip.GetEntry($"ppt/media/{svgName}");
+                if (svgEntry != null)
+                {
+                    using var svgMs = new MemoryStream();
+                    using var svgEs = svgEntry.Open();
+                    svgEs.CopyTo(svgMs);
+                    idata = svgMs.ToArray();
+                    iext = "svg";
+                    isSvg = true;
+                }
+            }
+        }
+
+        slide.Images.Add(new Picture { Data = idata, Extension = iext, Left = left, Top = top, Width = width, Height = height, IsSvg = isSvg, Rotation = rotation });
+    }
+
+    private void ParseGraphicFrame(XmlElement gf, Slide slide, Dictionary<String, (String Target, String Type)> rels)
+    {
+        var (left, top, width, height) = ParseXfrm(gf.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement);
+        var tbl = gf.SelectSingleNode(".//*[local-name()='tbl']") as XmlElement;
+        if (tbl != null) { ParseTable(tbl, left, top, width, height, slide); return; }
+        var cr = gf.SelectSingleNode(".//*[local-name()='chart']") as XmlElement;
+        if (cr != null)
+        {
+            var rId = cr.GetAttribute("r:id");
+            if (rId.Length > 0 && rels.TryGetValue(rId, out var rel))
+                ParseChartFromRel(rel.Target, left, top, width, height, slide);
+        }
+    }
+
+    private static void ParseTable(XmlElement tbl, Int64 left, Int64 top, Int64 width, Int64 height, Slide slide)
+    {
+        var table = new Table { Left = left, Top = top, Width = width, Height = height };
+        var gcs = tbl.SelectNodes(".//*[local-name()='gridCol']");
+        if (gcs != null)
+        {
+            var cw = new List<Int64>();
+            foreach (XmlElement gc in gcs)
+            { var w = gc.GetAttribute("w"); cw.Add(w.Length > 0 && Int64.TryParse(w, out var v) ? v : width / Math.Max(1, gcs.Count)); }
+            table.ColWidths = cw.ToArray();
+        }
+        var tpr = tbl.SelectSingleNode(".//*[local-name()='tblPr']") as XmlElement;
+        if (tpr != null) table.FirstRowHeader = tpr.GetAttribute("firstRow") == "1";
+        var rows = tbl.SelectNodes(".//*[local-name()='tr']");
+        if (rows != null)
+        {
+            var ri = 0;
+            foreach (XmlElement tr in rows)
+            {
+                var cells = tr.SelectNodes(".//*[local-name()='tc']");
+                if (cells == null) { ri++; continue; }
+                var rd = new String[cells.Count];
+                var ci = 0;
+                foreach (XmlElement tc in cells)
+                {
+                    var ct = new StringBuilder();
+                    foreach (XmlElement t in tc.SelectNodes(".//*[local-name()='t']")!) ct.Append(t.InnerText);
+                    rd[ci] = ct.ToString();
+                    // 解析合并单元格（S11-01 Reader 侧）
+                    var gs = tc.GetAttribute("gridSpan");
+                    var rs = tc.GetAttribute("rowSpan");
+                    var vm = tc.GetAttribute("vMerge");
+                    var colSpan = gs.Length > 0 && Int32.TryParse(gs, out var csv) ? csv : 1;
+                    var rowSpan = rs.Length > 0 && Int32.TryParse(rs, out var rsv) ? rsv : 1;
+                    if (colSpan > 1 || rowSpan > 1 || vm == "1")
+                    {
+                        if (vm == "1")
+                        {
+                            for (var pr = ri - 1; pr >= 0; pr--)
+                            {
+                                if (table.MergedCells.TryGetValue((pr, ci), out var prev))
+                                {
+                                    table.MergedCells[(pr, ci)] = (prev.ColSpan, prev.RowSpan + 1);
+                                    break;
+                                }
+                            }
+                        }
+                        else
+                            table.MergedCells[(ri, ci)] = (colSpan, rowSpan);
+                    }
+                    var tpr2 = tc.SelectSingleNode(".//*[local-name()='tcPr']") as XmlElement;
+                    var rpr2 = tc.SelectSingleNode(".//*[local-name()='rPr']") as XmlElement;
+                    if (tpr2 != null || rpr2 != null)
+                    {
+                        var cs = new CellStyle();
+                        var bg = tpr2?.SelectSingleNode(".//*[local-name()='srgbClr']") as XmlElement;
+                        if (bg != null) cs.BackgroundColor = bg.GetAttribute("val");
+                        if (rpr2 != null)
+                        {
+                            var sz = rpr2.GetAttribute("sz");
+                            if (sz.Length > 0 && Int32.TryParse(sz, out var sv)) cs.FontSize = sv / 100;
+                            cs.Bold = rpr2.GetAttribute("b") == "1";
+                            var fc = rpr2.SelectSingleNode(".//*[local-name()='srgbClr']") as XmlElement;
+                            if (fc != null) cs.FontColor = fc.GetAttribute("val");
+                        }
+                        table.CellStyles[(ri, ci)] = cs;
+                    }
+                    // 解析表格边框（S11-02 Reader 侧）
+                    if (tpr2 != null)
+                    {
+                        var border = new CellBorder();
+                        var hasBorder = false;
+                        var lnL = tpr2.SelectSingleNode("*[local-name()='lnL']") as XmlElement;
+                        var lnR = tpr2.SelectSingleNode("*[local-name()='lnR']") as XmlElement;
+                        var lnT = tpr2.SelectSingleNode("*[local-name()='lnT']") as XmlElement;
+                        var lnB = tpr2.SelectSingleNode("*[local-name()='lnB']") as XmlElement;
+                        void ParseOneBorder(XmlElement ln, Action<String?> setColor, Action<Int32> setWidth)
+                        {
+                            var wv = ln.GetAttribute("w");
+                            if (wv.Length > 0 && Int32.TryParse(wv, out var w)) setWidth(w);
+                            var clr = ln.SelectSingleNode(".//*[local-name()='srgbClr']") as XmlElement;
+                            setColor(clr?.GetAttribute("val"));
+                        }
+                        if (lnL != null) { ParseOneBorder(lnL, c => border.LeftColor = c, w => border.LeftWidth = w); hasBorder = true; }
+                        if (lnR != null) { ParseOneBorder(lnR, c => border.RightColor = c, w => border.RightWidth = w); hasBorder = true; }
+                        if (lnT != null) { ParseOneBorder(lnT, c => border.TopColor = c, w => border.TopWidth = w); hasBorder = true; }
+                        if (lnB != null) { ParseOneBorder(lnB, c => border.BottomColor = c, w => border.BottomWidth = w); hasBorder = true; }
+                        if (hasBorder) table.CellBorders[(ri, ci)] = border;
+                    }
+                    ci++;
+                }
+                table.Rows.Add(rd);
+                ri++;
+            }
+        }
+        slide.Tables.Add(table);
+    }
+
+    private void ParseChartFromRel(String target, Int64 left, Int64 top, Int64 width, Int64 height, Slide slide)
+    {
+        var cp = "ppt/" + target.TrimStart('.').TrimStart('/');
+        var ce = _zip.GetEntry(cp);
+        if (ce == null) return;
+        var cd = LoadXml(ce);
+        const String C = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+        const String A = "http://schemas.openxmlformats.org/drawingml/2006/main";
+        var cns = new XmlNamespaceManager(cd.NameTable);
+        cns.AddNamespace("c", C);
+        cns.AddNamespace("a", A);
+        var chart = new Chart { Left = left, Top = top, Width = width, Height = height };
+        // 图表类型元素（barChart/areaChart 等）是 plotArea 的直接子元素；原 [@*] 谓词会漏匹配无属性的图表元素
+        var ctn = cd.SelectSingleNode("//c:plotArea/*[substring(local-name(), string-length(local-name())-4) = 'Chart']", cns) as XmlElement;
+        chart.ChartType = ctn?.LocalName?.Replace("Chart", String.Empty) ?? "bar";
+        var tn = cd.SelectSingleNode("//c:title//c:rich//a:t", cns) as XmlElement;
+        chart.Title = tn?.InnerText;
+        var fcn = cd.SelectSingleNode("//c:ser[1]/c:cat//c:strCache", cns) ?? cd.SelectSingleNode("//c:ser[1]/c:cat//c:numCache", cns);
+        if (fcn != null)
+        {
+            var cats = new List<String>();
+            foreach (XmlElement pt in fcn.SelectNodes("c:pt/c:v", cns)!) cats.Add(pt.InnerText);
+            chart.Categories = cats.ToArray();
+        }
+        foreach (XmlElement ser in cd.SelectNodes("//c:ser", cns)!)
+        {
+            var sn = ser.SelectSingleNode(".//c:tx//c:v", cns)?.InnerText ?? String.Empty;
+            var vals = new List<Double>();
+            foreach (XmlElement v in ser.SelectNodes(".//c:val//c:numCache/c:pt/c:v", cns)!)
+            { if (Double.TryParse(v.InnerText, NumberStyles.Float, CultureInfo.InvariantCulture, out var d)) vals.Add(d); }
+            // X 值（散点图/气泡图，S19 Reader 侧）
+            Double[]? xvals = null;
+            var xNodes = ser.SelectNodes(".//c:xVal//c:numCache/c:pt/c:v", cns);
+            if (xNodes != null && xNodes.Count > 0)
+            {
+                var xl = new List<Double>();
+                foreach (XmlElement v in xNodes) 
+                { if (Double.TryParse(v.InnerText, NumberStyles.Float, CultureInfo.InvariantCulture, out var d)) xl.Add(d); }
+                if (xl.Count > 0) xvals = xl.ToArray();
+            }
+            // 系列填充色（S19 Reader 侧）
+            String? color = null;
+            var sclr = ser.SelectSingleNode(".//c:spPr//a:solidFill//a:srgbClr", cns) as XmlElement;
+            if (sclr != null) color = sclr.GetAttribute("val");
+            chart.Series.Add(new ChartSeries { Name = sn, Values = vals.ToArray(), XValues = xvals, Color = color });
+        }
+        // 数值轴最小值/最大值（S19 Reader 侧）
+        var axScaling = cd.SelectSingleNode("//c:valAx//c:scaling", cns) as XmlElement;
+        if (axScaling != null)
+        {
+            var minEl = axScaling.SelectSingleNode("c:min", cns) as XmlElement;
+            var maxEl = axScaling.SelectSingleNode("c:max", cns) as XmlElement;
+            if (minEl != null && Double.TryParse(minEl.GetAttribute("val"), NumberStyles.Float, CultureInfo.InvariantCulture, out var minv)) chart.AxisMinValue = minv;
+            if (maxEl != null && Double.TryParse(maxEl.GetAttribute("val"), NumberStyles.Float, CultureInfo.InvariantCulture, out var maxv)) chart.AxisMaxValue = maxv;
+        }
+        // 图例位置（S19 Reader 侧）
+        var lgp = cd.SelectSingleNode("//c:legend//c:legendPos", cns) as XmlElement;
+        if (lgp != null)
+        {
+            var lv = lgp.GetAttribute("val");
+            if (lv.Length > 0) chart.LegendPosition = lv;
+        }
+        slide.Charts.Add(chart);
+    }
+
+    private void ParseGroup(XmlElement grpSp, Slide slide, Dictionary<String, (String Target, String Type)> rels,
+        Dictionary<String, DefaultRunProps>? layoutDefaults = null)
+    {
+        var (left, top, width, height) = ParseXfrm(grpSp.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement);
+        var g = new GroupShape { Left = left, Top = top, Width = width, Height = height };
+        foreach (XmlNode child in grpSp.ChildNodes)
+        {
+            if (child is not XmlElement el) continue;
+            switch (el.LocalName)
+            {
+                case "sp": ParseShapeOrTextBoxInGroup(el, g, rels, layoutDefaults); break;
+                case "pic": ParsePictureInGroup(el, g, rels); break;
+                case "grpSp": ParseGroupInGroup(el, g, rels, layoutDefaults); break;
+            }
+        }
+        slide.Groups.Add(g);
+    }
+
+    private void ParseShapeOrTextBoxInGroup(XmlElement sp, GroupShape g, Dictionary<String, (String Target, String Type)> rels,
+        Dictionary<String, DefaultRunProps>? layoutDefaults = null)
+    {
+        var isTB = sp.SelectSingleNode(".//*[local-name()='cNvSpPr']")?.Attributes?["txBox"]?.Value == "1";
+        var xfrmEl = sp.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement;
+        var (l, t, w, h) = ParseXfrm(xfrmEl);
+        var rotation = ParseRotation(xfrmEl);
+        var flipH = xfrmEl?.GetAttribute("flipH") == "1";
+        var flipV = xfrmEl?.GetAttribute("flipV") == "1";
+        var st = sp.SelectSingleNode(".//*[local-name()='prstGeom']")?.Attributes?["prst"]?.Value ?? "textBox";
+        var spPr = sp.SelectSingleNode(".//*[local-name()='spPr']") as XmlElement;
+        var fc = ParseFillColor(spPr);
+        var fillImage = ParseFillImage(spPr, rels);
+        // 组内形状也读取渐变/虚线/线宽/圆角（与顶层一致，保证往返）
+        var (gradType, gradC1, gradC2, gradAngle) = ParseShapeGradient(spPr);
+        var dashStyle = ParseDashStyle(spPr);
+        var (lineColor, lineWidth) = ParseLine(spPr);
+        Int64 cornerRadius = 0;
+        if (st == "roundRect")
+        {
+            var gd = sp.SelectSingleNode(".//*[local-name()='prstGeom']/*[local-name()='avLst']/*[local-name()='gd']") as XmlElement;
+            if (gd != null)
+            {
+                var fmla = gd.GetAttribute("fmla") ?? "";
+                var valStr = fmla.StartsWith("val ") ? fmla[4..] : fmla;
+                if (Int64.TryParse(valStr, out var adjVal) && adjVal > 0)
+                    cornerRadius = (Int64)Math.Round(adjVal * (Double)w / 50000);
+            }
+        }
+        var txt = new StringBuilder();
+        foreach (XmlElement tt in sp.SelectNodes(".//*[local-name()='t']")!) txt.Append(tt.InnerText);
+        var text = txt.ToString();
+
+        // 组内形状级超链接（S20 Reader 侧）
+        String? shapeHyperlink = null;
+        var shHlink = sp.SelectSingleNode(".//*[local-name()='cNvPr']/*[local-name()='hlinkClick']") as XmlElement
+            ?? sp.SelectSingleNode(".//*[local-name()='spPr']/*[local-name()='hlinkClick']") as XmlElement;
+        if (shHlink != null)
+        {
+            var rid = shHlink.GetAttribute("r:id");
+            if (rid.Length > 0 && rels.TryGetValue(rid, out var rel))
+                shapeHyperlink = rel.Target;
+        }
+
+        // 解析字体属性：从第一个 rPr 提取字号/粗体/颜色/字体名称
+        var fontSize = 0;
+        var bold = false;
+        String? fontColor = null;
+        String? latinFn = null, eaFn = null, csFn = null, symFn = null;
+        var firstRPr = sp.SelectSingleNode(".//*[local-name()='rPr']") as XmlElement;
+        if (firstRPr != null)
+        {
+            var sz = firstRPr.GetAttribute("sz");
+            if (sz.Length > 0 && Int32.TryParse(sz, out var sv)) fontSize = sv / 100;
+            bold = firstRPr.GetAttribute("b") == "1";
+            var sf = firstRPr.SelectSingleNode("*[local-name()='solidFill']") as XmlElement;
+            var sfc = sf?.SelectSingleNode("*[local-name()='srgbClr']") as XmlElement;
+            if (sfc != null) fontColor = sfc.GetAttribute("val");
+            else
+            {
+                var sc = sf?.SelectSingleNode("*[local-name()='schemeClr']") as XmlElement;
+                if (sc != null) fontColor = "scheme:" + sc.GetAttribute("val");
+            }
+            var latin = firstRPr.SelectSingleNode(".//*[local-name()='latin']") as XmlElement;
+            var ea = firstRPr.SelectSingleNode(".//*[local-name()='ea']") as XmlElement;
+            var cs = firstRPr.SelectSingleNode(".//*[local-name()='cs']") as XmlElement;
+            var sym = firstRPr.SelectSingleNode(".//*[local-name()='sym']") as XmlElement;
+            latinFn = latin?.GetAttribute("typeface");
+            eaFn = ea?.GetAttribute("typeface");
+            csFn = cs?.GetAttribute("typeface");
+            symFn = sym?.GetAttribute("typeface");
+        }
+
+        // 若无显式 rPr，尝试从 lstStyle/defRPr 继承默认字体
+        if (firstRPr == null)
+        {
+            var txBody = sp.SelectSingleNode(".//*[local-name()='txBody']") as XmlElement;
+            var defRPr = txBody?.SelectSingleNode(".//*[local-name()='lstStyle']/*[local-name()='defPPr']/*[local-name()='defRPr']") as XmlElement;
+            if (defRPr != null)
+            {
+                var sz = defRPr.GetAttribute("sz");
+                if (sz.Length > 0 && Int32.TryParse(sz, out var sv)) fontSize = sv / 100;
+                bold = defRPr.GetAttribute("b") == "1";
+                var ln = defRPr.SelectSingleNode(".//*[local-name()='latin']") as XmlElement;
+                var e = defRPr.SelectSingleNode(".//*[local-name()='ea']") as XmlElement;
+                var c = defRPr.SelectSingleNode(".//*[local-name()='cs']") as XmlElement;
+                var s = defRPr.SelectSingleNode(".//*[local-name()='sym']") as XmlElement;
+                latinFn = ln?.GetAttribute("typeface");
+                eaFn = e?.GetAttribute("typeface");
+                csFn = c?.GetAttribute("typeface");
+                symFn = s?.GetAttribute("typeface");
+            }
+        }
+
+        if (isTB)
+            g.TextBoxes.Add(new TextBox
+            {
+                Left = l, Top = t, Width = w, Height = h, Text = text, BackgroundColor = fc,
+                FontSize = fontSize > 0 ? fontSize : 18, Bold = bold, FontColor = fontColor,
+                LatinFontName = latinFn, EastAsianFontName = eaFn,
+                ComplexScriptFontName = csFn, SymbolFontName = symFn,
+            });
+        else
+            g.Shapes.Add(new Shape
+            {
+                Left = l, Top = t, Width = w, Height = h, ShapeType = st, Text = text, FillColor = fc,
+                FontSize = fontSize > 0 ? fontSize : 14, Bold = bold, FontColor = fontColor,
+                LatinFontName = latinFn, EastAsianFontName = eaFn,
+                ComplexScriptFontName = csFn, SymbolFontName = symFn,
+                FillImage = fillImage,
+                FillImageExt = fillImage != null ? GetFillImageExt(spPr, rels) : "png",
+                Rotation = rotation, FlipHorizontal = flipH, FlipVertical = flipV,
+                GradientType = gradType, GradientColor1 = gradC1, GradientColor2 = gradC2, GradientAngle = gradAngle,
+                DashStyle = dashStyle, LineColor = lineColor, LineWidth = (Int32)lineWidth, CornerRadius = cornerRadius,
+                HyperlinkUrl = shapeHyperlink,
+            });
+    }
+
+    private void ParsePictureInGroup(XmlElement pic, GroupShape g, Dictionary<String, (String Target, String Type)> rels)
+    {
+        var (l, t, w, h) = ParseXfrm(pic.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement);
+        var rotation = ParseRotation(pic.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement);
+
+        // 组内图片（S07-02）：读取真实图片数据，而非占位形状
+        var blip = pic.SelectSingleNode(".//*[local-name()='blip']") as XmlElement;
+        var embedId = blip?.GetAttribute("r:embed") ?? blip?.GetAttribute("embed");
+        if (embedId == null || !rels.TryGetValue(embedId, out var rel)) return;
+        var iname = Path.GetFileName(rel.Target);
+        var ientry = _zip.GetEntry($"ppt/media/{iname}");
+        if (ientry == null) return;
+        var iext = Path.GetExtension(iname).TrimStart('.').ToLowerInvariant();
+        Byte[] idata;
+        using (var ms = new MemoryStream())
+        using (var es = ientry.Open()) { es.CopyTo(ms); idata = ms.ToArray(); }
+
+        var isSvg = iext == "svg";
+        // 检测 asvg:svgBlip（SVG 标准格式），用 SVG 数据覆盖 PNG 缩略图
+        var svgBlip = blip!.SelectSingleNode("*[local-name()='svgBlip']") as XmlElement;
+        if (svgBlip != null)
+        {
+            var svgEmbedId = svgBlip.GetAttribute("r:embed") ?? svgBlip.GetAttribute("embed");
+            if (svgEmbedId != null && rels.TryGetValue(svgEmbedId, out var svgRel))
+            {
+                var svgName = Path.GetFileName(svgRel.Target);
+                var svgEntry = _zip.GetEntry($"ppt/media/{svgName}");
+                if (svgEntry != null)
+                {
+                    using var svgMs = new MemoryStream();
+                    using var svgEs = svgEntry.Open();
+                    svgEs.CopyTo(svgMs);
+                    idata = svgMs.ToArray();
+                    iext = "svg";
+                    isSvg = true;
+                }
+            }
+        }
+
+        g.Images.Add(new Picture { Data = idata, Extension = iext, Left = l, Top = t, Width = w, Height = h, IsSvg = isSvg, Rotation = rotation });
+    }
+
+    private void ParseGroupInGroup(XmlElement inner, GroupShape pg, Dictionary<String, (String Target, String Type)> rels,
+        Dictionary<String, DefaultRunProps>? layoutDefaults = null)
+    {
+        foreach (XmlNode child in inner.ChildNodes)
+        {
+            if (child is not XmlElement el) continue;
+            switch (el.LocalName)
+            {
+                case "sp": ParseShapeOrTextBoxInGroup(el, pg, rels, layoutDefaults); break;
+                case "pic": ParsePictureInGroup(el, pg, rels); break;
+                case "grpSp": ParseGroupInGroup(el, pg, rels, layoutDefaults); break;
+            }
+        }
+    }
+
+    private static void ParseNotes(XmlDocument doc, Slide slide)
+    {
+        var n = doc.SelectSingleNode("//*[local-name()='notes']");
+        if (n == null) return;
+        var sb = new StringBuilder();
+        foreach (XmlElement t in n.SelectNodes(".//*[local-name()='t']")!) sb.Append(t.InnerText);
+        var text = sb.ToString();
+        if (text.Length > 0) slide.Notes = text;
+    }
+
+    private static void ParseTransition(XmlDocument doc, Slide slide)
+    {
+        var trans = doc.SelectSingleNode("//*[local-name()='transition']") as XmlElement;
+        if (trans == null) return;
+        var dur = trans.GetAttribute("dur");
+        var ac = trans.GetAttribute("advClick");
+        var tr = new Transition
+        {
+            DurationMs = dur.Length > 0 && Int32.TryParse(dur, out var d) ? d : 500,
+            AdvanceOnClick = ac != "0",
+        };
+        foreach (var tp in new[] { "fade", "push", "wipe", "zoom", "split", "cut" })
+        {
+            var ch = trans.SelectSingleNode($"*[local-name()='{tp}']") as XmlElement;
+            if (ch == null) continue;
+            tr.Type = tp;
+            var dir = ch.GetAttribute("dir");
+            if (dir.Length > 0) tr.Direction = dir;
+            break;
+        }
+        slide.Transition = tr;
+    }
+
+    /// <summary>解析连接器（S13-02 Reader 侧）</summary>
+    private static void ParseConnector(XmlElement cxnSp, Slide slide)
+    {
+        var xfrm = cxnSp.SelectSingleNode(".//*[local-name()='xfrm']") as XmlElement;
+        var (l, t, w, h) = ParseXfrm(xfrm);
+        var prstGeom = cxnSp.SelectSingleNode(".//*[local-name()='prstGeom']") as XmlElement;
+        var prst = prstGeom?.GetAttribute("prst") ?? "straightConnector1";
+        // 去掉 Connector1 后缀还原为类型名
+        var ct = prst.Replace("Connector1", "").Replace("1", "");
+        var (lc, lw) = ParseLine(cxnSp.SelectSingleNode(".//*[local-name()='spPr']") as XmlElement);
+        var ln = cxnSp.SelectSingleNode(".//*[local-name()='ln']") as XmlElement;
+        var tailEnd = ln?.SelectSingleNode("*[local-name()='tailEnd']") as XmlElement;
+        var headEnd = ln?.SelectSingleNode("*[local-name()='headEnd']") as XmlElement;
+        var prstDash = ln?.SelectSingleNode("*[local-name()='prstDash']") as XmlElement;
+        slide.Connectors.Add(new ConnectionShape
+        {
+            Left = l, Top = t, Width = w, Height = h,
+            ConnectorType = ct.Length > 0 ? ct : "straight",
+            LineColor = lc,
+            LineWidth = lw > 0 ? (Int32)lw : 9525,
+            StartArrow = tailEnd?.GetAttribute("type"),
+            EndArrow = headEnd?.GetAttribute("type"),
+            DashStyle = prstDash?.GetAttribute("val"),
+        });
+    }
+
+    /// <summary>解析幻灯片批注（S13-01 Reader 侧）</summary>
+    private void ParseSlideComments(Int32 slideIndex, Slide slide)
+    {
+        var commentsEntry = _zip.GetEntry($"ppt/comments/comment{slideIndex + 1}.xml");
+        if (commentsEntry == null) return;
+        var doc = LoadXml(commentsEntry);
+        var authorsDoc = TryLoadCommentsAuthors();
+        var authorMap = new Dictionary<String, String>();
+        if (authorsDoc != null)
+        {
+            foreach (XmlElement author in authorsDoc.SelectNodes("//*[local-name()='cmAuthor']")!)
+            {
+                var aId = author.GetAttribute("id");
+                var aName = author.GetAttribute("name");
+                var aUid = author.GetAttribute("uid");
+                if (aId.Length > 0) authorMap[aId] = aName;
+            }
+        }
+        var idx = 0;
+        foreach (XmlElement cm in doc.SelectNodes("//*[local-name()='cm']")!)
+        {
+            var c = new Comment { Index = ++idx };
+            c.Author = authorMap.TryGetValue(cm.GetAttribute("authorId"), out var name) ? name : cm.GetAttribute("authorId");
+            var dtStr = cm.GetAttribute("dt");
+            if (DateTime.TryParse(dtStr, out var dt)) c.Date = dt;
+            var pos = cm.SelectSingleNode("*[local-name()='pos']") as XmlElement;
+            if (pos != null)
+            {
+                if (Int32.TryParse(pos.GetAttribute("x"), out var px) && SlideWidth > 0) c.X = (Single)px / SlideWidth;
+                if (Int32.TryParse(pos.GetAttribute("y"), out var py) && SlideHeight > 0) c.Y = (Single)py / SlideHeight;
+            }
+            c.Text = cm.SelectSingleNode("*[local-name()='text']")?.InnerText;
+            slide.Comments.Add(c);
+        }
+    }
+
+    /// <summary>加载批注作者列表</summary>
+    private XmlDocument? TryLoadCommentsAuthors()
+    {
+        var entry = _zip.GetEntry("ppt/comments/commentAuthors.xml");
+        return entry != null ? LoadXml(entry) : null;
+    }
+
+    /// <summary>解析幻灯片元素动画（S12 Reader 侧）</summary>
+    private static void ParseSlideAnimations(XmlDocument sldDoc, Slide slide)
+    {
+        var timing = sldDoc.SelectSingleNode("//*[local-name()='timing']") as XmlElement;
+        if (timing == null) return;
+        // 遍历所有动画节点（animEffect/animEmph/animMotion），宽容嵌套位置（par/cTn/childTnLst）
+        var order = 0;
+        foreach (XmlElement el in timing.SelectNodes(".//*[local-name()='animEffect' or local-name()='animEmph' or local-name()='animMotion']")!)
+        {
+            var localName = el.LocalName;
+            // 识别动画类型：animEffect(进入)/animEmph(强调)/animMotion(路径)
+            var category = localName switch
+            {
+                "animEffect" => AnimationCategory.Entrance,
+                "animEmph" => AnimationCategory.Emphasis,
+                "animMotion" => AnimationCategory.MotionPath,
+                _ => AnimationCategory.Entrance,
+            };
+            var cBhvr = el.SelectSingleNode("*[local-name()='cBhvr']") as XmlElement;
+            if (cBhvr == null) continue;
+            var anim = new Animation
+            {
+                Order = order++,
+                Category = category,
+                Effect = el.GetAttribute("filter") ?? el.LocalName,
+            };
+            // 目标形状
+            var tgt = cBhvr.SelectSingleNode("*[local-name()='tgtEl']/*[local-name()='spTgt']") as XmlElement;
+            if (tgt != null && Int32.TryParse(tgt.GetAttribute("spid"), out var spid))
+                anim.TargetIndex = spid;
+            // 时长
+            var durEl = cBhvr.SelectSingleNode("*[local-name()='cTn']") as XmlElement;
+            if (durEl != null)
+            {
+                var durVal = durEl.GetAttribute("dur");
+                if (durVal.Length > 0) anim.DurationMs = (Int32)(ParseDuration(durVal) / 1000);
+            }
+            slide.Animations.Add(anim);
+        }
+    }
+
+    /// <summary>解析动画时长（如 "indefinite" 或毫秒数）</summary>
+    private static Int64 ParseDuration(String val) => Int64.TryParse(val, out var ms) ? ms : 0;
+
+    /// <summary>解析文档属性（S14-03 Reader 侧）</summary>
+    private void ParseDocProps(Presentation doc)
+    {
+        // core.xml
+        var coreEntry = _zip.GetEntry("docProps/core.xml");
+        if (coreEntry != null)
+        {
+            var coreDoc = LoadXml(coreEntry);
+            doc.Properties.Title = coreDoc.SelectSingleNode("//*[local-name()='title']")?.InnerText;
+            doc.Properties.Author = coreDoc.SelectSingleNode("//*[local-name()='creator']")?.InnerText;
+            doc.Properties.Subject = coreDoc.SelectSingleNode("//*[local-name()='subject']")?.InnerText;
+            doc.Properties.Description = coreDoc.SelectSingleNode("//*[local-name()='description']")?.InnerText;
+        }
+        // app.xml
+        var appEntry = _zip.GetEntry("docProps/app.xml");
+        if (appEntry != null)
+        {
+            var appDoc = LoadXml(appEntry);
+            var company = appDoc.SelectSingleNode("//*[local-name()='Company']")?.InnerText;
+            if (!company.IsNullOrEmpty() && doc.Properties.Author.IsNullOrEmpty())
+                doc.Properties.Author = company;
+        }
+    }
+
+    /// <summary>解析全局页眉页脚（S13-03 Reader 侧）</summary>
+    private void ParseHeaderFooter(Presentation doc)
+    {
+        var presEntry = _zip.GetEntry("ppt/presentation.xml");
+        if (presEntry == null) return;
+        var presDoc = LoadXml(presEntry);
+        var hf = presDoc.SelectSingleNode("//*[local-name()='hf']") as XmlElement;
+        if (hf == null) return;
+        var footer = hf.GetAttribute("footer");
+        var showSlideNum = hf.GetAttribute("showSlideNum");
+        var dt = hf.GetAttribute("dt");
+        var fdt = hf.GetAttribute("fdt");
+        var dfmt = hf.GetAttribute("dfmt");
+        doc.HeaderFooter = new HeaderFooter
+        {
+            ShowFooter = footer.Length > 0,
+            FooterText = footer.Length > 0 ? footer : null,
+            ShowPageNumber = showSlideNum == "1",
+            ShowDate = dt == "1",
+            DateAutomatic = fdt.Length == 0,
+            FixedDate = fdt.Length > 0 ? fdt : null,
+            DateFormat = dfmt.Length > 0 ? dfmt : null,
+        };
+    }
+
+    private static String? ParseFillColor(XmlElement? parent)
+    {
+        if (parent == null) return null;
+        // 仅匹配 spPr 的直接子元素 solidFill，避免误匹配 ln 等嵌套元素内的颜色
+        var clr = parent.SelectSingleNode("*[local-name()='solidFill']/*[local-name()='srgbClr']") as XmlElement;
+        return clr?.GetAttribute("val");
+    }
+
+    private static (String? Color, Int64 Width) ParseLine(XmlElement? parent)
+    {
+        if (parent == null) return (null, 0);
+        var ln = parent.SelectSingleNode(".//*[local-name()='ln']") as XmlElement;
+        if (ln == null) return (null, 0);
+        var w = ln.GetAttribute("w");
+        var width = w.Length > 0 && Int64.TryParse(w, out var wv) ? wv : 0L;
+        var clr = ln.SelectSingleNode(".//*[local-name()='srgbClr']") as XmlElement;
+        return (clr?.GetAttribute("val"), width);
+    }
+
+    /// <summary>判断是否为显式文本框（cNvSpPr txBox="1"）</summary>
+    /// <param name="sp">形状元素</param>
+    /// <returns>是文本框</returns>
+    private static Boolean IsTxBox(XmlElement sp)
+    {
+        var cNvSpPr = sp.SelectSingleNode(".//*[local-name()='cNvSpPr']") as XmlElement;
+        return cNvSpPr?.GetAttribute("txBox") == "1";
+    }
+
+    /// <summary>解析形状渐变填充（S16-03 Reader 侧）</summary>
+    /// <param name="spPr">形状属性元素</param>
+    /// <returns>（渐变类型，起始色，结束色，角度）</returns>
+    private static (String? Type, String? Color1, String? Color2, Int32 Angle) ParseShapeGradient(XmlElement? spPr)
+    {
+        if (spPr == null) return (null, null, null, 0);
+        var grad = spPr.SelectSingleNode("*[local-name()='gradFill']") as XmlElement;
+        if (grad == null) return (null, null, null, 0);
+        var stops = grad.SelectNodes(".//*[local-name()='gs']");
+        String? c1 = null, c2 = null;
+        if (stops != null && stops.Count >= 2)
+        {
+            var e1 = (stops[0] as XmlElement)?.SelectSingleNode(".//*[local-name()='srgbClr']") as XmlElement;
+            var e2 = (stops[1] as XmlElement)?.SelectSingleNode(".//*[local-name()='srgbClr']") as XmlElement;
+            if (e1 != null) c1 = e1.GetAttribute("val");
+            if (e2 != null) c2 = e2.GetAttribute("val");
+        }
+        var lin = grad.SelectSingleNode(".//*[local-name()='lin']") as XmlElement;
+        var rad = grad.SelectSingleNode(".//*[local-name()='rad']") as XmlElement;
+        var angle = 0;
+        var angAttr = lin?.GetAttribute("ang");
+        if (angAttr != null && Int32.TryParse(angAttr, out var av)) angle = av / 60000; // 1/60000 度 → 度
+        return (rad != null ? "radial" : "linear", c1, c2, angle);
+    }
+
+    /// <summary>解析线条虚线样式（S16-05 Reader 侧）</summary>
+    /// <param name="spPr">形状属性元素</param>
+    /// <returns>虚线样式值（如 dash/dot），实线返回 null</returns>
+    private static String? ParseDashStyle(XmlElement? spPr)
+    {
+        if (spPr == null) return null;
+        var ln = spPr.SelectSingleNode("*[local-name()='ln']") as XmlElement;
+        return (ln?.SelectSingleNode("*[local-name()='prstDash']") as XmlElement)?.GetAttribute("val");
+    }
+
+    /// <summary>解析带文本形状的文本与字体属性（Reader 侧）</summary>
+    /// <param name="sp">形状元素</param>
+    /// <returns>（文本，字号，粗体，颜色，四类字体）</returns>
+    private static (String Text, Int32 FontSize, Boolean Bold, String? FontColor, String? LatinFn, String? EaFn, String? CsFn, String? SymFn) ParseShapeText(XmlElement sp)
+    {
+        var sb = new StringBuilder();
+        foreach (XmlElement t in sp.SelectNodes(".//*[local-name()='t']")!) sb.Append(t.InnerText);
+        var text = sb.ToString();
+
+        var fontSize = 0;
+        var bold = false;
+        String? fontColor = null, latinFn = null, eaFn = null, csFn = null, symFn = null;
+        var firstRPr = sp.SelectSingleNode(".//*[local-name()='rPr']") as XmlElement;
+        if (firstRPr != null)
+        {
+            var sz = firstRPr.GetAttribute("sz");
+            if (sz.Length > 0 && Int32.TryParse(sz, out var sv)) fontSize = sv / 100;
+            bold = firstRPr.GetAttribute("b") == "1";
+            var sf = firstRPr.SelectSingleNode("*[local-name()='solidFill']") as XmlElement;
+            var sfc = sf?.SelectSingleNode("*[local-name()='srgbClr']") as XmlElement;
+            if (sfc != null) fontColor = sfc.GetAttribute("val");
+            var l = firstRPr.SelectSingleNode(".//*[local-name()='latin']") as XmlElement;
+            var e = firstRPr.SelectSingleNode(".//*[local-name()='ea']") as XmlElement;
+            var c = firstRPr.SelectSingleNode(".//*[local-name()='cs']") as XmlElement;
+            var s = firstRPr.SelectSingleNode(".//*[local-name()='sym']") as XmlElement;
+            latinFn = l?.GetAttribute("typeface");
+            eaFn = e?.GetAttribute("typeface");
+            csFn = c?.GetAttribute("typeface");
+            symFn = s?.GetAttribute("typeface");
+        }
+        return (text, fontSize, bold, fontColor, latinFn, eaFn, csFn, symFn);
+    }
+
+    private static (Int64 Left, Int64 Top, Int64 Width, Int64 Height) ParseXfrm(XmlElement? xfrm)
+    {
+        if (xfrm == null) return (0, 0, 0, 0);
+        var off = xfrm.SelectSingleNode("*[local-name()='off']") as XmlElement;
+        var ext = xfrm.SelectSingleNode("*[local-name()='ext']") as XmlElement;
+        return (
+            off != null && Int64.TryParse(off.GetAttribute("x"), out var x) ? x : 0,
+            off != null && Int64.TryParse(off.GetAttribute("y"), out var y) ? y : 0,
+            ext != null && Int64.TryParse(ext.GetAttribute("cx"), out var cx) ? cx : 0,
+            ext != null && Int64.TryParse(ext.GetAttribute("cy"), out var cy) ? cy : 0
+        );
+    }
+
+    /// <summary>解析旋转角度（S15-02 Reader 侧）</summary>
+    private static Int32 ParseRotation(XmlElement? xfrm)
+    {
+        if (xfrm == null) return 0;
+        var rot = xfrm.GetAttribute("rot");
+        return rot.Length > 0 && Int32.TryParse(rot, out var r) ? r : 0;
+    }
     #endregion
 
     #region 文本提取
@@ -339,22 +2045,123 @@ public class PptxReader : IDisposable, ITextExtractable, IMarkdownExtractable
     /// <returns>纯文本字符串</returns>
     public String? ExtractText() => ReadAllText();
 
-    /// <summary>提取 Markdown 格式（每页用标题分隔）</summary>
+    /// <summary>提取 Markdown 格式（每页用标题分隔，结构化 AST 序列化）</summary>
     /// <returns>Markdown 字符串</returns>
-    public String? ExtractMarkdown()
+    public String? ExtractMarkdown() => ToMarkdownDocument()?.ToMarkdown();
+
+    /// <summary>提取 Markdown 文档对象（AST）</summary>
+    /// <remarks>
+    /// 结构化输出：每张幻灯片 → ## 标题；字号最大的文本框 → ### 标题；
+    /// 正文段落、带项目符号的列表、表格 → GFM 表格、备注 → 引用块（对标 anydoc 固定策略）。
+    /// </remarks>
+    /// <returns>Markdown 文档对象，无内容返回 null</returns>
+    public MarkdownDocument? ToMarkdownDocument()
     {
         var count = GetSlideCount();
         if (count == 0) return null;
 
-        var sb = new StringBuilder();
-        for (var i = 0; i < count; i++)
+        var doc = new MarkdownDocument();
+        var slides = ReadAllSlides().ToList();
+        for (var i = 0; i < slides.Count; i++)
         {
-            if (i > 0) sb.AppendLine();
-            sb.AppendLine($"## 幻灯片 {i + 1}");
-            sb.AppendLine();
-            sb.AppendLine(GetSlideText(i));
+            var slide = slides[i];
+            if (slide == null) continue;
+
+            doc.Blocks.Add(MarkdownBlock.CreateHeading(2, [MarkdownInline.CreateText($"幻灯片 {i + 1}")]));
+
+            // 标题识别：字号最大的文本框作为幻灯片标题
+            var maxSize = 0;
+            foreach (var tb in slide.TextBoxes)
+            {
+                if (tb.FontSize > maxSize) maxSize = tb.FontSize;
+            }
+
+            var bulletItems = new List<MarkdownBlock>();
+            foreach (var tb in slide.TextBoxes)
+            {
+                var text = TextBoxPlainText(tb);
+                if (String.IsNullOrWhiteSpace(text)) continue;
+
+                // 字号最大的文本框 → 标题（需足够大，避免把普通文字误判为标题）
+                if (maxSize >= 20 && tb.FontSize >= maxSize && tb.Paragraphs.Count <= 1)
+                {
+                    doc.Blocks.Add(MarkdownBlockBuilder.Heading(3, text));
+                }
+                else if (tb.Paragraphs.Count > 0)
+                {
+                    foreach (var para in tb.Paragraphs)
+                    {
+                        var inlines = ParagraphInlines(para);
+                        if (inlines.Count == 0) continue;
+                        if (para.BulletChar != null || para.Level > 0)
+                            bulletItems.Add(MarkdownBlock.CreateListItem(inlines));
+                        else
+                            doc.Blocks.Add(MarkdownBlock.CreateParagraph(inlines));
+                    }
+                }
+                else
+                {
+                    doc.Blocks.Add(MarkdownBlockBuilder.Paragraph(text));
+                }
+            }
+            if (bulletItems.Count > 0)
+                doc.Blocks.Add(MarkdownBlock.CreateBulletList(bulletItems));
+
+            // 表格 → GFM 表格
+            foreach (var tbl in slide.Tables)
+            {
+                if (tbl.Rows.Count == 0) continue;
+                doc.Blocks.Add(MarkdownBlockBuilder.Table(tbl.Rows.ToArray(), tbl.FirstRowHeader));
+            }
+
+            // 备注 → 引用块
+            if (!String.IsNullOrWhiteSpace(slide.Notes))
+                doc.Blocks.Add(MarkdownBlockBuilder.BlockQuote(slide.Notes));
         }
-        return sb.ToString();
+        return doc;
+    }
+
+    /// <summary>拼接文本框纯文本（优先段落 Runs）</summary>
+    /// <param name="tb">文本框</param>
+    /// <returns>纯文本</returns>
+    private static String TextBoxPlainText(TextBox tb)
+    {
+        if (tb.Paragraphs.Count > 0)
+        {
+            var sb = new StringBuilder();
+            foreach (var p in tb.Paragraphs)
+            {
+                foreach (var run in p.Runs) sb.Append(run.Text);
+            }
+            return sb.ToString();
+        }
+        return tb.Text;
+    }
+
+    /// <summary>构建段落行内元素（保留粗体/斜体/超链接）</summary>
+    /// <param name="para">段落</param>
+    /// <returns>行内元素列表</returns>
+    private static List<MarkdownInline> ParagraphInlines(Paragraph para)
+    {
+        var list = new List<MarkdownInline>();
+        foreach (var run in para.Runs)
+        {
+            if (String.IsNullOrEmpty(run.Text)) continue;
+            var clean = MarkdownTextCleaner.Clean(run.Text);
+
+            // 超链接优先
+            if (!run.HyperlinkUrl.IsNullOrEmpty())
+            {
+                list.Add(MarkdownInline.CreateLink(run.HyperlinkUrl!, "", [MarkdownInline.CreateText(clean)]));
+                continue;
+            }
+
+            List<MarkdownInline> inlines = [MarkdownInline.CreateText(clean)];
+            if (run.Italic) inlines = [MarkdownInline.CreateEmphasis(inlines)];
+            if (run.Bold) inlines = [MarkdownInline.CreateStrong(inlines)];
+            list.AddRange(inlines);
+        }
+        return list;
     }
     #endregion
 }

@@ -1,19 +1,19 @@
 using System.Text;
 
-namespace NewLife.Office;
+namespace NewLife.Office.VCard;
 
 /// <summary>VCard 文档包装，封装联系人列表并提供文本/Markdown 提取能力</summary>
 public class VCardDocument : ITextExtractable, IMarkdownExtractable
 {
     #region 属性
     /// <summary>联系人列表</summary>
-    public List<VCardContact> Contacts { get; }
+    public List<Contact> Contacts { get; }
     #endregion
 
     #region 构造
     /// <summary>实例化 VCard 文档包装</summary>
     /// <param name="contacts">联系人列表</param>
-    public VCardDocument(List<VCardContact> contacts) => Contacts = contacts ?? [];
+    public VCardDocument(List<Contact> contacts) => Contacts = contacts ?? [];
     #endregion
 
     #region 文本提取
@@ -45,10 +45,10 @@ public class VCardDocument : ITextExtractable, IMarkdownExtractable
             foreach (var addr in c.Addresses)
             {
                 var parts = new List<String>();
-                if (!String.IsNullOrEmpty(addr.Country)) parts.Add(addr.Country);
-                if (!String.IsNullOrEmpty(addr.Region)) parts.Add(addr.Region);
-                if (!String.IsNullOrEmpty(addr.City)) parts.Add(addr.City);
-                if (!String.IsNullOrEmpty(addr.Street)) parts.Add(addr.Street);
+                if (!String.IsNullOrEmpty(addr.Country)) parts.Add(addr.Country!);
+                if (!String.IsNullOrEmpty(addr.Region)) parts.Add(addr.Region!);
+                if (!String.IsNullOrEmpty(addr.City)) parts.Add(addr.City!);
+                if (!String.IsNullOrEmpty(addr.Street)) parts.Add(addr.Street!);
                 if (parts.Count > 0)
                     sb.AppendLine($"地址: {String.Join(" ", parts)}" + (String.IsNullOrEmpty(addr.Type) ? "" : $" ({addr.Type})"));
             }
@@ -87,10 +87,10 @@ public class VCardDocument : ITextExtractable, IMarkdownExtractable
             foreach (var addr in c.Addresses)
             {
                 var parts = new List<String>();
-                if (!String.IsNullOrEmpty(addr.Country)) parts.Add(addr.Country);
-                if (!String.IsNullOrEmpty(addr.Region)) parts.Add(addr.Region);
-                if (!String.IsNullOrEmpty(addr.City)) parts.Add(addr.City);
-                if (!String.IsNullOrEmpty(addr.Street)) parts.Add(addr.Street);
+                if (!String.IsNullOrEmpty(addr.Country)) parts.Add(addr.Country!);
+                if (!String.IsNullOrEmpty(addr.Region)) parts.Add(addr.Region!);
+                if (!String.IsNullOrEmpty(addr.City)) parts.Add(addr.City!);
+                if (!String.IsNullOrEmpty(addr.Street)) parts.Add(addr.Street!);
                 if (parts.Count > 0)
                     sb.AppendLine($"- **地址**: {String.Join(" ", parts)}" + (String.IsNullOrEmpty(addr.Type) ? "" : $" ({addr.Type})"));
             }

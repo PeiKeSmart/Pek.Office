@@ -1,23 +1,28 @@
 ﻿using System.Globalization;
 using System.Text;
+using NewLife.Office.Markdown;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Pdf;
 
-/// <summary>PDF 读取器（基础实现）</summary>
+/// <summary>PDF 读取器</summary>
 /// <remarks>
-/// 直接解析 PDF 字节流，提取文本内容和元数据。
-/// 支持 PDF 1.0-1.7，基于对象流扫描方式提取文本（不依赖外部库）。
-/// 对加密 PDF 或内嵌 CJK 字体 PDF 的文本提取效果有限。
+/// 基于交叉引用表（xref）精确定位 PDF 对象，支持 FlateDecode 解压缩内容流。
+/// 支持 PDF 1.0-1.7，正确提取文本、图片、元数据和书签结构。
+/// 对加密 PDF 的文本提取有限（需先解密）。
 /// </remarks>
-public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
+public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable, IMarkdownDocumentExtractable
 {
     #region 属性
     /// <summary>源文件路径</summary>
     public String? FilePath { get; private set; }
+
+    /// <summary>交叉引用表</summary>
+    public PdfXRefTable? XRefTable { get; private set; }
     #endregion
 
     #region 私有字段
     private readonly Byte[] _data;
+    private readonly Encoding _latin1 = Encoding.GetEncoding(28591);
     #endregion
 
     #region 构造
@@ -27,6 +32,7 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
     {
         FilePath = path.GetFullPath();
         _data = File.ReadAllBytes(FilePath);
+        XRefTable = new PdfXRefTable(_data);
     }
 
     /// <summary>从流打开</summary>
@@ -36,10 +42,78 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
         _data = ms.ToArray();
+        XRefTable = new PdfXRefTable(_data);
     }
 
     /// <summary>释放资源</summary>
     public void Dispose() => GC.SuppressFinalize(this);
+    #endregion
+
+    #region FlateDecode 解压（公开给 XRefTable 使用）
+    /// <summary>解压 FlateDecode（zlib/Deflate）压缩的数据</summary>
+    /// <param name="data">压缩数据（含 zlib 头 + deflate + Adler-32 尾）</param>
+    /// <returns>解压后的字节数组</returns>
+    public static Byte[] DecompressFlate(Byte[] data)
+    {
+        // zlib 格式：2字节头 + deflate 数据 + 4字节 Adler-32
+        // CMF=0x78, FLG 常见值：0x01/0x5E/0x9C/0xDA
+        if (data.Length < 6) return data;
+
+        var headerOffset = 0;
+        // 跳过 2 字节 zlib 头
+        if (data.Length >= 2 && data[0] == 0x78)
+            headerOffset = 2;
+
+        using var output = new MemoryStream();
+        using var input = new MemoryStream(data, headerOffset, data.Length - headerOffset - (headerOffset > 0 ? 4 : 0));
+        using var deflate = new System.IO.Compression.DeflateStream(input, System.IO.Compression.CompressionMode.Decompress);
+        deflate.CopyTo(output);
+        return output.ToArray();
+    }
+
+    /// <summary>根据流字典解压缩内容流</summary>
+    /// <param name="streamData">原始流数据</param>
+    /// <param name="dict">流字典</param>
+    /// <returns>解压后的字节数组</returns>
+    internal static Byte[] DecompressStreamData(Byte[] streamData, PdfDict dict)
+    {
+        if (!dict.TryGetValue("Filter", out var filterVal)) return streamData;
+
+        // 支持单一过滤器或过滤器数组
+        var filters = new List<String>();
+        if (filterVal is PdfName fn)
+            filters.Add(fn.Value);
+        else if (filterVal is PdfArray fa)
+            filters.AddRange(fa.Items.OfType<PdfName>().Select(n => n.Value));
+
+        var result = streamData;
+        foreach (var filter in filters)
+        {
+            switch (filter)
+            {
+                case "FlateDecode":
+                    try { result = DecompressFlate(result); } catch { }
+                    break;
+                case "ASCIIHexDecode":
+                    result = DecodeAsciiHex(result);
+                    break;
+                case "ASCII85Decode":
+                    result = DecodeAscii85(result);
+                    break;
+                case "LZWDecode":
+                    // 从 dict 中读取 EarlyChange 参数（默认 1）
+                    var earlyChange = 1;
+                    if (dict.TryGetValue("EarlyChange", out var ecVal) && ecVal is PdfNumber ecn)
+                        earlyChange = (Int32)ecn.Value;
+                    result = DecodeLzw(result, earlyChange);
+                    break;
+                case "RunLengthDecode":
+                    result = DecodeRunLength(result);
+                    break;
+            }
+        }
+        return result;
+    }
     #endregion
 
     #region 读取方法
@@ -47,16 +121,98 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
     /// <returns>页数</returns>
     public Int32 GetPageCount()
     {
-        var latin1 = Encoding.GetEncoding(1252);
-        var pdf = latin1.GetString(_data);
-        // 在 Pages 字典中查找 /Count 值
+        var pdf = _latin1.GetString(_data);
         var countIdx = FindToken(pdf, "/Count");
         if (countIdx < 0) return 0;
         var numStr = ExtractNextToken(pdf, countIdx + 6);
         return Int32.TryParse(numStr.Trim(), out var count) ? count : 0;
     }
 
-    /// <summary>提取全部文本（从所有内容流中）</summary>
+    /// <summary>读取 PDF 中所有嵌入/引用的字体信息</summary>
+    /// <returns>字体信息列表</returns>
+    public List<PdfFontInfo> ReadFonts()
+    {
+        var fonts = new List<PdfFontInfo>();
+        var pdf = _latin1.GetString(_data);
+        var visited = new HashSet<String>();
+
+        // 扫描所有字体字典：查找 /BaseFont 或 /FontName
+        var pos = 0;
+        while (true)
+        {
+            var found = FindToken(pdf.Substring(pos), "/BaseFont");
+            if (found < 0) break;
+            pos += found + 9;
+            var name = ExtractNameValue(pdf, ref pos);
+            if (name == null || !visited.Add(name)) continue;
+
+            var info = new PdfFontInfo { Name = name };
+
+            // 回溯查找字体类型和编码
+            var searchBack = Math.Max(0, pos - 200);
+            var context = pdf.Substring(searchBack, pos - searchBack);
+
+            // 检测类型：/Type /Font 附近或 /Subtype
+            var typeIdx = context.LastIndexOf("/Subtype");
+            if (typeIdx >= 0)
+            {
+                var subtype = ExtractNextToken(context, typeIdx + 8).Trim();
+                if (subtype.Length > 0 && subtype[0] == '/') subtype = subtype.Substring(1);
+                info.Type = subtype;
+            }
+
+            // 检测编码
+            var encIdx = context.LastIndexOf("/Encoding");
+            if (encIdx >= 0)
+            {
+                var encoding = ExtractNextToken(context, encIdx + 9).Trim();
+                if (encoding.Length > 0 && encoding[0] == '/') encoding = encoding.Substring(1);
+                info.Encoding = encoding;
+            }
+
+            // 排除重复的字体描述符（字体名过短且以 F 开头的通常不是真实字体）
+            if (info.Name != null && (info.Name.Length > 3 || !info.Name.StartsWith("F")))
+                fonts.Add(info);
+        }
+
+        // 如果找到太多（包括 FontDescriptor 等），去重过滤
+        var result = fonts.Where(f => f.Name?.Length > 1).GroupBy(f => f.Name).Select(g => g.First()).ToList();
+        return result;
+    }
+
+    /// <summary>提取 PDF name 值（/xxx 格式）</summary>
+    private static String? ExtractNameValue(String pdf, ref Int32 pos)
+    {
+        while (pos < pdf.Length && pdf[pos] == ' ') pos++;
+        if (pos >= pdf.Length) return null;
+
+        // 跳过 #XX 十六进制转义
+        if (pos + 1 < pdf.Length && pdf[pos] == '#') { pos += 3; }
+
+        var start = pos;
+        if (start < pdf.Length && pdf[start] == '/') start++;
+
+        while (pos < pdf.Length && !IsPdfDelimiter(pdf[pos]))
+            pos++;
+
+        if (start >= pos) return null;
+
+        var len = pos - start;
+        if (start + len > pdf.Length) len = pdf.Length - start;
+        if (len <= 0) return null;
+
+        var name = pdf.Substring(start, len);
+        name = name.Trim();
+        if (name.StartsWith("/")) name = name.Substring(1);
+        return name.Length > 0 ? name : null;
+    }
+
+    private static Boolean IsPdfDelimiter(Char c)
+    {
+        return c == ' ' || c == '\r' || c == '\n' || c == '\t' || c == '/' || c == '<' || c == '>' || c == '[' || c == ']' || c == '(' || c == ')';
+    }
+
+    /// <summary>提取全部文本（基于 xref + 解压缩内容流）</summary>
     /// <returns>合并后的文本</returns>
     public String ExtractText()
     {
@@ -65,19 +221,97 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
         return sb.ToString();
     }
 
+    /// <summary>基于 xref 表提取全部文本</summary>
+    private void ExtractTextViaXref(StringBuilder sb)
+    {
+        var pageObjNums = GetPageObjectNumbers();
+        foreach (var pageObjNum in pageObjNums)
+        {
+            var pageObj = PdfObjectParser.ReadObject(_data, XRefTable!, pageObjNum);
+            if (pageObj is not DictObj pageDictObj) continue;
+
+            var pageDict = pageDictObj.Value;
+            if (!pageDict.TryGetValue("Contents", out var contentsVal)) continue;
+
+            // 处理单个内容流或内容流数组
+            var contentRefs = new List<Ref>();
+            if (contentsVal is Ref r)
+                contentRefs.Add(r);
+            else if (contentsVal is PdfArray arr)
+                contentRefs.AddRange(arr.Items.OfType<Ref>());
+
+            foreach (var cref in contentRefs)
+            {
+                var contentObj = PdfObjectParser.ReadObject(_data, XRefTable!, cref.ObjNum);
+                if (contentObj is not PdfStream contentStream) continue;
+
+                var decompressed = DecompressStreamData(contentStream.Data, contentStream.Dict);
+                var contentText = _latin1.GetString(decompressed);
+                ExtractTextFromContent(contentText, sb);
+
+                sb.AppendLine();
+            }
+        }
+    }
+
+    /// <summary>获取所有页面对象号</summary>
+    private List<Int32> GetPageObjectNumbers()
+    {
+        var pageObjNums = new List<Int32>();
+        if (XRefTable == null) return pageObjNums;
+
+        // 从 Catalog → Pages → Kids 获取页面引用
+        if (!XRefTable.Trailer.TryGetValue("Root", out var rootVal) || rootVal is not Ref rootRef)
+            return pageObjNums;
+
+        var catalogObj = PdfObjectParser.ReadObject(_data, XRefTable, rootRef.ObjNum);
+        if (catalogObj is not DictObj catalogDictObj) return pageObjNums;
+
+        if (!catalogDictObj.Value.TryGetValue("Pages", out var pagesVal) || pagesVal is not Ref pagesRef)
+            return pageObjNums;
+
+        var pagesObj = PdfObjectParser.ReadObject(_data, XRefTable, pagesRef.ObjNum);
+        if (pagesObj is not DictObj pagesDictObj) return pageObjNums;
+
+        var pagesDict = pagesDictObj.Value;
+        if (!pagesDict.TryGetValue("Kids", out var kidsVal) || kidsVal is not PdfArray kidsArr)
+            return pageObjNums;
+
+        foreach (var kid in kidsArr.Items)
+        {
+            if (kid is Ref kidRef)
+                pageObjNums.Add(kidRef.ObjNum);
+        }
+
+        return pageObjNums;
+    }
+
     /// <summary>读取文档元数据</summary>
     /// <returns>元数据对象</returns>
-    public PdfMetadata ReadMetadata()
+    public PdfDocumentInfo ReadMetadata()
     {
-        var meta = new PdfMetadata { PageCount = GetPageCount() };
-        var latin1 = Encoding.GetEncoding(1252);
-        var pdf = latin1.GetString(_data);
+        var meta = new PdfDocumentInfo { PageCount = GetPageCount() };
+        var pdf = _latin1.GetString(_data);
 
         // 读取 %PDF-x.x 版本
         if (pdf.StartsWith("%PDF-"))
-            meta.PdfVersion = pdf.Substring(5, Math.Min(3, pdf.Length - 5));
+            meta.PdfVersion = pdf.Substring(5, Math.Min(3, pdf.Length - 5)).Trim();
 
-        // 读取 Info 字典
+        // 优先从 xref trailer 读取
+        if (XRefTable != null && XRefTable.Trailer.TryGetValue("Info", out var infoVal) && infoVal is Ref infoRef)
+        {
+            var infoObj = PdfObjectParser.ReadObject(_data, XRefTable, infoRef.ObjNum);
+            if (infoObj is DictObj infoDict)
+            {
+                meta.Title = GetDictString(infoDict.Value, "Title");
+                meta.Author = GetDictString(infoDict.Value, "Author");
+                meta.Subject = GetDictString(infoDict.Value, "Subject");
+                meta.CreationDate = GetDictString(infoDict.Value, "CreationDate");
+                return meta;
+            }
+        }
+
+        // 回退：扫描 Info 字典
         var infoStart = FindToken(pdf, "/Info");
         if (infoStart >= 0)
         {
@@ -91,18 +325,67 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
         return meta;
     }
 
-    /// <summary>提取带坐标位置的文本（P06-05）</summary>
-    /// <remarks>
-    /// 解析内容流中的文本定位/显示操作符，返回各文本段落及其近似坐标。
-    /// 坐标系以页面左下角为原点，单位为 PDF 用户空间单位（通常约等于磅/pt）。
-    /// 注意：对加密或使用自定义字体映射的 PDF，文本内容可能不准确。
-    /// </remarks>
-    /// <returns>文本项序列，每项含文本内容和近似 (X, Y) 坐标</returns>
-    public IEnumerable<PdfTextItem> ExtractTextWithPositions()
+    /// <summary>从 PdfDict 中提取字符串值</summary>
+    private static String? GetDictString(PdfDict dict, String key)
     {
-        var latin1 = Encoding.GetEncoding(1252);
-        var pdf = latin1.GetString(_data);
-        var results = new List<PdfTextItem>();
+        if (!dict.TryGetValue(key, out var val)) return null;
+        return val switch
+        {
+            PdfString s => s.Value,
+            HexString h => DecodeHexFromString(h.Value),
+            _ => val.ToString(),
+        };
+    }
+
+    /// <summary>提取带坐标位置的文本</summary>
+    /// <remarks>基于 xref + 内容流解压，正确追踪文本矩阵</remarks>
+    /// <returns>文本项序列</returns>
+    public IEnumerable<PdfText> ExtractTextWithPositions()
+    {
+        var results = new List<PdfText>();
+        if (XRefTable == null || !XRefTable.Trailer.TryGetValue("Root", out var rv) || rv is not Ref)
+        {
+            // 回退到字符串扫描
+            return ScanPositionedText(results);
+        }
+
+        var pageObjNums = GetPageObjectNumbers();
+        foreach (var pageObjNum in pageObjNums)
+        {
+            var pageObj = PdfObjectParser.ReadObject(_data, XRefTable, pageObjNum);
+            if (pageObj is not DictObj pageDictObj) continue;
+
+            var pageDict = pageDictObj.Value;
+            if (!pageDict.TryGetValue("Contents", out var contentsVal)) continue;
+
+            var contentRefs = new List<Ref>();
+            if (contentsVal is Ref r) contentRefs.Add(r);
+            else if (contentsVal is PdfArray arr) contentRefs.AddRange(arr.Items.OfType<Ref>());
+
+            foreach (var cref in contentRefs)
+            {
+                var contentObj = PdfObjectParser.ReadObject(_data, XRefTable, cref.ObjNum);
+                if (contentObj is not PdfStream contentStream) continue;
+
+                var decompressed = DecompressStreamData(contentStream.Data, contentStream.Dict);
+                var contentText = _latin1.GetString(decompressed);
+                ExtractPositionedText(contentText, results);
+            }
+        }
+
+        // xref 路径未提取到任何文本时回退到字符串扫描（兼容 xref offset 不可靠的生成器）
+        if (results.Count == 0)
+            return ScanPositionedText(results);
+
+        return results;
+    }
+
+    /// <summary>字符串扫描回退：提取所有 stream 块中的带位置文本</summary>
+    /// <param name="results">输出列表（原地追加）</param>
+    /// <returns>文本项列表</returns>
+    private IEnumerable<PdfText> ScanPositionedText(List<PdfText> results)
+    {
+        var pdf = _latin1.GetString(_data);
         var pos = 0;
         while (pos < pdf.Length)
         {
@@ -120,22 +403,352 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
         return results;
     }
 
-    /// <summary>从 PDF 中提取嵌入图片（P06-04）</summary>
-    /// <remarks>
-    /// 扫描所有流字典，找到类型为 /Subtype /Image 的 XObject 流并提取原始字节。
-    /// 对 /Filter /DCTDecode（JPEG）图片返回直接可用的 JPEG 字节。
-    /// 其他编码格式返回原始压缩字节，可结合 <see cref="PdfImageStream.Filter"/> 判断。
-    /// </remarks>
-    /// <returns>图片流对象序列</returns>
-    public IEnumerable<PdfImageStream> ExtractImageStreams()
+    /// <summary>获取指定页的文本块（带坐标位置）</summary>
+    /// <param name="pageIndex">页面索引（0 起）</param>
+    /// <returns>该页的所有文本块</returns>
+    public List<PdfText> GetPageTextBlocks(Int32 pageIndex)
     {
-        var latin1 = Encoding.GetEncoding(1252);
-        var text = latin1.GetString(_data);
-        var pos = 0;
+        var results = new List<PdfText>();
+        if (XRefTable == null) return results;
+
+        var pageObjNums = GetPageObjectNumbers();
+        if (pageIndex < 0 || pageIndex >= pageObjNums.Count) return results;
+
+        var pageObjNum = pageObjNums[pageIndex];
+        var pageObj = PdfObjectParser.ReadObject(_data, XRefTable, pageObjNum);
+        if (pageObj is not DictObj pageDictObj) return results;
+
+        var pageDict = pageDictObj.Value;
+        if (!pageDict.TryGetValue("Contents", out var contentsVal)) return results;
+
+        var contentRefs = new List<Ref>();
+        if (contentsVal is Ref r) contentRefs.Add(r);
+        else if (contentsVal is PdfArray arr) contentRefs.AddRange(arr.Items.OfType<Ref>());
+
+        foreach (var cref in contentRefs)
+        {
+            var contentObj = PdfObjectParser.ReadObject(_data, XRefTable, cref.ObjNum);
+            if (contentObj is not PdfStream contentStream) continue;
+
+            var decompressed = DecompressStreamData(contentStream.Data, contentStream.Dict);
+            var contentText = _latin1.GetString(decompressed);
+            ExtractPositionedText(contentText, results);
+        }
+
+        return results;
+    }
+
+    /// <summary>启发式提取 PDF 中的表格数据（按位置聚类），返回每页的表格行数据</summary>
+    /// <param name="yTolerance">Y 坐标容差（点），默认 5</param>
+    /// <param name="xTolerance">X 坐标容差（点），默认 10</param>
+    /// <returns>每页的表格数据：List&lt;String[]&gt;，每行若干列</returns>
+    public List<String[]> ExtractTables(Single yTolerance = 5f, Single xTolerance = 10f)
+    {
+        var textItems = ExtractTextWithPositions().ToList();
+        if (textItems.Count == 0) return [];
+
+        // 按 Y 坐标分组（行）
+        var rows = new List<List<PdfText>>();
+        var sorted = textItems.OrderByDescending(t => t.Y).ToList();
+        foreach (var item in sorted)
+        {
+            var added = false;
+            foreach (var row in rows)
+            {
+                if (Math.Abs(row[0].Y - item.Y) <= yTolerance)
+                {
+                    row.Add(item);
+                    added = true;
+                    break;
+                }
+            }
+            if (!added) rows.Add([item]);
+        }
+
+        // 每行内按 X 排序并去重（相近 X 合并）
+        var result = new List<String[]>();
+        foreach (var row in rows)
+        {
+            var sortedRow = row.OrderBy(t => t.X).ToList();
+            var cells = new List<String>();
+            PdfText? last = null;
+            foreach (var t in sortedRow)
+            {
+                if (last != null && Math.Abs(last.X - t.X) <= xTolerance)
+                {
+                    // 合并相近的文本（同一单元格多段文本）
+                    cells[^1] += t.Text;
+                }
+                else
+                {
+                    cells.Add(t.Text);
+                }
+                last = t;
+            }
+            if (cells.Count > 0)
+                result.Add(cells.ToArray());
+        }
+
+        return result;
+    }
+
+    /// <summary>读取 AcroForm 表单字段及当前值</summary>
+    /// <returns>表单对象（含字段列表和值），null 表示无表单</returns>
+    public PdfAcroForm? ReadFormFields()
+    {
+        if (XRefTable == null || !XRefTable.Trailer.TryGetValue("Root", out var rv) || rv is not Ref rootRef)
+            return null;
+
+        var rootObj = PdfObjectParser.ReadObject(_data, XRefTable, rootRef.ObjNum);
+        if (rootObj is not DictObj rootDictObj) return null;
+        if (!rootDictObj.Value.TryGetValue("AcroForm", out var acroVal)) return null;
+
+        Ref acroRef;
+        if (acroVal is Ref ar) acroRef = ar;
+        else return null;
+
+        var acroObj = PdfObjectParser.ReadObject(_data, XRefTable, acroRef.ObjNum);
+        if (acroObj is not DictObj acroDictObj) return null;
+
+        var form = new PdfAcroForm();
+        var dict = acroDictObj.Value;
+
+        if (dict.TryGetValue("NeedAppearances", out var naVal) && naVal is PdfBoolean na)
+            form.NeedAppearances = na.Value;
+
+        if (dict.TryGetValue("Fields", out var fieldsVal))
+        {
+            var fieldRefs = new List<Ref>();
+            if (fieldsVal is Ref fr) fieldRefs.Add(fr);
+            else if (fieldsVal is PdfArray fa) fieldRefs.AddRange(fa.Items.OfType<Ref>());
+
+            foreach (var fref in fieldRefs)
+            {
+                var field = ReadFormField(fref);
+                if (field != null) form.Fields.Add(field);
+            }
+        }
+
+        return form;
+    }
+
+    private FormField? ReadFormField(Ref fref)
+    {
+        var fobj = PdfObjectParser.ReadObject(_data, XRefTable!, fref.ObjNum);
+        if (fobj is not DictObj fdictObj) return null;
+        var dict = fdictObj.Value;
+
+        var field = new FormField();
+
+        if (dict.TryGetValue("T", out var tVal) && tVal is PdfString ts)
+            field.FullName = ts.Value;
+
+        if (dict.TryGetValue("FT", out var ftVal) && ftVal is PdfName ftn)
+            field.FieldType = ftn.Value switch { "Tx" => FormFieldType.Tx, "Btn" => FormFieldType.Btn, "Ch" => FormFieldType.Ch, "Sig" => FormFieldType.Sig, _ => FormFieldType.Tx };
+
+        if (dict.TryGetValue("V", out var vVal))
+            field.Value = vVal switch { PdfString vs => vs.Value, PdfName vn => vn.Value, _ => vVal.ToString() };
+
+        if (dict.TryGetValue("DV", out var dvVal) && dvVal is PdfString dvs)
+            field.DefaultValue = dvs.Value;
+
+        // 解析 Rect（[x1 y1 x2 y2]）
+        if (dict.TryGetValue("Rect", out var rectVal) && rectVal is PdfArray rectArr && rectArr.Items.Count >= 4)
+        {
+            if (rectArr.Items[0] is PdfNumber rx) field.X = (Single)rx.Value;
+            if (rectArr.Items[1] is PdfNumber ry) field.Y = (Single)ry.Value;
+            if (rectArr.Items[2] is PdfNumber rw) field.Width = (Single)rw.Value - field.X;
+            if (rectArr.Items[3] is PdfNumber rh) field.Height = (Single)rh.Value - field.Y;
+        }
+
+        // Kids（子字段，递归读取）
+        if (dict.TryGetValue("Kids", out var kidsVal))
+        {
+            var kidRefs = new List<Ref>();
+            if (kidsVal is Ref kr) kidRefs.Add(kr);
+            else if (kidsVal is PdfArray ka) kidRefs.AddRange(ka.Items.OfType<Ref>());
+
+            foreach (var kref in kidRefs)
+            {
+                var kid = ReadFormField(kref);
+                if (kid != null) field.Kids.Add(kid);
+            }
+        }
+
+        // Opt（下拉/列表选项）
+        if (dict.TryGetValue("Opt", out var optVal) && optVal is PdfArray optArr)
+        {
+            foreach (var oi in optArr.Items)
+            {
+                if (oi is PdfString os) field.Options.Add(os.Value);
+                else if (oi is PdfArray oa && oa.Items.Count > 0 && oa.Items[0] is PdfString oas) field.Options.Add(oas.Value);
+            }
+        }
+
+        return field;
+    }
+
+    /// <summary>读取指定页面的注释（Annotations）</summary>
+    /// <param name="pageIndex">页面索引（0起始）</param>
+    /// <returns>注释列表，无注释时返回空列表</returns>
+    /// <remarks>
+    /// 支持全部 14 种 PDF 注释类型（Link/Text/Highlight/Underline/StrikeOut/
+    /// FreeText/Square/Circle/Line/Stamp/Caret/Polygon/PolyLine/Squiggly）。
+    /// 解析注释的 Rect、Contents、作者、颜色、顶点等属性。
+    /// </remarks>
+    public List<PdfAnnotation> ReadAnnotations(Int32 pageIndex)
+    {
+        var result = new List<PdfAnnotation>();
+        if (XRefTable == null) return result;
+
+        var pageObjNums = GetPageObjectNumbers();
+        if (pageIndex < 0 || pageIndex >= pageObjNums.Count) return result;
+
+        var pageObjNum = pageObjNums[pageIndex];
+        var pageObj = PdfObjectParser.ReadObject(_data, XRefTable, pageObjNum);
+        if (pageObj is not DictObj pageDictObj) return result;
+
+        if (!pageDictObj.Value.TryGetValue("Annots", out var annotsVal)) return result;
+
+        // 收集注释引用
+        var annotRefs = new List<Ref>();
+        if (annotsVal is Ref ar) annotRefs.Add(ar);
+        else if (annotsVal is PdfArray aa) annotRefs.AddRange(aa.Items.OfType<Ref>());
+
+        foreach (var aref in annotRefs)
+        {
+            var aobj = PdfObjectParser.ReadObject(_data, XRefTable, aref.ObjNum);
+            if (aobj is not DictObj adictObj) continue;
+            var dict = adictObj.Value;
+
+            var annot = new PdfAnnotation { PageIndex = pageIndex };
+
+            // Subtype → 类型映射
+            if (dict.TryGetValue("Subtype", out var subVal) && subVal is PdfName subName)
+            {
+                annot.Type = subName.Value switch
+                {
+                    "Link" => PdfAnnotationType.Link,
+                    "Text" => PdfAnnotationType.Text,
+                    "Highlight" => PdfAnnotationType.Highlight,
+                    "Underline" => PdfAnnotationType.Underline,
+                    "StrikeOut" => PdfAnnotationType.StrikeOut,
+                    "FreeText" => PdfAnnotationType.FreeText,
+                    "Square" => PdfAnnotationType.Square,
+                    "Circle" => PdfAnnotationType.Circle,
+                    "Line" => PdfAnnotationType.Line,
+                    "Stamp" => PdfAnnotationType.Stamp,
+                    "Caret" => PdfAnnotationType.Caret,
+                    "Polygon" => PdfAnnotationType.Polygon,
+                    "PolyLine" => PdfAnnotationType.PolyLine,
+                    "Squiggly" => PdfAnnotationType.Squiggly,
+                    _ => PdfAnnotationType.Text,
+                };
+            }
+
+            // Rect
+            if (dict.TryGetValue("Rect", out var rectVal) && rectVal is PdfArray rectArr && rectArr.Items.Count >= 4)
+            {
+                if (rectArr.Items[0] is PdfNumber rx) annot.X = (Single)rx.Value;
+                if (rectArr.Items[1] is PdfNumber ry) annot.Y = (Single)ry.Value;
+                if (rectArr.Items[2] is PdfNumber rw) annot.Width = (Single)rw.Value - annot.X;
+                if (rectArr.Items[3] is PdfNumber rh) annot.Height = (Single)rh.Value - annot.Y;
+            }
+
+            // Contents
+            if (dict.TryGetValue("Contents", out var contVal))
+            {
+                if (contVal is PdfString cs) annot.Contents = cs.Value;
+                else if (contVal is HexString chs) annot.Contents = DecodeHexFromString(chs.Value);
+            }
+
+            // Author（便签注释）
+            if (dict.TryGetValue("T", out var tVal) && tVal is PdfString ts)
+                annot.Author = ts.Value;
+
+            // 颜色
+            if (dict.TryGetValue("C", out var cVal) && cVal is PdfArray ca && ca.Items.Count >= 3)
+            {
+                var r = ca.Items[0] is PdfNumber cr ? (Byte)(cr.Value * 255) : (Byte)0;
+                var g = ca.Items[1] is PdfNumber cg ? (Byte)(cg.Value * 255) : (Byte)0;
+                var b = ca.Items[2] is PdfNumber cb ? (Byte)(cb.Value * 255) : (Byte)0;
+                annot.Color = new Color(r, g, b);
+            }
+
+            // 顶点（多边形/折线）
+            if (dict.TryGetValue("Vertices", out var vertVal) && vertVal is PdfArray va)
+            {
+                var verts = new List<Single>();
+                foreach (var vi in va.Items)
+                {
+                    if (vi is PdfNumber vn) verts.Add((Single)vn.Value);
+                }
+                annot.Vertices = verts.ToArray();
+            }
+
+            // Link 类型：URL
+            if (annot.Type == PdfAnnotationType.Link && dict.TryGetValue("A", out var aVal) && aVal is DictObj aDict)
+            {
+                if (aDict.Value.TryGetValue("URI", out var uriVal) && uriVal is PdfString us)
+                    annot.Url = us.Value;
+            }
+
+            result.Add(annot);
+        }
+
+        return result;
+    }
+
+    /// <summary>从 PDF 中提取嵌入图片</summary>
+    /// <returns>图片流对象序列</returns>
+    public IEnumerable<PdfImage> ExtractImageStreams()
+    {
+        if (XRefTable == null || !XRefTable.Trailer.TryGetValue("Root", out var _))
+            return ExtractImageStreamsLegacy();
+
+        var results = new List<PdfImage>();
         var imgIdx = 0;
+        foreach (var kv in XRefTable.Entries)
+        {
+            if (!kv.Value.InUse) continue;
+            var obj = PdfObjectParser.ReadObject(_data, XRefTable, kv.Key);
+            if (obj is not PdfStream stream) continue;
+
+            var dict = stream.Dict;
+            if (!dict.TryGetValue("Subtype", out var subtypeVal) || subtypeVal is not PdfName subName || subName.Value != "Image") continue;
+            if (!dict.TryGetValue("Type", out var typeVal) || typeVal is not PdfName tName || tName.Value != "XObject") continue;
+
+            var width = 0; var height = 0;
+            if (dict.TryGetValue("Width", out var wVal) && wVal is PdfNumber wn) width = (Int32)wn.Value;
+            if (dict.TryGetValue("Height", out var hVal) && hVal is PdfNumber hn) height = (Int32)hn.Value;
+            if (width <= 0 || height <= 0) continue;
+
+            var filter = String.Empty;
+            if (dict.TryGetValue("Filter", out var fVal))
+            {
+                if (fVal is PdfName fn) filter = fn.Value;
+                else if (fVal is PdfArray fa) filter = String.Join(",", fa.Items.OfType<PdfName>().Select(n => n.Value));
+            }
+
+            var rawData = stream.Data;
+            var isJpeg = filter.IndexOf("DCTDecode", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!isJpeg && filter.IndexOf("FlateDecode", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                try { rawData = DecompressStreamData(stream.Data, dict); } catch { }
+            }
+
+            results.Add(new PdfImage { Index = imgIdx++, Width = width, Height = height, Filter = filter, RawData = rawData });
+        }
+        return results;
+    }
+
+    private IEnumerable<PdfImage> ExtractImageStreamsLegacy()
+    {
+        var imgIdx = 0;
+        var text = _latin1.GetString(_data);
+        var pos = 0;
         while (pos < text.Length)
         {
-            // 寻找包含 /Subtype /Image 的字典
             var dictStart = text.IndexOf("<<", pos, StringComparison.Ordinal);
             if (dictStart < 0) break;
             var dictEnd = text.IndexOf(">>", dictStart + 2, StringComparison.Ordinal);
@@ -144,13 +757,9 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
 
             if (dict.IndexOf("/Subtype", StringComparison.Ordinal) >= 0 && dict.IndexOf("/Image", StringComparison.OrdinalIgnoreCase) >= 0)
             {
-                // 解析宽高
                 var widthTok = GetDictIntValue(dict, "Width");
                 var heightTok = GetDictIntValue(dict, "Height");
                 var filter = GetDictToken(dict, "Filter");
-                var lengthTok = GetDictIntValue(dict, "Length");
-
-                // 找到紧随 >> 之后的 stream
                 var strmPos = text.IndexOf("stream", dictEnd, StringComparison.Ordinal);
                 if (strmPos >= 0 && strmPos < dictEnd + 100)
                 {
@@ -161,14 +770,7 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
                     if (dataEnd > dataStart && widthTok > 0 && heightTok > 0)
                     {
                         var rawBytes = _data.AsSpan(dataStart, Math.Min(dataEnd - dataStart, _data.Length - dataStart)).ToArray();
-                        yield return new PdfImageStream
-                        {
-                            Index = imgIdx++,
-                            Width = widthTok,
-                            Height = heightTok,
-                            Filter = filter ?? String.Empty,
-                            RawData = rawBytes,
-                        };
+                        yield return new PdfImage { Index = imgIdx++, Width = widthTok, Height = heightTok, Filter = filter ?? String.Empty, RawData = rawBytes };
                         pos = dataEnd + 9;
                         continue;
                     }
@@ -176,6 +778,97 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
             }
             pos = dictEnd + 2;
         }
+    }
+
+    /// <summary>读取整个 PDF 文档为 PdfDocument 数据模型</summary>
+    /// <returns>包含元数据、页面和书签信息的 PdfDocument</returns>
+    public PdfDocument ReadDocument()
+    {
+        var meta = ReadMetadata();
+        var doc = new PdfDocument { Metadata = meta };
+
+        // 读取页面信息
+        var pageObjNums = GetPageObjectNumbers();
+        for (var i = 0; i < pageObjNums.Count; i++)
+        {
+            var pageObjNum = pageObjNums[i];
+            var pageObj = PdfObjectParser.ReadObject(_data, XRefTable!, pageObjNum);
+            if (pageObj is not DictObj pageDictObj) continue;
+
+            var pageDict = pageDictObj.Value;
+            var page = new PdfPage();
+
+            // MediaBox
+            if (pageDict.TryGetValue("MediaBox", out var mbVal) && mbVal is PdfArray mb && mb.Items.Count >= 4)
+            {
+                page.Width = ((PdfNumber)mb.Items[2]).Value;
+                page.Height = ((PdfNumber)mb.Items[3]).Value;
+            }
+
+            // Rotate
+            if (pageDict.TryGetValue("Rotate", out var rotVal) && rotVal is PdfNumber rn)
+                page.Rotation = (Int32)rn.Value;
+
+            // 提取该页文本块（带坐标）
+            page.TextBlocks = GetPageTextBlocks(i);
+
+            doc.Pages.Add(page);
+        }
+
+        // 读取书签大纲（/Outlines）
+        if (XRefTable!.Trailer.TryGetValue("Root", out var rootVal2) && rootVal2 is Ref rootRef2)
+        {
+            var catalogObj2 = PdfObjectParser.ReadObject(_data, XRefTable, rootRef2.ObjNum);
+            if (catalogObj2 is DictObj catDict2 &&
+                catDict2.Value.TryGetValue("Outlines", out var outVal) && outVal is Ref outRef)
+            {
+                var outlinesObj = PdfObjectParser.ReadObject(_data, XRefTable, outRef.ObjNum);
+                if (outlinesObj is DictObj outDict)
+                {
+                    if (outDict.Value.TryGetValue("First", out var firstVal) && firstVal is Ref firstRef)
+                        ReadBookmarkTree(firstRef.ObjNum, doc.Bookmarks);
+                }
+            }
+        }
+
+        return doc;
+    }
+
+    /// <summary>递归读取书签树</summary>
+    private void ReadBookmarkTree(Int32 objNum, List<PdfOutline> bookmarks)
+    {
+        var obj = PdfObjectParser.ReadObject(_data, XRefTable!, objNum);
+        if (obj is not DictObj dictObj) return;
+
+        var dict = dictObj.Value;
+        var bm = new PdfOutline();
+
+        if (dict.TryGetValue("Title", out var titleVal))
+        {
+            if (titleVal is PdfString ts) bm.Title = ts.Value;
+            else if (titleVal is HexString ths) bm.Title = DecodeHexFromString(ths.Value);
+        }
+
+        // 解析 /Dest 获取目标页索引
+        if (dict.TryGetValue("Dest", out var destVal) && destVal is PdfArray destArr && destArr.Items.Count >= 1)
+        {
+            if (destArr.Items[0] is Ref pageRef)
+            {
+                var pageObjNums = GetPageObjectNumbers();
+                bm.PageIndex = pageObjNums.IndexOf(pageRef.ObjNum);
+                if (bm.PageIndex < 0) bm.PageIndex = 0;
+            }
+        }
+
+        bookmarks.Add(bm);
+
+        // 递归读取子书签（/First）
+        if (dict.TryGetValue("First", out var childVal) && childVal is Ref childRef)
+            ReadBookmarkTree(childRef.ObjNum, bm.Children);
+
+        // 读取下一个兄弟书签（/Next）
+        if (dict.TryGetValue("Next", out var nextVal) && nextVal is Ref nextRef)
+            ReadBookmarkTree(nextRef.ObjNum, bookmarks);
     }
     #endregion
 
@@ -538,7 +1231,7 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
     /// <summary>从 PDF 内容流中提取带位置信息的文本</summary>
     /// <param name="content">内容流字符串</param>
     /// <param name="results">结果列表</param>
-    private static void ExtractPositionedText(String content, List<PdfTextItem> results)
+    private static void ExtractPositionedText(String content, List<PdfText> results)
     {
         var curX = 0f;
         var curY = 0f;
@@ -575,7 +1268,7 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
                     {
                         var decoded = DecodePdfString(s);
                         if (decoded.Length > 0)
-                            results.Add(new PdfTextItem { Text = decoded, X = curX, Y = curY, FontSize = fontSize });
+                            results.Add(new PdfText { Text = decoded, X = curX, Y = curY, FontSize = fontSize });
                         i = peek + 2;
                         numStack.Clear();
                         continue;
@@ -610,7 +1303,7 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
                             SkipWhitespace(content, ref peek);
                             if (peek + 1 < content.Length && content[peek] == 'T' && content[peek + 1] == 'j')
                             {
-                                results.Add(new PdfTextItem { Text = decoded, X = curX, Y = curY, FontSize = fontSize });
+                                results.Add(new PdfText { Text = decoded, X = curX, Y = curY, FontSize = fontSize });
                                 i = peek + 2;
                                 numStack.Clear();
                                 continue;
@@ -652,7 +1345,7 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
                     }
                     var txt = arrSb.ToString();
                     if (txt.Length > 0)
-                        results.Add(new PdfTextItem { Text = txt, X = curX, Y = curY, FontSize = fontSize });
+                        results.Add(new PdfText { Text = txt, X = curX, Y = curY, FontSize = fontSize });
                     i = arrEnd + 1;
                     SkipWhitespace(content, ref i);
                     if (i + 1 < content.Length && content[i] == 'T' && content[i + 1] == 'J')
@@ -768,13 +1461,500 @@ public class PdfReader : IDisposable, ITextExtractable, IMarkdownExtractable
     }
     #endregion
 
+    #region 流解码器
+    /// <summary>解码 ASCIIHexDecode 编码的数据</summary>
+    private static Byte[] DecodeAsciiHex(Byte[] data)
+    {
+        var text = Encoding.ASCII.GetString(data);
+        var hex = new StringBuilder();
+        foreach (var c in text)
+        {
+            if (c == '>') break; // EOD
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+                hex.Append(c);
+        }
+        var h = hex.ToString();
+        if (h.Length % 2 != 0) h += "0";
+        var bytes = new Byte[h.Length / 2];
+        for (var i = 0; i < bytes.Length; i++)
+        {
+            if (!Byte.TryParse(h.Substring(i * 2, 2), NumberStyles.HexNumber, null, out bytes[i]))
+                bytes[i] = 0;
+        }
+        return bytes;
+    }
+
+    /// <summary>解码 ASCII85Decode 编码的数据</summary>
+    private static Byte[] DecodeAscii85(Byte[] data)
+    {
+        var text = Encoding.ASCII.GetString(data);
+        using var output = new MemoryStream();
+        var pos = 0;
+        while (pos < text.Length)
+        {
+            var c = text[pos];
+            if (c == '~' && pos + 1 < text.Length && text[pos + 1] == '>') break; // EOD
+
+            if (c >= '!' && c <= 'u')
+            {
+                var group = new List<Byte>(5);
+                while (group.Count < 5 && pos < text.Length)
+                {
+                    var ch = text[pos];
+                    if (ch >= '!' && ch <= 'u')
+                        group.Add((Byte)(ch - '!'));
+                    else if (ch == '~')
+                        break;
+                    else
+                    {
+                        pos++;
+                        continue;
+                    }
+                    pos++;
+                }
+
+                var n = group.Count;
+                if (n == 0) continue;
+
+                // 补到 5 字节
+                while (group.Count < 5) group.Add(84); // 'u' value
+
+                UInt32 value = 0;
+                for (var i = 0; i < 5; i++)
+                    value = value * 85 + group[i];
+
+                for (var i = 0; i < n - 1 && i < 4; i++)
+                    output.WriteByte((Byte)(value >> (24 - i * 8)));
+            }
+            else pos++;
+        }
+        return output.ToArray();
+    }
+
+    /// <summary>LZW 解码（PDF LZWDecode 过滤器）</summary>
+    /// <param name="data">LZW 编码数据</param>
+    /// <param name="earlyChange">EarlyChange 参数（PDF 默认 1）</param>
+    /// <returns>解码后的原始数据</returns>
+    /// <remarks>
+    /// PDF LZW 解码参数：
+    /// - 初始码宽 9 位
+    /// - 清除码 256，EOD 码 257
+    /// - EarlyChange=1 时在码值 511（而非 512）后增加码宽
+    /// </remarks>
+    public static Byte[] DecodeLzw(Byte[] data, Int32 earlyChange = 1)
+    {
+        if (data == null || data.Length == 0) return [];
+
+        using var output = new MemoryStream();
+        var bitPos = 0;     // 当前位位置
+        var codeSize = 9;   // 当前码宽
+        var clearCode = 256;
+        var eodCode = 257;
+        var nextCode = 258;
+        var maxCode = (1 << codeSize) - 1;
+
+        // 字典：code → byte[]（可变长度）
+        var dict = new Dictionary<Int32, Byte[]>();
+        for (var i = 0; i < 256; i++)
+            dict[i] = [(Byte)i];
+
+        Int32 prevCode = -1;
+        var firstCode = true;
+
+        while (true)
+        {
+            var code = ReadLzwBits(data, ref bitPos, codeSize);
+            if (code < 0) break; // 数据不足
+
+            if (code == eodCode) break;
+            if (code == clearCode)
+            {
+                // 重置字典
+                dict.Clear();
+                for (var i = 0; i < 256; i++)
+                    dict[i] = [(Byte)i];
+                nextCode = 258;
+                codeSize = 9;
+                maxCode = (1 << codeSize) - 1;
+                prevCode = -1;
+                firstCode = true;
+                continue;
+            }
+
+            Byte[] entry;
+            if (dict.TryGetValue(code, out var existing))
+            {
+                entry = existing;
+            }
+            else if (code == nextCode && prevCode >= 0)
+            {
+                // KwKwK 特殊情况：prev 序列 + prev 首字节
+                var prevEntry = dict[prevCode];
+                entry = new Byte[prevEntry.Length + 1];
+                Array.Copy(prevEntry, entry, prevEntry.Length);
+                entry[prevEntry.Length] = prevEntry[0];
+                dict[nextCode] = entry;
+                nextCode++;
+            }
+            else
+            {
+                // 无效码值，尝试恢复
+                break;
+            }
+
+            output.Write(entry, 0, entry.Length);
+
+            // 构建新字典条目
+            if (!firstCode && code != nextCode - 1)
+            {
+                var prevEntry = dict[prevCode];
+                var newEntry = new Byte[prevEntry.Length + 1];
+                Array.Copy(prevEntry, newEntry, prevEntry.Length);
+                newEntry[prevEntry.Length] = entry[0];
+
+                if (nextCode <= maxCode - (1 - earlyChange))
+                {
+                    dict[nextCode] = newEntry;
+                    nextCode++;
+                }
+            }
+
+            // 检查是否需要增加码宽
+            var threshold = (1 << codeSize) - earlyChange;
+            if (nextCode > threshold && codeSize < 12)
+            {
+                codeSize++;
+                maxCode = (1 << codeSize) - 1;
+            }
+
+            prevCode = code;
+            firstCode = false;
+        }
+
+        return output.ToArray();
+    }
+
+    /// <summary>从字节数组中读取指定位数的 LZW 码值</summary>
+    private static Int32 ReadLzwBits(Byte[] data, ref Int32 bitPos, Int32 numBits)
+    {
+        if (numBits <= 0 || numBits > 16) return -1;
+
+        var value = 0;
+        for (var i = 0; i < numBits; i++)
+        {
+            var byteIdx = (bitPos + i) / 8;
+            if (byteIdx >= data.Length) return -1;
+            var bitIdx = (bitPos + i) % 8;
+            if ((data[byteIdx] & (1 << bitIdx)) != 0)
+                value |= (1 << i);
+        }
+        bitPos += numBits;
+        return value;
+    }
+
+    /// <summary>RunLengthDecode（PDF RLE）解压缩</summary>
+    /// <param name="data">RLE 编码数据</param>
+    /// <returns>解码后的原始数据</returns>
+    /// <remarks>
+    /// PDF RunLength 编码：
+    /// - 字节 n (0-127): 复制接下来的 n+1 个字节原样输出
+    /// - 字节 n (128-255): 将下一个字节重复 257-n 次
+    /// - 字节 128: EOD（流结束）
+    /// </remarks>
+    public static Byte[] DecodeRunLength(Byte[] data)
+    {
+        if (data == null || data.Length == 0) return [];
+
+        using var output = new MemoryStream();
+        var pos = 0;
+        while (pos < data.Length)
+        {
+            var n = data[pos++];
+            if (n == 128) break; // EOD
+
+            if (n < 128)
+            {
+                // 复制接下来的 n+1 个字节
+                var count = n + 1;
+                if (pos + count > data.Length) count = data.Length - pos;
+                output.Write(data, pos, count);
+                pos += count;
+            }
+            else
+            {
+                // 重复下一个字节 257-n 次
+                if (pos >= data.Length) break;
+                var count = 257 - n;
+                var b = data[pos++];
+                for (var i = 0; i < count; i++)
+                    output.WriteByte(b);
+            }
+        }
+        return output.ToArray();
+    }
+
+    /// <summary>从十六进制字符串解码为文本</summary>
+    internal static String DecodeHexFromString(String hex)
+    {
+        var clean = new StringBuilder(hex.Length);
+        foreach (var c in hex)
+        {
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+                clean.Append(c);
+        }
+        var h = clean.ToString();
+        if (h.Length == 0 || h.Length % 2 != 0) return String.Empty;
+
+        var bytes = new Byte[h.Length / 2];
+        for (var j = 0; j < bytes.Length; j++)
+        {
+            if (!Byte.TryParse(h.Substring(j * 2, 2), NumberStyles.HexNumber, null, out bytes[j]))
+                return String.Empty;
+        }
+
+        // UTF-16BE 猜测
+        if (bytes.Length % 2 == 0)
+        {
+            try
+            {
+                var text = Encoding.BigEndianUnicode.GetString(bytes);
+                var printable = 0;
+                foreach (var ch in text) if (ch >= 32) printable++;
+                if (printable > 0 && printable * 2 >= text.Length) return text;
+            }
+            catch { }
+        }
+
+        try { return Encoding.GetEncoding(1252).GetString(bytes); }
+        catch { return String.Empty; }
+    }
+    #endregion
+
+    #region 附件
+    /// <summary>获取文档附件（嵌入式文件）</summary>
+    /// <returns>附件列表，每项 (文件名, 文件数据)</returns>
+    public List<(String FileName, Byte[] Data)> GetAttachments()
+    {
+        var result = new List<(String, Byte[])>();
+        if (XRefTable == null) return result;
+
+        // 查找 Catalog
+        if (!XRefTable.Trailer.TryGetValue("Root", out var rootVal) || rootVal is not Ref rootRef)
+            return result;
+
+        var catalogObj = PdfObjectParser.ReadObject(_data, XRefTable, rootRef.ObjNum);
+        if (catalogObj is not DictObj catalogDict) return result;
+
+        // 读取 /Names → /EmbeddedFiles
+        if (!catalogDict.Value.TryGetValue("Names", out var namesVal) || namesVal is not DictObj namesDict)
+            return result;
+
+        if (!namesDict.Value.TryGetValue("EmbeddedFiles", out var efVal))
+            return result;
+
+        // EmbeddedFiles 可能是内联字典（leaf node）或引用（Ref to name tree node）
+        DictObj? efLeaf = null;
+        if (efVal is DictObj efDictObj)
+        {
+            efLeaf = efDictObj;
+        }
+        else if (efVal is Ref efRef)
+        {
+            var efObj = PdfObjectParser.ReadObject(_data, XRefTable, efRef.ObjNum);
+            efLeaf = efObj as DictObj;
+        }
+        if (efLeaf == null) return result;
+
+        // 读取 /Names 数组：[name1, filespec1, name2, filespec2, ...]
+        if (!efLeaf.Value.TryGetValue("Names", out var namesArrVal) || namesArrVal is not PdfArray namesArr)
+            return result;
+
+        var items = namesArr.Items;
+        for (var i = 0; i + 1 < items.Count; i += 2)
+        {
+            var fileName = items[i] is PdfString ps ? ps.Value : items[i].ToString()?.Trim('(', ')') ?? $"file{i / 2}";
+            if (items[i + 1] is not Ref fsRef) continue;
+
+            var fsObj = PdfObjectParser.ReadObject(_data, XRefTable, fsRef.ObjNum);
+            if (fsObj is not DictObj fsDict) continue;
+
+            // 读取 /EF → /F → 流对象引用
+            if (!fsDict.Value.TryGetValue("EF", out var efVal2) || efVal2 is not DictObj efDict2)
+                continue;
+
+            if (!efDict2.Value.TryGetValue("F", out var fVal) || fVal is not Ref fRef)
+                continue;
+
+            var streamObj = PdfObjectParser.ReadObject(_data, XRefTable, fRef.ObjNum);
+            if (streamObj is not DictObj streamDict) continue;
+
+            // 手动提取流数据（ReadObject 不处理 stream/endstream）
+            var streamOffset = XRefTable!.GetOffset(fRef.ObjNum);
+            if (streamOffset < 0) continue;
+            var rawData = ReadStreamData(_data, streamOffset, streamDict.Value);
+            if (rawData != null && rawData.Length > 0)
+                result.Add((fileName, rawData));
+        }
+
+        return result;
+    }
+
+    /// <summary>从原始字节中提取 stream/endstream 之间的数据</summary>
+    private static Byte[]? ReadStreamData(Byte[] data, Int64 objOffset, PdfDict dict)
+    {
+        var text = Encoding.GetEncoding(28591).GetString(data);
+        var pos = (Int32)objOffset;
+
+        // 跳过对象头 "N G obj\n"
+        var objIdx = text.IndexOf("obj", pos, StringComparison.Ordinal);
+        if (objIdx < 0 || objIdx - pos > 30) return null;
+        pos = objIdx + 3;
+
+        // 查找 "stream" 关键字（在字典 >> 之后）
+        var streamIdx = text.IndexOf("stream", pos, StringComparison.Ordinal);
+        if (streamIdx < 0) return null;
+
+        // stream 之后是 \n 或 \r\n
+        var dataStart = streamIdx + 6;
+        if (dataStart < text.Length && text[dataStart] == '\r') dataStart++;
+        if (dataStart < text.Length && text[dataStart] == '\n') dataStart++;
+
+        // 查找 endstream
+        var endIdx = text.IndexOf("endstream", dataStart, StringComparison.Ordinal);
+        if (endIdx < 0) return null;
+
+        // endstream 之前的 \n 或 \r\n 是数据的一部分（可能没有）
+        var dataEnd = endIdx;
+        if (dataEnd > dataStart && text[dataEnd - 1] == '\n') dataEnd--;
+        if (dataEnd > dataStart && text[dataEnd - 1] == '\r') dataEnd--;
+
+        var length = dataEnd - dataStart;
+        if (length <= 0) return [];
+
+        var rawData = new Byte[length];
+        Array.Copy(data, dataStart, rawData, 0, length);
+        return DecompressStreamData(rawData, dict);
+    }
+    #endregion
+
     #region 文本提取
     /// <summary>提取纯文本</summary>
     /// <returns>纯文本字符串</returns>
     String? ITextExtractable.ExtractText() => ExtractText();
 
-    /// <summary>提取 Markdown 格式</summary>
+    /// <summary>提取 Markdown 格式（结构化 AST 序列化）</summary>
     /// <returns>Markdown 字符串</returns>
-    String? IMarkdownExtractable.ExtractMarkdown() => ExtractText();
+    String? IMarkdownExtractable.ExtractMarkdown() => ToMarkdownDocument()?.ToMarkdown();
+
+    /// <summary>提取 Markdown 文档对象（AST）</summary>
+    /// <remarks>
+    /// 结构检测（对标 MarkItDown 启发式）：按 Y 坐标聚合文本行为段落，
+    /// 字号显著大于正文基准 → 标题；每页输出 ## 标题分隔。
+    /// </remarks>
+    /// <returns>Markdown 文档对象，无内容返回 null</returns>
+    public MarkdownDocument? ToMarkdownDocument()
+    {
+        var pageCount = GetPageCount();
+        if (pageCount == 0) return TextFallback();
+
+        // 正文基准字号 = 全文档最常见字号
+        var fontSizes = new List<Single>();
+        for (var p = 0; p < pageCount; p++)
+        {
+            foreach (var tb in GetPageTextBlocks(p))
+            {
+                if (tb.FontSize > 0) fontSizes.Add(tb.FontSize);
+            }
+        }
+        var baseSize = fontSizes.GroupBy(x => Math.Round(x)).OrderByDescending(g => g.Count()).Select(g => g.Key).FirstOrDefault();
+        if (baseSize <= 0) baseSize = 12;
+
+        var doc = new MarkdownDocument();
+        var hasContent = false;
+        for (var p = 0; p < pageCount; p++)
+        {
+            var blocks = GetPageTextBlocks(p);
+            if (blocks.Count == 0) continue;
+            hasContent = true;
+
+            doc.Blocks.Add(MarkdownBlock.CreateHeading(2, [MarkdownInline.CreateText($"第 {p + 1} 页")]));
+
+            foreach (var line in GroupLines(blocks))
+            {
+                var text = MarkdownTextCleaner.Clean(line.Text);
+                if (String.IsNullOrWhiteSpace(text)) continue;
+
+                // 标题推断：字号显著大于正文基准
+                if (line.FontSize > baseSize * 1.25 && line.FontSize >= 14)
+                {
+                    var level = line.FontSize >= baseSize * 1.6 ? 3 : 4;
+                    doc.Blocks.Add(MarkdownBlockBuilder.Heading(level, text));
+                }
+                else
+                {
+                    doc.Blocks.Add(MarkdownBlockBuilder.Paragraph(text));
+                }
+            }
+        }
+        if (!hasContent) return TextFallback();
+        return doc.Blocks.Count > 0 ? doc : null;
+    }
+
+    /// <summary>回退：无法按页/文本块读取时，按行输出纯文本段落</summary>
+    /// <returns>Markdown 文档对象，无内容返回 null</returns>
+    private MarkdownDocument? TextFallback()
+    {
+        var text = ExtractText();
+        if (String.IsNullOrWhiteSpace(text)) return null;
+
+        var doc = new MarkdownDocument();
+        foreach (var line in text.Split('\n'))
+        {
+            var t = MarkdownTextCleaner.Clean(line).Trim();
+            if (String.IsNullOrWhiteSpace(t)) continue;
+            doc.Blocks.Add(MarkdownBlockBuilder.Paragraph(t));
+        }
+        return doc.Blocks.Count > 0 ? doc : null;
+    }
+
+    /// <summary>将文本块按 Y 坐标聚合为文本行（行内按 X 排序），自上而下排序</summary>
+    /// <param name="blocks">页面文本块</param>
+    /// <returns>文本行序列（文本, 最大字号, Y）</returns>
+    private static List<(String Text, Single FontSize, Single Y)> GroupLines(List<PdfText> blocks)
+    {
+        const Single yTolerance = 5f;
+        var lines = new List<(String Text, Single FontSize, Single Y)>();
+        var used = new Boolean[blocks.Count];
+        for (var i = 0; i < blocks.Count; i++)
+        {
+            if (used[i]) continue;
+            used[i] = true;
+
+            var lineItems = new List<PdfText> { blocks[i] };
+            for (var j = i + 1; j < blocks.Count; j++)
+            {
+                if (used[j]) continue;
+                if (Math.Abs(blocks[j].Y - blocks[i].Y) <= yTolerance)
+                {
+                    used[j] = true;
+                    lineItems.Add(blocks[j]);
+                }
+            }
+
+            lineItems.Sort((a, b) => a.X.CompareTo(b.X));
+            var sb = new StringBuilder();
+            var maxSize = 0f;
+            foreach (var item in lineItems)
+            {
+                sb.Append(item.Text);
+                if (item.FontSize > maxSize) maxSize = item.FontSize;
+            }
+            lines.Add((sb.ToString(), maxSize, blocks[i].Y));
+        }
+
+        // 自上而下：PDF 坐标原点在左下，Y 大者在上
+        lines.Sort((a, b) => b.Y.CompareTo(a.Y));
+        return lines;
+    }
     #endregion
 }

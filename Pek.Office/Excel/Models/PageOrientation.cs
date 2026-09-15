@@ -1,4 +1,4 @@
-﻿namespace NewLife.Office;
+﻿namespace NewLife.Office.Excel;
 
 /// <summary>页面方向</summary>
 public enum PageOrientation

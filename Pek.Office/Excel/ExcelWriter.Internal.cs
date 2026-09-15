@@ -2,7 +2,7 @@
 using System.Security;
 using NewLife.Collections;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Excel;
 
 partial class ExcelWriter
 {
@@ -18,7 +18,15 @@ partial class ExcelWriter
         }
     }
 
-    private void AddRow(String sheet, Object?[]? values, CellStyle? rowStyle = null)
+    /// <summary>将行号计数器推进到指定行（1基），用于还原源文件中的跳行/空行间隔</summary>
+    private void AdvanceToRow(String sheet, Int32 targetRowIndex1Based)
+    {
+        EnsureSheet(sheet);
+        if (_sheetRowIndex[sheet] < targetRowIndex1Based - 1)
+            _sheetRowIndex[sheet] = targetRowIndex1Based - 1;
+    }
+
+    private void AddRow(String sheet, Object?[]? values, CellFormat? rowStyle = null)
     {
         EnsureSheet(sheet);
 
@@ -31,12 +39,23 @@ partial class ExcelWriter
         for (var i = 0; i < values.Length; i++)
         {
             var val = values[i];
-            if (val == null) continue; // 缺失列：解析时自动补 null
+
+            // 空值但可能被 SetCellFormat 覆盖了样式——需要先查出样式再决定是否跳过
+            CellFormat? overrideStyle = null;
+            if (val == null)
+            {
+                if (_cellFormatOverrides.TryGetValue(sheet, out var ovDict) &&
+                    ovDict.TryGetValue((rowIndex - 1, i), out var ovStyle))
+                {
+                    overrideStyle = ovStyle;
+                }
+                if (overrideStyle == null) continue; // 无值无样式：跳过
+            }
 
             var cellRef = GetColumnName(i) + rowIndex; // A1 / B2 ...
 
             // 公式快捷路径
-            if (val is ExcelFormula fval)
+            if (val is CellFormula fval)
             {
                 var fxml = SecurityElement.Escape(fval.Formula) ?? fval.Formula;
                 sb.Append("<c r=\"").Append(cellRef).Append('"');
@@ -60,15 +79,42 @@ partial class ExcelWriter
                         break;
                 }
                 if (fType != null) sb.Append(" t=\"").Append(fType).Append('"');
+
+                // 检查公式单元格的样式覆盖
+                CellFormat? fCellStyle = null;
+                if (_cellFormatOverrides.TryGetValue(sheet, out var fOverrides) &&
+                    fOverrides.TryGetValue((rowIndex - 1, i), out var fcs))
+                {
+                    fCellStyle = fcs;
+                }
+                if (fCellStyle != null)
+                {
+                    var fNumFmtId = (Int32)NumFmtStyle.General;
+                    if (!fCellStyle.NumberFormat.IsNullOrEmpty())
+                        fNumFmtId = GetOrCreateNumFmt(fCellStyle.NumberFormat!);
+                    var fSIndex = GetOrCreateXf(fCellStyle, fNumFmtId);
+                    if (fSIndex >= 0) sb.Append(" s=\"").Append(fSIndex).Append('"');
+                }
+
                 sb.Append("><f>").Append(fxml).Append("</f><v>").Append(fInner).Append("</v></c>");
                 continue;
             }
 
             // 识别类型
-            var autoStyle = ExcelCellStyle.General;
+            var autoStyle = NumFmtStyle.General;
             String? tAttr = null; // t="s" / "b"
             String? inner = null; // <v>值</v>
             var displayLen = 0;   // 估算显示长度用于列宽
+
+            // 空值但有样式覆盖：直接写入自闭合带样式空单元格，跳过值处理
+            if (val == null && overrideStyle != null)
+            {
+                var nullSIndex = GetOrCreateXf(overrideStyle, (Int32)NumFmtStyle.General);
+                sb.Append("<c r=\"").Append(cellRef).Append('"');
+                if (nullSIndex >= 0) sb.Append(" s=\"").Append(nullSIndex).Append('"');
+                sb.Append("/>");
+                continue;
+            }
 
             switch (val)
             {
@@ -77,7 +123,7 @@ partial class ExcelWriter
                         // 百分比：形如 "12.3%" / "45%"
                         if (str.Length > 0 && str.EndsWith("%") && TryParsePercent(str, out var pct))
                         {
-                            autoStyle = ExcelCellStyle.Percent;
+                            autoStyle = NumFmtStyle.Percent;
                             inner = (pct / 100).ToString("0.##########", CultureInfo.InvariantCulture);
                             //displayLen = inner.Length + 1;
                             break;
@@ -110,7 +156,7 @@ partial class ExcelWriter
                         // Excel 序列值：1=1900/1/1（含闰年Bug），读取时减2，这里写入需补2
                         var serial = (dt - baseDate).TotalDays + 2; // 包含时间小数
                         var hasTime = dt.TimeOfDay.Ticks != 0;
-                        autoStyle = hasTime ? ExcelCellStyle.DateTime : ExcelCellStyle.Date;
+                        autoStyle = hasTime ? NumFmtStyle.DateTime : NumFmtStyle.Date;
                         inner = serial.ToString("0.###############", CultureInfo.InvariantCulture);
                         // 为避免 WPS 显示 ########，这里按常见完整格式长度估算：yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss
                         //displayLen = hasTime ? 16 - 1 : 10 - 1;
@@ -118,7 +164,7 @@ partial class ExcelWriter
                         break;
                     }
                 case TimeSpan ts:
-                    autoStyle = ExcelCellStyle.Time;
+                    autoStyle = NumFmtStyle.Time;
                     inner = ts.TotalDays.ToString("0.###############", CultureInfo.InvariantCulture);
                     //displayLen = inner.Length;
                     break;
@@ -133,7 +179,7 @@ partial class ExcelWriter
                         }
                         else
                         {
-                            autoStyle = ExcelCellStyle.Integer;
+                            autoStyle = NumFmtStyle.Integer;
                             inner = numStr; // 使用 General，避免两位截断
                         }
                         displayLen = numStr.Length < 8 ? 0 : numStr.Length;
@@ -196,25 +242,84 @@ partial class ExcelWriter
 
             // 计算最终 XF 索引
             var sIndex = -1;
-            if (rowStyle != null)
+
+            // 检查每单元格样式覆盖（0基行列）
+            CellFormat? cellStyle = null;
+            if (_cellFormatOverrides.TryGetValue(sheet, out var overrides) &&
+                overrides.TryGetValue((rowIndex - 1, i), out var css))
+            {
+                cellStyle = css;
+            }
+
+            var effectiveStyle = cellStyle ?? rowStyle;
+            if (effectiveStyle != null)
             {
                 // 用户指定了样式：合并自动检测的 numFmtId 与用户样式的字体/填充/边框/对齐
                 var numFmtId = (Int32)autoStyle;
                 // 如果用户样式指定了自定义数字格式，则覆盖自动检测
-                if (!rowStyle.NumberFormat.IsNullOrEmpty())
-                    numFmtId = GetOrCreateNumFmt(rowStyle.NumberFormat!);
-                sIndex = GetOrCreateXf(rowStyle, numFmtId);
+                if (!effectiveStyle.NumberFormat.IsNullOrEmpty())
+                    numFmtId = GetOrCreateNumFmt(effectiveStyle.NumberFormat!);
+                sIndex = GetOrCreateXf(effectiveStyle, numFmtId);
             }
             else if (tAttr == null)
             {
                 // 无用户样式、非字符串/布尔：使用内置样式
-                sIndex = Array.IndexOf(_cellStyles, autoStyle);
+                sIndex = Array.IndexOf(_cellFormats, autoStyle);
+            }
+
+            // 富文本覆盖：写 inline string <is> 结构
+            if (effectiveStyle?.RichTextRuns != null && effectiveStyle.RichTextRuns.Count > 0)
+            {
+                sb.Append("<c r=\"").Append(cellRef).Append('"');
+                if (sIndex >= 0) sb.Append(" s=\"").Append(sIndex).Append('"');
+                sb.Append(" t=\"inlineStr\"><is>");
+                foreach (var run in effectiveStyle.RichTextRuns)
+                {
+                    sb.Append("<r>");
+                    var hasRPr = run.Bold || run.Italic || run.Underline || run.Strike ||
+                                 !run.Color.IsNullOrEmpty() || run.FontSize > 0 || !run.FontName.IsNullOrEmpty();
+                    if (hasRPr)
+                    {
+                        sb.Append("<rPr>");
+                        if (run.Bold) sb.Append("<b/>");
+                        if (run.Italic) sb.Append("<i/>");
+                        if (run.Underline) sb.Append("<u/>");
+                        if (run.Strike) sb.Append("<strike/>");
+                        if (run.FontSize > 0) sb.Append("<sz val=\"").Append(run.FontSize).Append("\"/>");
+                        if (!run.Color.IsNullOrEmpty()) sb.Append("<color rgb=\"FF").Append(run.Color).Append("\"/>");
+                        if (!run.FontName.IsNullOrEmpty()) sb.Append("<rFont val=\"").Append(SecurityElement.Escape(run.FontName)).Append("\"/>");
+                        sb.Append("</rPr>");
+                    }
+                    sb.Append("<t xml:space=\"preserve\">").Append(SecurityElement.Escape(run.Text) ?? run.Text).Append("</t></r>");
+                }
+                sb.Append("</is></c>");
+                if (AutoFitColumnWidth)
+                {
+                    var rtLen = effectiveStyle.RichTextRuns.Sum(r => r.Text.Length);
+                    if (rtLen > 0)
+                    {
+                        var rtList = _sheetColWidths[sheet];
+                        while (rtList.Count <= i) rtList.Add(0);
+                        var rw = Math.Min(rtLen + 2, 80);
+                        if (rw > rtList[i]) rtList[i] = rw;
+                    }
+                }
+                continue;
             }
 
             sb.Append("<c r=\"").Append(cellRef).Append('"');
             if (tAttr != null) sb.Append(' ').Append("t=\"").Append(tAttr).Append('"');
             if (sIndex >= 0) sb.Append(' ').Append("s=\"").Append(sIndex).Append('"');
-            sb.Append("><v>").Append(inner).Append("</v></c>");
+
+            // 空值但有样式覆盖：生成自闭合空单元格（无 <v>）
+            if (val == null && overrideStyle != null)
+            {
+                sb.Append("/>");
+            }
+            else
+            {
+                sb.Append("><v>").Append(inner).Append("</v></c>");
+            }
 
             // 自动列宽
             if (AutoFitColumnWidth && displayLen > 0)

@@ -2,7 +2,7 @@ using System.IO.Compression;
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Word;
 
 /// <summary>Word 模板填充器</summary>
 /// <remarks>
@@ -185,6 +185,211 @@ public class WordTemplate
     }
     #endregion
 
+    #region 邮件合并
+    /// <summary>执行邮件合并，替换模板中的 MERGEFIELD 域显示文本</summary>
+    /// <remarks>
+    /// 扫描模板 docx 的 word/document.xml 中所有 MERGEFIELD 域代码，
+    /// 提取域名（如 "FirstName"），用 data 字典中对应值替换域的显示文本（«FieldName»）。
+    /// 保留域结构（fldChar begin/instrText/separate/end），替换仅修改 display text 部分的 &lt;w:t&gt; 内容。
+    /// 也处理 IF 条件域中的 MERGEFIELD 引用（替换为实际值后移除域结构）。
+    /// </remarks>
+    /// <param name="outputPath">输出路径</param>
+    /// <param name="data">合并域名字典（如 "FirstName" → "张三"）</param>
+    public void MailMerge(String outputPath, IDictionary<String, Object?> data)
+    {
+        using var fs = new FileStream(outputPath.GetFullPath(), FileMode.Create, FileAccess.Write, FileShare.None);
+        MailMerge(fs, data);
+    }
+
+    /// <summary>执行邮件合并，写入流</summary>
+    /// <param name="outputStream">输出流</param>
+    /// <param name="data">合并域名字典</param>
+    public void MailMerge(Stream outputStream, IDictionary<String, Object?> data)
+    {
+        var templateBytes = File.ReadAllBytes(TemplatePath);
+
+        using var srcMs = new MemoryStream(templateBytes);
+        using var srcZip = new ZipArchive(srcMs, ZipArchiveMode.Read);
+        using var dstZip = new ZipArchive(outputStream, ZipArchiveMode.Create, leaveOpen: true);
+
+        foreach (var entry in srcZip.Entries)
+        {
+            var dstEntry = dstZip.CreateEntry(entry.FullName, CompressionLevel.Fastest);
+            using var srcStream = entry.Open();
+            using var dstStream = dstEntry.Open();
+
+            if (entry.FullName.Equals("word/document.xml", StringComparison.OrdinalIgnoreCase))
+            {
+                var content = ReadAsString(srcStream);
+                content = ProcessMergeFields(content, data);
+                var bytes = Encoding.UTF8.GetBytes(content);
+                dstStream.Write(bytes, 0, bytes.Length);
+            }
+            else
+            {
+                srcStream.CopyTo(dstStream);
+            }
+        }
+    }
+
+    /// <summary>执行邮件合并，支持多条记录</summary>
+    /// <remarks>
+    /// 每条记录生成一个合并文档后追加到输出。
+    /// 首条记录直接调用单记录合并；后续记录读取模板中 word/document.xml 以外的部件（样式/页眉/页脚等）已由首条记录建立，
+    /// 仅附加 document.xml 中合并后的内容体（段落/表格节点），通过 ZIP 追加条目实现多记录合并。
+    /// </remarks>
+    /// <param name="outputPath">输出路径</param>
+    /// <param name="records">记录集合，每条记录为一个字典</param>
+    public void MailMerge(String outputPath, IEnumerable<IDictionary<String, Object?>> records)
+    {
+        using var fs = new FileStream(outputPath.GetFullPath(), FileMode.Create, FileAccess.Write, FileShare.None);
+        MailMerge(fs, records);
+    }
+
+    /// <summary>执行邮件合并多记录，写入流</summary>
+    /// <param name="outputStream">输出流</param>
+    /// <param name="records">记录集合</param>
+    public void MailMerge(Stream outputStream, IEnumerable<IDictionary<String, Object?>> records)
+    {
+        var recordList = records.ToList();
+        if (recordList.Count == 0)
+        {
+            var templateBytes2 = File.ReadAllBytes(TemplatePath);
+            outputStream.Write(templateBytes2, 0, templateBytes2.Length);
+            return;
+        }
+
+        var templateBytes = File.ReadAllBytes(TemplatePath);
+
+        using var srcMs = new MemoryStream(templateBytes);
+        using var srcZip = new ZipArchive(srcMs, ZipArchiveMode.Read);
+        using var dstZip = new ZipArchive(outputStream, ZipArchiveMode.Create, leaveOpen: true);
+
+        var docEntry = srcZip.GetEntry("word/document.xml");
+        if (docEntry == null) return;
+
+        // 缓存模板 XML（后续记录复用）
+        var templateXml = ReadAsString(docEntry.Open());
+
+        // 第一条记录：完整处理
+        var firstXml = ProcessMergeFields(templateXml, recordList[0]);
+
+        // 收集后续记录的 body 内所有 p/tbl 元素
+        var extraBodyElements = new StringBuilder();
+        for (var i = 1; i < recordList.Count; i++)
+        {
+            var recordXml = ProcessMergeFields(templateXml, recordList[i]);
+            var bodyStart = recordXml.IndexOf("<w:body>", StringComparison.Ordinal);
+            var bodyEnd = recordXml.IndexOf("</w:body>", bodyStart, StringComparison.Ordinal);
+            if (bodyStart < 0 || bodyEnd < 0) continue;
+
+            var bodyInner = recordXml[(bodyStart + "<w:body>".Length)..bodyEnd];
+
+            // 移除末尾的 sectPr（保留给第一条记录）
+            var sectPrPos = bodyInner.LastIndexOf("<w:sectPr", StringComparison.Ordinal);
+            if (sectPrPos >= 0)
+            {
+                var sectPrEnd = bodyInner.IndexOf("</w:sectPr>", sectPrPos, StringComparison.Ordinal);
+                if (sectPrEnd >= 0)
+                    bodyInner = bodyInner[..sectPrPos] + bodyInner[(sectPrEnd + "</w:sectPr>".Length)..];
+            }
+
+            extraBodyElements.Append("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
+            extraBodyElements.Append(bodyInner);
+        }
+
+        // 将额外记录内容插入第一条的 body 中（在 sectPr 或 </w:body> 之前）
+        String mergedXml;
+        if (extraBodyElements.Length > 0)
+        {
+            var bodyEndIdx = firstXml.LastIndexOf("</w:body>", StringComparison.Ordinal);
+            var sectPrIdx = firstXml.LastIndexOf("<w:sectPr", bodyEndIdx, StringComparison.Ordinal);
+            if (sectPrIdx >= 0)
+                mergedXml = firstXml[..sectPrIdx] + extraBodyElements + firstXml[sectPrIdx..];
+            else
+                mergedXml = firstXml[..bodyEndIdx] + extraBodyElements + firstXml[bodyEndIdx..];
+        }
+        else
+        {
+            mergedXml = firstXml;
+        }
+
+        // 写入 ZIP
+        foreach (var entry in srcZip.Entries)
+        {
+            var dstEntry = dstZip.CreateEntry(entry.FullName, CompressionLevel.Fastest);
+            using var dstStream = dstEntry.Open();
+
+            if (entry.FullName.Equals("word/document.xml", StringComparison.OrdinalIgnoreCase))
+            {
+                var bytes = Encoding.UTF8.GetBytes(mergedXml);
+                dstStream.Write(bytes, 0, bytes.Length);
+            }
+            else
+            {
+                using var srcStream = entry.Open();
+                srcStream.CopyTo(dstStream);
+            }
+        }
+    }
+
+    /// <summary>处理文档 XML 中的 MERGEFIELD 合并域，替换显示文本</summary>
+    /// <param name="xml">word/document.xml 原始内容</param>
+    /// <param name="data">合并域数据字典</param>
+    /// <returns>替换后的 XML</returns>
+    internal static String ProcessMergeFields(String xml, IDictionary<String, Object?> data)
+    {
+        if (data.Count == 0) return xml;
+
+        // 匹配 MERGEFIELD 域块：begin → instrText("MERGEFIELD Name") → separate → display run → end
+        // 使用非贪婪匹配，逐字段处理
+        var fieldPattern = @"<w:r[^>]*>\s*<w:fldChar\s+w:fldCharType=""begin""[^>]*/>\s*</w:r>" +
+            @"\s*<w:r[^>]*>\s*<w:instrText[^>]*>\s*MERGEFIELD\s+(\w[\w\s]*\w)\s*.*?</w:instrText>\s*</w:r>" +
+            @"\s*<w:r[^>]*>\s*<w:fldChar\s+w:fldCharType=""separate""[^>]*/>\s*</w:r>" +
+            @"(.*?)" +
+            @"<w:r[^>]*>\s*<w:fldChar\s+w:fldCharType=""end""[^>]*/>\s*</w:r>";
+
+        return Regex.Replace(xml, fieldPattern, match =>
+        {
+            var fieldName = match.Groups[1].Value.Trim();
+            var displayBlock = match.Groups[2].Value; // runs between separate and end
+
+            // 在 data 中查找对应值
+            var value = FindFieldValue(data, fieldName);
+            if (value == null) return match.Value; // 无对应值，保留原域
+
+            // 替换 display block 中的 <w:t> 文本内容
+            var escapedValue = EscapeXml(value);
+            var newDisplayBlock = Regex.Replace(displayBlock,
+                @"(<w:t[^>]*>)(.*?)(</w:t>)",
+                "$1" + escapedValue + "$3");
+
+            // 重建完整域块
+            var prefix = match.Value[..(match.Groups[2].Index - match.Index)];
+            var suffix = match.Value[(match.Groups[2].Index - match.Index + match.Groups[2].Length)..];
+            return prefix + newDisplayBlock + suffix;
+        }, RegexOptions.Singleline | RegexOptions.Compiled);
+    }
+
+    private static String? FindFieldValue(IDictionary<String, Object?> data, String fieldName)
+    {
+        // 精确匹配
+        if (data.TryGetValue(fieldName, out var val)) return Convert.ToString(val);
+
+        // 不区分大小写匹配
+        var entry = data.FirstOrDefault(kv => String.Equals(kv.Key, fieldName, StringComparison.OrdinalIgnoreCase));
+        if (!String.IsNullOrEmpty(entry.Key)) return Convert.ToString(entry.Value);
+
+        // 尝试去掉空格匹配（如 "First Name" → "FirstName"）
+        var compact = fieldName.Replace(" ", "");
+        entry = data.FirstOrDefault(kv =>
+            String.Equals(kv.Key.Replace(" ", ""), compact, StringComparison.OrdinalIgnoreCase));
+        if (!String.IsNullOrEmpty(entry.Key)) return Convert.ToString(entry.Value);
+
+        return null;
+    }
+    #endregion
+
     #region 私有方法
     private static String ReadAsString(Stream s)
     {
@@ -193,12 +398,21 @@ public class WordTemplate
         return Encoding.UTF8.GetString(ms.ToArray());
     }
 
+    /// <summary>匹配 {{Key}} 占位符（含被 run 边界拆分的情况）</summary>
+    private static readonly Regex PlaceholderRegex = new(@"\{\{(?<inner>.*?)\}\}", RegexOptions.Singleline | RegexOptions.Compiled);
+
+    /// <summary>剥离 run 边界标签（w:t / w:r / w:rPr 等），用于还原被拆分的占位符文本</summary>
+    private static readonly Regex RunBoundaryRegex = new(
+        @"</w:t>|</w:r>|<w:r[^>]*>|<w:rPr>|</w:rPr>|<w:t[^>]*>|<w:tab[^>]*>|<w:br[^>]*>|<w:proofErr[^>]*>",
+        RegexOptions.Compiled);
+
     private static String ApplyReplacements(String xml, IDictionary<String, Object?> data)
     {
-        // Word 有时将 {{Key}} 拆分在多个 w:r 中，先合并段落文本再替换
-        // 简单策略：对 xml 字符串直接做文本替换；对拆分的情况，
-        // 先将 }}...{{ 模式之间可能出现的 </w:t><w:r><w:t> 等去除
-        // 更健壮的方案：解析XML，但此处为快速实现采用字符串替换
+        // Word 有时将 {{Key}} 拆分在多个 w:r 中（例如 {{Na 与 me}} 被 run 边界隔开），
+        // 先剥离占位符区域内的 run 边界标签压缩为完整占位符，再做精确替换
+        if (data.Count > 0)
+            xml = CompressSplitPlaceholders(xml, data.Keys);
+
         foreach (var kv in data)
         {
             var placeholder = $"{{{{{kv.Key}}}}}";
@@ -206,6 +420,20 @@ public class WordTemplate
             xml = xml.Replace(placeholder, EscapeXml(value));
         }
         return xml;
+    }
+
+    /// <summary>压缩被 run 边界拆分的占位符（还原为完整占位符）</summary>
+    /// <param name="xml">document.xml 字符串</param>
+    /// <param name="keys">占位符键集合</param>
+    /// <returns>压缩后的 XML（仅当剥离 run 边界后等于某个 Key 时才压缩，避免误替换普通文本）</returns>
+    private static String CompressSplitPlaceholders(String xml, IEnumerable<String> keys)
+    {
+        var keySet = new HashSet<String>(keys, StringComparer.Ordinal);
+        return PlaceholderRegex.Replace(xml, m =>
+        {
+            var clean = RunBoundaryRegex.Replace(m.Groups["inner"].Value, "").Trim();
+            return keySet.Contains(clean) ? $"{{{{{clean}}}}}" : m.Value;
+        });
     }
 
     /// <summary>展开表格模板行；在 rowTag 行内寻找 {{#Key}} / {{/Key}} 标记并按列表数据展开</summary>

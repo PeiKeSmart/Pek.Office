@@ -2,7 +2,7 @@
 using System.Security.Cryptography;
 using System.Text;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Pdf;
 
 /// <summary>PDF 写入器</summary>
 /// <remarks>
@@ -53,6 +53,9 @@ public class PdfWriter : IDisposable
     /// <summary>是否在页脚显示页码</summary>
     public Boolean ShowPageNumbers { get; set; }
 
+    /// <summary>页码格式字符串，{page}=当前页, {total}=总页数。null 时使用默认 "- 1 -" 格式</summary>
+    public String? PageNumberFormat { get; set; }
+
     /// <summary>文档标题（写入 PDF Info 字典）</summary>
     public String? DocumentTitle { get; set; }
 
@@ -71,8 +74,21 @@ public class PdfWriter : IDisposable
     /// <summary>权限标志位（PDF 标准，-1 表示全部允许，-3904 表示允许打印/复制，-3844 表示禁止修改）</summary>
     public Int32 Permissions { get; set; } = -1;
 
+    /// <summary>加密修订版本（默认 RC4-128bit，可选 AES-128/AES-256）</summary>
+    public CipherRevision CipherRevision { get; set; } = CipherRevision.Rc4_128;
+
+    /// <summary>PDF/A 合规级别，null 表示不启用 PDF/A</summary>
+    public PdfACompliance? PdfACompliance { get; set; }
+
     /// <summary>书签列表</summary>
-    public List<PdfBookmark> Bookmarks { get; } = [];
+    public List<PdfOutline> Bookmarks { get; } = [];
+
+    /// <summary>是否对嵌入中文字体启用子集化（P08），仅保留实际使用字符，显著减小 PDF 体积</summary>
+    /// <remarks>启用后嵌入字体的 FontFile2 将替换为子集字体，需 PDF 阅读器支持子集化 TrueType。</remarks>
+    public Boolean SubsetFonts { get; set; }
+
+    /// <summary>注释列表（所有类型的页面注释）</summary>
+    public List<PdfAnnotation> Annotations { get; } = [];
     #endregion
 
     #region 私有字段
@@ -83,6 +99,12 @@ public class PdfWriter : IDisposable
     private readonly PdfFont _fontTimesBold = new("F2", "Times-Bold");
     private readonly PdfFont _fontCourier = new("F3", "Courier");
     private PdfFont? _fontCjk;
+
+    // 嵌入文件列表
+    private readonly List<(String FileName, Byte[] Data)> _embeddedFiles = [];
+
+    // 每个字体实际使用的 Unicode 码点（子集化用，P08）
+    private readonly Dictionary<PdfFont, HashSet<Int32>> _usedChars = [];
 
     // WinAnsiEncoding 在 Latin-1 之外的 CP1252 扩展字符映射（U+0080-U+009F 区段）
     private static readonly Dictionary<Char, Char> _cp1252Map = new Dictionary<Char, Char>
@@ -246,6 +268,53 @@ public class PdfWriter : IDisposable
         else
             _content.AppendLine($"({EncodePdfText(text)}) Tj");
         _content.AppendLine("ET");
+
+        // 子集化：记录该字体实际使用的字符（P08）
+        if (SubsetFonts) RecordUsedChars(font, text);
+    }
+
+    /// <summary>绘制文本（支持字符间距和词间距）</summary>
+    /// <param name="text">文本内容</param>
+    /// <param name="x">X 坐标（点）</param>
+    /// <param name="y">Y 坐标（点）</param>
+    /// <param name="characterSpacing">字符间距（点），0=默认</param>
+    /// <param name="wordSpacing">词间距（点），0=默认</param>
+    /// <param name="fontSize">字体大小（点）</param>
+    /// <param name="font">字体，null 时自动选择</param>
+    public void DrawText(String text, Single x, Single y, Single characterSpacing, Single wordSpacing, Single fontSize = 12, PdfFont? font = null)
+    {
+        EnsurePage();
+        font ??= ContainsCjk(text) ? EnsureCjkFont() : _fontHelvetica;
+        if (!font.IsCjk && ContainsCjk(text))
+            font = EnsureCjkFont();
+        _content.AppendLine("BT");
+        _content.AppendLine($"/{font.Name} {fontSize:F1} Tf");
+        if (characterSpacing != 0) _content.AppendLine($"{characterSpacing:F2} Tc");
+        if (wordSpacing != 0) _content.AppendLine($"{wordSpacing:F2} Tw");
+        _content.AppendLine($"{x:F2} {y:F2} Td");
+        if (font.IsCjk)
+            _content.AppendLine($"<{EncodeCjkHex(text)}> Tj");
+        else
+            _content.AppendLine($"({EncodePdfText(text)}) Tj");
+        _content.AppendLine("ET");
+
+        // 子集化：记录该字体实际使用的字符（P08）
+        if (SubsetFonts) RecordUsedChars(font, text);
+    }
+
+    /// <summary>记录字体实际使用的 Unicode 码点（子集化用）</summary>
+    /// <param name="font">字体</param>
+    /// <param name="text">绘制文本</param>
+    private void RecordUsedChars(PdfFont font, String text)
+    {
+        if (String.IsNullOrEmpty(text)) return;
+        if (!_usedChars.TryGetValue(font, out var set))
+        {
+            set = [];
+            _usedChars[font] = set;
+        }
+        foreach (var ch in text)
+            set.Add(ch);
     }
 
     /// <summary>创建简体中文字体（Adobe 预定义 STSong-Light，PDF 阅读器需安装 CJK 字体包）</summary>
@@ -355,6 +424,283 @@ public class PdfWriter : IDisposable
         _content.AppendLine("Q");
     }
 
+    /// <summary>绘制圆角矩形</summary>
+    /// <param name="x">左下角 X</param>
+    /// <param name="y">左下角 Y</param>
+    /// <param name="w">宽度</param>
+    /// <param name="h">高度</param>
+    /// <param name="radius">圆角半径</param>
+    /// <param name="filled">是否填充</param>
+    /// <param name="fillColorHex">填充色</param>
+    /// <param name="strokeColorHex">边框色</param>
+    /// <param name="lineWidth">边框线宽</param>
+    public void DrawRoundedRect(Single x, Single y, Single w, Single h, Single radius,
+        Boolean filled = false, String? fillColorHex = null, String? strokeColorHex = null, Single lineWidth = 0.5f)
+    {
+        if (radius <= 0 || radius * 2 > w || radius * 2 > h)
+        {
+            DrawRect(x, y, w, h, filled, fillColorHex, strokeColorHex, lineWidth);
+            return;
+        }
+
+        EnsurePage();
+        var r = radius;
+        const Single k = 0.5522847498f; // 90° 贝塞尔近似常数
+        var kc = k * r;
+
+        _content.AppendLine("q");
+        _content.AppendLine($"{lineWidth:F2} w");
+        if (strokeColorHex != null) _content.AppendLine(HexToRgbOp(strokeColorHex, false));
+        if (filled && fillColorHex != null) _content.AppendLine(HexToRgbOp(fillColorHex, true));
+
+        // 从底边左角开始，逆时针画
+        _content.Append($"{x + r:F2} {y:F2} m");                          // 底边起点
+        _content.Append($" {x + w - r:F2} {y:F2} l");                     // 底边直线
+        // 右下角圆弧
+        _content.Append($" {x + w - r + kc:F2} {y:F2} {x + w:F2} {y + r - kc:F2} {x + w:F2} {y + r:F2} c");
+        // 右边直线
+        _content.Append($" {x + w:F2} {y + h - r:F2} l");
+        // 右上角圆弧
+        _content.AppendLine($" {x + w:F2} {y + h - r + kc:F2} {x + w - r + kc:F2} {y + h:F2} {x + w - r:F2} {y + h:F2} c");
+        // 顶边直线
+        _content.Append($" {x + r:F2} {y + h:F2} l");
+        // 左上角圆弧
+        _content.Append($" {x + r - kc:F2} {y + h:F2} {x:F2} {y + h - r + kc:F2} {x:F2} {y + h - r:F2} c");
+        // 左边直线
+        _content.AppendLine($" {x:F2} {y + r:F2} l");
+        // 左下角圆弧（闭合回到起点）
+        _content.Append($" {x:F2} {y + r - kc:F2} {x + r - kc:F2} {y:F2} {x + r:F2} {y:F2} c");
+        _content.Append(filled ? (strokeColorHex != null ? " B" : " f") : " S");
+        _content.AppendLine();
+        _content.AppendLine("Q");
+    }
+
+    /// <summary>绘制椭圆（含圆）</summary>
+    /// <param name="cx">中心 X</param>
+    /// <param name="cy">中心 Y（从底部量起）</param>
+    /// <param name="rx">水平半径</param>
+    /// <param name="ry">垂直半径</param>
+    /// <param name="filled">是否填充</param>
+    /// <param name="fillColorHex">填充色（16进制 RGB）</param>
+    /// <param name="strokeColorHex">边框色</param>
+    /// <param name="lineWidth">边框线宽</param>
+    /// <remarks>使用 4 段三次贝塞尔曲线逼近椭圆</remarks>
+    public void DrawEllipse(Single cx, Single cy, Single rx, Single ry,
+        Boolean filled = false, String? fillColorHex = null, String? strokeColorHex = null, Single lineWidth = 0.5f)
+    {
+        EnsurePage();
+        // 贝塞尔控制点偏移系数 k = 4*(√2-1)/3 ≈ 0.552
+        const Single k = 0.5522847498f;
+        var kx = k * rx;
+        var ky = k * ry;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("q");
+        sb.AppendLine($"{lineWidth:F2} w");
+        if (strokeColorHex != null) sb.AppendLine(HexToRgbOp(strokeColorHex, false));
+        if (filled && fillColorHex != null) sb.AppendLine(HexToRgbOp(fillColorHex, true));
+
+        // 从 3 点钟方向开始，逆时针画 4 段贝塞尔曲线
+        sb.Append($"{cx + rx:F2} {cy:F2} m");
+        sb.AppendLine($" {cx + rx:F2} {cy + ky:F2} {cx + kx:F2} {cy + ry:F2} {cx:F2} {cy + ry:F2} c");
+        sb.Append($"{cx - kx:F2} {cy + ry:F2} {cx - rx:F2} {cy + ky:F2} {cx - rx:F2} {cy:F2} c");
+        sb.AppendLine($" {cx - rx:F2} {cy - ky:F2} {cx - kx:F2} {cy - ry:F2} {cx:F2} {cy - ry:F2} c");
+        sb.Append($"{(filled ? "f" : "S")}");
+        // 对于椭圆不需要末尾换行，上面的c和操作符已就位
+        _content.Append(sb.ToString());
+        if (filled && strokeColorHex != null)
+            _content.Append(" B");
+        _content.AppendLine();
+        _content.AppendLine("Q");
+    }
+
+    /// <summary>绘制圆弧</summary>
+    /// <param name="cx">中心 X</param>
+    /// <param name="cy">中心 Y（从底部量起）</param>
+    /// <param name="r">半径</param>
+    /// <param name="startAngle">起始角度（度，0=3点钟方向，逆时针）</param>
+    /// <param name="endAngle">结束角度（度）</param>
+    /// <param name="strokeColorHex">线条颜色（16进制 RGB）</param>
+    /// <param name="lineWidth">线宽</param>
+    /// <remarks>使用三次贝塞尔曲线分段逼近圆弧，每段 ≤ 90°</remarks>
+    public void DrawArc(Single cx, Single cy, Single r, Single startAngle, Single endAngle,
+        String? strokeColorHex = null, Single lineWidth = 0.5f)
+    {
+        // 规范化角度差（确保逆时针且不超过 360°）
+        var sweep = endAngle - startAngle;
+        while (sweep <= 0) sweep += 360;
+        if (sweep > 360) sweep = 360;
+
+        EnsurePage();
+        var sb = new StringBuilder();
+        sb.AppendLine("q");
+        sb.AppendLine($"{lineWidth:F2} w");
+        if (strokeColorHex != null) sb.AppendLine(HexToRgbOp(strokeColorHex, false));
+
+        // 将弧度范围按每段 ≤ 90° 分段
+        var segCount = (Int32)Math.Ceiling(sweep / 90.0);
+        var segSweep = sweep / segCount;
+
+        // 贝塞尔魔术常数
+        const Double k = 0.5522847498;
+
+        // 第一段：moveto 起点
+        var angleRad = startAngle * Math.PI / 180.0;
+        var sx = cx + r * (Single)Math.Cos(angleRad);
+        var sy = cy + r * (Single)Math.Sin(angleRad);
+        sb.Append($"{sx:F2} {sy:F2} m");
+
+        for (var i = 0; i < segCount; i++)
+        {
+            var a1 = (startAngle + i * segSweep) * Math.PI / 180.0;
+            var a2 = (startAngle + (i + 1) * segSweep) * Math.PI / 180.0;
+            var da = a2 - a1;
+
+            // 控制点：从起点沿切线方向延伸 k*r*tan(da/2)，终点沿反向切线
+            var tanLen = (Single)(k * r * Math.Tan(da / 2.0));
+            var c1x = cx + r * (Single)Math.Cos(a1) - tanLen * (Single)Math.Sin(a1);
+            var c1y = cy + r * (Single)Math.Sin(a1) + tanLen * (Single)Math.Cos(a1);
+            var c2x = cx + r * (Single)Math.Cos(a2) + tanLen * (Single)Math.Sin(a2);
+            var c2y = cy + r * (Single)Math.Sin(a2) - tanLen * (Single)Math.Cos(a2);
+            var ex = cx + r * (Single)Math.Cos(a2);
+            var ey = cy + r * (Single)Math.Sin(a2);
+
+            sb.Append($" {c1x:F2} {c1y:F2} {c2x:F2} {c2y:F2} {ex:F2} {ey:F2} c");
+        }
+
+        sb.AppendLine(" S");
+        _content.Append(sb.ToString());
+        _content.AppendLine("Q");
+    }
+
+    /// <summary>绘制渐变矩形（垂直方向）</summary>
+    /// <param name="x">左下角 X</param>
+    /// <param name="y">左下角 Y</param>
+    /// <param name="w">宽度</param>
+    /// <param name="h">高度</param>
+    /// <param name="colorTop">顶部颜色（16进制 RGB）</param>
+    /// <param name="colorBottom">底部颜色（16进制 RGB）</param>
+    /// <param name="steps">渐变分段数（默认20，越大越平滑）</param>
+    public void DrawGradientRect(Single x, Single y, Single w, Single h,
+        String colorTop, String colorBottom, Int32 steps = 20)
+    {
+        EnsurePage();
+        var (r1, g1, b1) = HexToRgb(colorTop);
+        var (r2, g2, b2) = HexToRgb(colorBottom);
+        var stepH = h / steps;
+
+        _content.AppendLine("q");
+        for (var i = 0; i < steps; i++)
+        {
+            var t = (Single)i / Math.Max(steps - 1, 1);
+            var r = r1 + (r2 - r1) * t;
+            var g = g1 + (g2 - g1) * t;
+            var b = b1 + (b2 - b1) * t;
+            _content.AppendLine($"{r:F3} {g:F3} {b:F3} rg");
+            _content.AppendLine($"{x:F2} {y + i * stepH:F2} {w:F2} {stepH:F2} re f");
+        }
+        _content.AppendLine("Q");
+    }
+
+    /// <summary>绘制三次贝塞尔曲线</summary>
+    /// <param name="x1">起点 X</param>
+    /// <param name="y1">起点 Y（从底部量起）</param>
+    /// <param name="cp1x">第一个控制点 X</param>
+    /// <param name="cp1y">第一个控制点 Y</param>
+    /// <param name="cp2x">第二个控制点 X</param>
+    /// <param name="cp2y">第二个控制点 Y</param>
+    /// <param name="x2">终点 X</param>
+    /// <param name="y2">终点 Y</param>
+    /// <param name="strokeColorHex">线条颜色（16进制 RGB）</param>
+    /// <param name="lineWidth">线宽（点）</param>
+    public void DrawBezier(Single x1, Single y1, Single cp1x, Single cp1y,
+        Single cp2x, Single cp2y, Single x2, Single y2,
+        String? strokeColorHex = null, Single lineWidth = 0.5f)
+    {
+        EnsurePage();
+        _content.AppendLine("q");
+        _content.AppendLine($"{lineWidth:F2} w");
+        if (strokeColorHex != null) _content.AppendLine(HexToRgbOp(strokeColorHex, false));
+        _content.AppendLine($"{x1:F2} {y1:F2} m {cp1x:F2} {cp1y:F2} {cp2x:F2} {cp2y:F2} {x2:F2} {y2:F2} c S");
+        _content.AppendLine("Q");
+    }
+
+    /// <summary>设置线型为虚线（影响后续所有 Draw* 方法的线条）</summary>
+    /// <param name="dashOn">实线段长度（点）</param>
+    /// <param name="dashOff">空白段长度（点）</param>
+    /// <remarks>调用 SetLineSolid() 恢复实线</remarks>
+    public void SetLineDash(Single dashOn = 4f, Single dashOff = 3f)
+    {
+        EnsurePage();
+        _content.AppendLine($"[{dashOn:F1} {dashOff:F1}] 0 d");
+    }
+
+    /// <summary>设置线型为点线（影响后续所有 Draw* 方法的线条）</summary>
+    /// <param name="dotSize">点的大小（点），默认 1.5</param>
+    /// <param name="gapSize">点间距（点），默认 2.5</param>
+    public void SetLineDot(Single dotSize = 1.5f, Single gapSize = 2.5f)
+    {
+        EnsurePage();
+        _content.AppendLine($"[{dotSize:F1} {gapSize:F1}] 0 d");
+    }
+
+    /// <summary>恢复实线样式</summary>
+    public void SetLineSolid()
+    {
+        EnsurePage();
+        _content.AppendLine("[] 0 d");
+    }
+
+    /// <summary>设置绘图透明度（影响后续所有 Draw* 方法的填充和描边）</summary>
+    /// <param name="fillAlpha">填充不透明度（0=完全透明，1=完全不透明），-1 表示不改变</param>
+    /// <param name="strokeAlpha">描边不透明度（0=完全透明，1=完全不透明），-1 表示不改变</param>
+    /// <remarks>调用 SetOpacity(1, 1) 或 SetOpacity() 恢复完全不透明</remarks>
+    public void SetOpacity(Single fillAlpha = 1f, Single strokeAlpha = 1f)
+    {
+        EnsurePage();
+        var gsName = _ensureExtGState(CurrentPage!, fillAlpha, strokeAlpha);
+        _content.AppendLine($"/{gsName} gs");
+    }
+
+    private String _ensureExtGState(PdfPage page, Single fillAlpha, Single strokeAlpha)
+    {
+        var key = $"{fillAlpha:F2},{strokeAlpha:F2}";
+        if (page.ExtGStates.TryGetValue(key, out var name)) return name;
+        name = $"GS{page.ExtGStates.Count + 1}";
+        page.ExtGStates[key] = name;
+        return name;
+    }
+
+    /// <summary>绘制多边形</summary>
+    /// <param name="points">顶点序列（至少3个），每项为 (X, Y) 元组</param>
+    /// <param name="filled">是否填充</param>
+    /// <param name="fillColorHex">填充色（16进制 RGB）</param>
+    /// <param name="strokeColorHex">边框色</param>
+    /// <param name="lineWidth">边框线宽</param>
+    public void DrawPolygon(IEnumerable<(Single X, Single Y)> points,
+        Boolean filled = false, String? fillColorHex = null, String? strokeColorHex = null, Single lineWidth = 0.5f)
+    {
+        var pts = points.ToList();
+        if (pts.Count < 3) return;
+
+        EnsurePage();
+        var sb = new StringBuilder();
+        sb.AppendLine("q");
+        sb.AppendLine($"{lineWidth:F2} w");
+        if (strokeColorHex != null) sb.AppendLine(HexToRgbOp(strokeColorHex, false));
+        if (filled && fillColorHex != null) sb.AppendLine(HexToRgbOp(fillColorHex, true));
+
+        sb.Append($"{pts[0].X:F2} {pts[0].Y:F2} m");
+        for (var i = 1; i < pts.Count; i++)
+            sb.Append($" {pts[i].X:F2} {pts[i].Y:F2} l");
+        // 闭合路径（回到起点）
+        sb.Append(" h");
+        sb.Append(filled ? (strokeColorHex != null ? " B" : " f") : " S");
+        sb.AppendLine();
+        _content.Append(sb.ToString());
+        _content.AppendLine("Q");
+    }
+
     /// <summary>绘制表格（从当前 Y 向下追加）</summary>
     /// <param name="rows">行列数据，rows[0] 可作为表头</param>
     /// <param name="firstRowHeader">首行是否表头（加粗、灰色背景）</param>
@@ -428,6 +774,31 @@ public class PdfWriter : IDisposable
         AppendEmptyLine(4f);
     }
 
+    /// <summary>绘制表格（使用 PdfTable 结构化模型）</summary>
+    /// <param name="table">表格定义（含行/列/样式）</param>
+    /// <remarks>
+    /// 将 PdfTable 模型转换为内部行列数组后调用基础 DrawTable。
+    /// 高级特性（单元格背景色、对齐、跨列）计划在后续版本中支持。
+    /// </remarks>
+    public void DrawTable(PdfTable table)
+    {
+        if (table == null) throw new ArgumentNullException(nameof(table));
+        if (table.Rows.Count == 0) return;
+
+        // 提取行列数据
+        var rows = table.Rows.Select(r => r.Cells.Select(c => c.Text).ToArray()).ToList();
+
+        // 提取列宽（如果有）
+        Single[]? colWidths = null;
+        if (table.ColumnWidths.Length > 0)
+            colWidths = table.ColumnWidths;
+
+        // 如果有表头行标记，使用 firstRowHeader
+        var firstRowHeader = table.Rows.Count > 0 && table.Rows[0].IsHeader;
+
+        DrawTable(rows, firstRowHeader, colWidths);
+    }
+
     /// <summary>嵌入并绘制 PNG 图片</summary>
     /// <param name="imageData">图片字节（PNG 格式）</param>
     /// <param name="x">左下角 X（从底部量起）</param>
@@ -438,10 +809,40 @@ public class PdfWriter : IDisposable
     {
         EnsurePage();
         var imgName = $"Im{_imgCounter++}";
-        var (imgW, imgH) = GetPngSize(imageData);
-        CurrentPage!.Images[imgName] = (imageData, imgW, imgH, false);
+        var isJpeg = IsJpegData(imageData);
+        var (imgW, imgH) = isJpeg ? GetJpegSize(imageData) : GetPngSize(imageData);
+        CurrentPage!.Images[imgName] = (imageData, imgW, imgH, isJpeg);
         _content.AppendLine("q");
         _content.AppendLine($"{w:F2} 0 0 {h:F2} {x:F2} {y:F2} cm");
+        _content.AppendLine($"/{imgName} Do");
+        _content.AppendLine("Q");
+    }
+
+    /// <summary>绘制图片（支持旋转）</summary>
+    /// <param name="imageData">图片字节</param>
+    /// <param name="x">中心 X 坐标（点）</param>
+    /// <param name="y">中心 Y 坐标（点，PDF 坐标系原点在左下角）</param>
+    /// <param name="w">宽度（点）</param>
+    /// <param name="h">高度（点）</param>
+    /// <param name="rotationDeg">旋转角度（度，顺时针）</param>
+    public void DrawImage(Byte[] imageData, Single x, Single y, Single w, Single h, Single rotationDeg)
+    {
+        EnsurePage();
+        var imgName = $"Im{_imgCounter++}";
+        var isJpeg = IsJpegData(imageData);
+        var (imgW, imgH) = isJpeg ? GetJpegSize(imageData) : GetPngSize(imageData);
+        CurrentPage!.Images[imgName] = (imageData, imgW, imgH, isJpeg);
+        var rad = rotationDeg * Math.PI / 180.0;
+        var cos = (Single)Math.Cos(rad);
+        var sin = (Single)Math.Sin(rad);
+        // 旋转矩阵：先平移中心→旋转→缩放→还原
+        // cm: a b c d e f = cos*W, sin*W, -sin*H, cos*H, x, y
+        var a = cos * w;
+        var b = sin * w;
+        var c = -sin * h;
+        var d = cos * h;
+        _content.AppendLine("q");
+        _content.AppendLine($"{a:F2} {b:F2} {c:F2} {d:F2} {x:F2} {y:F2} cm");
         _content.AppendLine($"/{imgName} Do");
         _content.AppendLine("Q");
     }
@@ -461,6 +862,33 @@ public class PdfWriter : IDisposable
         var y = PageHeight - CurrentY - heightPt;
         DrawImage(imageData, MarginLeft, y, widthPt, heightPt);
         CurrentY += heightPt + 6f;
+    }
+
+    /// <summary>在当前页绘制 QR 码（自动生成 PNG 图片）</summary>
+    /// <param name="text">QR 码内容（URL 或短文本）</param>
+    /// <param name="x">X 坐标（点）</param>
+    /// <param name="y">Y 坐标（点，PDF 坐标系原点在左下角）</param>
+    /// <param name="sizePt">QR 码尺寸（点，正方形）</param>
+    public void DrawQRCode(String text, Single x, Single y, Single sizePt)
+    {
+        var pngBytes = PdfQRCode.Generate(text);
+        DrawImage(pngBytes, x, y, sizePt, sizePt);
+    }
+
+    /// <summary>追加 QR 码到当前页（自动跟踪 Y 位置）</summary>
+    /// <param name="text">QR 码内容</param>
+    /// <param name="sizePt">QR 码尺寸（点，正方形）</param>
+    public void AppendQRCode(String text, Single sizePt = 72f)
+    {
+        EnsurePage();
+        if (CurrentY + sizePt > PageHeight - MarginBottom)
+        {
+            EndPage();
+            BeginPage();
+        }
+        var y = PageHeight - CurrentY - sizePt;
+        DrawQRCode(text, MarginLeft, y, sizePt);
+        CurrentY += sizePt + 6f;
     }
 
     /// <summary>在当前页面添加超链接注释区域</summary>
@@ -485,12 +913,20 @@ public class PdfWriter : IDisposable
         AddHyperlink(MarginLeft, y, ContentWidth, lineHeight, url);
     }
 
+    /// <summary>添加页面注释（便签/高亮/下划线/删除线/图章等全部类型）</summary>
+    /// <param name="annotation">注释对象（Type 决定注释类型）</param>
+    public void AddAnnotation(PdfAnnotation annotation)
+    {
+        if (annotation.PageIndex < 0) annotation.PageIndex = Pages.Count;
+        Annotations.Add(annotation);
+    }
+
     /// <summary>添加书签，指向当前（最后一）页</summary>
     /// <param name="title">书签标题</param>
     /// <returns>书签对象</returns>
-    public PdfBookmark AddBookmark(String title)
+    public PdfOutline AddBookmark(String title)
     {
-        var bm = new PdfBookmark { Title = title, PageIndex = Pages.Count };
+        var bm = new PdfOutline { Title = title, PageIndex = Pages.Count };
         Bookmarks.Add(bm);
         return bm;
     }
@@ -502,6 +938,17 @@ public class PdfWriter : IDisposable
     {
         if (pageIndex >= 0 && pageIndex < Pages.Count)
             Pages[pageIndex].Rotation = rotation / 90 * 90;
+    }
+
+    /// <summary>嵌入文件作为附件（PDF 1.4+）</summary>
+    /// <param name="fileName">文件名（显示名）</param>
+    /// <param name="data">文件二进制数据</param>
+    public void EmbedFile(String fileName, Byte[] data)
+    {
+        if (fileName.IsNullOrEmpty()) throw new ArgumentNullException(nameof(fileName));
+        if (data == null || data.Length == 0) throw new ArgumentNullException(nameof(data));
+
+        _embeddedFiles.Add((fileName, data));
     }
 
     /// <summary>将对象集合以表格形式写入 PDF</summary>
@@ -525,6 +972,122 @@ public class PdfWriter : IDisposable
     }
     #endregion
 
+    #region 表单 (AcroForm)
+    /// <summary>当前文档的表单对象（在首次调用 AddFormField 时自动创建）</summary>
+    public PdfAcroForm? Form { get; private set; }
+
+    /// <summary>添加文本框表单字段</summary>
+    /// <param name="name">字段名</param>
+    /// <param name="x">X 坐标（从左下角量起，单位磅）</param>
+    /// <param name="y">Y 坐标（从左下角量起，单位磅）</param>
+    /// <param name="width">宽度</param>
+    /// <param name="height">高度</param>
+    /// <param name="value">初始值</param>
+    /// <param name="fontSize">字号</param>
+    /// <returns>表单字段对象</returns>
+    public FormField AddTextField(String name, Single x, Single y, Single width, Single height, String? value = null, Single fontSize = 12f)
+    {
+        EnsureForm();
+        var field = new FormField
+        {
+            FullName = name,
+            FieldType = FormFieldType.Tx,
+            Value = value,
+            PageIndex = Pages.Count,
+            X = x, Y = y, Width = width, Height = height,
+            FontSize = fontSize,
+        };
+        Form!.Fields.Add(field);
+        return field;
+    }
+
+    /// <summary>添加复选框表单字段</summary>
+    /// <param name="name">字段名</param>
+    /// <param name="x">X 坐标</param>
+    /// <param name="y">Y 坐标</param>
+    /// <param name="size">复选框大小（默认 12pt）</param>
+    /// <param name="checked">初始选中状态</param>
+    /// <returns>表单字段对象</returns>
+    public FormField AddCheckBox(String name, Single x, Single y, Single size = 12f, Boolean @checked = false)
+    {
+        EnsureForm();
+        var field = new FormField
+        {
+            FullName = name,
+            FieldType = FormFieldType.Btn,
+            Value = @checked ? "/Yes" : "/Off",
+            PageIndex = Pages.Count,
+            X = x, Y = y, Width = size, Height = size,
+        };
+        Form!.Fields.Add(field);
+        return field;
+    }
+
+    /// <summary>添加下拉选择框表单字段</summary>
+    /// <param name="name">字段名</param>
+    /// <param name="x">X 坐标</param>
+    /// <param name="y">Y 坐标</param>
+    /// <param name="width">宽度</param>
+    /// <param name="height">高度</param>
+    /// <param name="options">选项列表</param>
+    /// <param name="selectedIndex">默认选中索引（-1 表示无）</param>
+    /// <returns>表单字段对象</returns>
+    public FormField AddComboBox(String name, Single x, Single y, Single width, Single height, List<String> options, Int32 selectedIndex = -1)
+    {
+        EnsureForm();
+        var field = new FormField
+        {
+            FullName = name,
+            FieldType = FormFieldType.Ch,
+            Value = selectedIndex >= 0 && selectedIndex < options.Count ? options[selectedIndex] : null,
+            PageIndex = Pages.Count,
+            X = x, Y = y, Width = width, Height = height,
+            Options = options,
+        };
+        Form!.Fields.Add(field);
+        return field;
+    }
+
+    /// <summary>添加签名字段</summary>
+    /// <param name="name">字段名</param>
+    /// <param name="x">X 坐标</param>
+    /// <param name="y">Y 坐标</param>
+    /// <param name="width">宽度</param>
+    /// <param name="height">高度</param>
+    /// <returns>表单字段对象</returns>
+    public FormField AddSignatureField(String name, Single x, Single y, Single width, Single height)
+    {
+        EnsureForm();
+        var field = new FormField
+        {
+            FullName = name,
+            FieldType = FormFieldType.Sig,
+            PageIndex = Pages.Count,
+            X = x, Y = y, Width = width, Height = height,
+        };
+        Form!.Fields.Add(field);
+        return field;
+    }
+
+    private void EnsureForm()
+    {
+        Form ??= new PdfAcroForm();
+    }
+
+    /// <summary>设置表单字段值（用于填充已有表单）</summary>
+    /// <param name="fieldName">字段名（完全限定名）</param>
+    /// <param name="value">字段值（复选框用 "/Yes" 或 "/Off"，文本框为文本内容）</param>
+    /// <returns>true 表示找到并设置了字段值</returns>
+    public Boolean SetFormFieldValue(String fieldName, String value)
+    {
+        EnsureForm();
+        var field = Form!.Fields.FirstOrDefault(f => f.FullName == fieldName);
+        if (field == null) return false;
+        field.Value = value;
+        return true;
+    }
+    #endregion
+
     #region 保存方法
     /// <summary>保存到文件</summary>
     /// <param name="path">输出路径</param>
@@ -532,6 +1095,55 @@ public class PdfWriter : IDisposable
     {
         using var fs = new FileStream(path.GetFullPath(), FileMode.Create, FileAccess.Write, FileShare.None);
         Save(fs);
+    }
+
+    /// <summary>从 PdfDocument 模型保存到文件</summary>
+    /// <param name="path">输出路径</param>
+    /// <param name="document">PDF 文档数据模型</param>
+    public void Save(String path, PdfDocument document)
+    {
+        using var fs = new FileStream(path.GetFullPath(), FileMode.Create, FileAccess.Write, FileShare.None);
+        Save(fs, document);
+    }
+
+    /// <summary>从 PdfDocument 模型保存到流</summary>
+    /// <param name="stream">目标流</param>
+    /// <param name="document">PDF 文档数据模型</param>
+    public void Save(Stream stream, PdfDocument document)
+    {
+        HeaderText       = document.HeaderText;
+        FooterText       = document.FooterText;
+        ShowPageNumbers  = document.ShowPageNumbers;
+        DocumentTitle    = document.Metadata.Title;
+        DocumentAuthor   = document.Metadata.Author;
+        DocumentSubject  = document.Metadata.Subject;
+        UserPassword     = document.UserPassword;
+        OwnerPassword    = document.OwnerPassword;
+        Permissions      = document.Permissions;
+        if (document.Bookmarks.Count > 0)
+            Bookmarks.AddRange(document.Bookmarks);
+
+        // 从 PdfDocument 模型写入页面内容
+        if (document.Pages.Count > 0)
+        {
+            foreach (var page in document.Pages)
+            {
+                PageWidth = page.Width > 0 ? page.Width : PageWidth;
+                PageHeight = page.Height > 0 ? page.Height : PageHeight;
+                BeginPage();
+
+                // 写入文本块（PDF 坐标：原点在左下角，与 DrawText 一致）
+                foreach (var tb in page.TextBlocks)
+                {
+                    if (!String.IsNullOrEmpty(tb.Text))
+                        DrawText(tb.Text, tb.X, tb.Y, tb.FontSize > 0 ? tb.FontSize : 12);
+                }
+
+                EndPage();
+            }
+        }
+
+        Save(stream);
     }
 
     /// <summary>保存到流</summary>
@@ -655,8 +1267,46 @@ public class PdfWriter : IDisposable
         if (UserPassword != null || OwnerPassword != null)
             encryptObjId = NextId();
 
+        // ── AcroForm 表单对象 ID ──
+        var acroFormObjId = 0;
+        var fieldObjIds = new List<Int32>();
+        if (Form != null && Form.Fields.Count > 0)
+        {
+            acroFormObjId = NextId();
+            // 每个字段需要一个对象（含 Kids 递归）
+            fieldObjIds = AllocateFormFieldIds(Form.Fields, NextId);
+        }
+
+        // ── 通用注释对象 ID ──
+        var annotObjIds = new List<Int32>();
+        foreach (var _ in Annotations)
+            annotObjIds.Add(NextId());
+
+        // ── PDF/A 对象 ID ──
+        var xmpMetadataObjId = 0;
+        var outputIntentObjId = 0;
+        if (PdfACompliance != null)
+        {
+            xmpMetadataObjId = NextId();
+            outputIntentObjId = NextId();
+        }
+
+        // ── 嵌入文件对象 ID ──
+        var efStreamObjIds = new Int32[_embeddedFiles.Count]; // /EmbeddedFile 流对象
+        var efSpecObjIds  = new Int32[_embeddedFiles.Count]; // /Filespec 字典对象
+        var efNamesObjId  = 0; // Name tree node 对象 ID
+        for (var i = 0; i < _embeddedFiles.Count; i++)
+        {
+            efStreamObjIds[i] = NextId();
+            efSpecObjIds[i] = NextId();
+        }
+        if (_embeddedFiles.Count > 0)
+            efNamesObjId = NextId();
+
         var totalObjs = nextId;
         while (offsets.Count < totalObjs) offsets.Add(0);
+
+        var annotPageMap = new Dictionary<Int32, List<Int32>>(); // pageObjId → [generic annot objIds]
 
         // 创建加密器
         Byte[]? fileIdBytes = null;
@@ -665,7 +1315,7 @@ public class PdfWriter : IDisposable
         {
             using var encMd5 = MD5.Create();
             fileIdBytes = encMd5.ComputeHash(latin1.GetBytes(DateTime.Now.Ticks.ToString()));
-            enc = new PdfEncryptor(UserPassword, OwnerPassword ?? UserPassword ?? String.Empty, Permissions, fileIdBytes);
+            enc = new PdfEncryptor(UserPassword, OwnerPassword ?? UserPassword ?? String.Empty, Permissions, fileIdBytes, CipherRevision);
         }
 
         String PdfStr(String text, Int32 objId)
@@ -674,11 +1324,93 @@ public class PdfWriter : IDisposable
             return enc.EncryptString(text, objId, 0);
         }
 
+        // 表单字段递归写入（局部函数，可访问 WriteObj）
+        void WriteFormFieldObjs(List<FormField> fields, List<Int32> fIds, Int32 startIdx)
+        {
+            var idx = startIdx;
+            foreach (var field in fields)
+            {
+                var objId = fIds[idx++];
+                var sb = new StringBuilder();
+                sb.Append("<< /Type /Annot /Subtype /Widget\n");
+                sb.Append($"/FT /{field.FieldType}\n");
+                sb.Append($"/T ({EscapePdfText(field.FullName)})\n");
+
+                if (field.Value != null)
+                    sb.Append($"/V ({EscapePdfText(field.Value)})\n");
+                if (field.DefaultValue != null)
+                    sb.Append($"/DV ({EscapePdfText(field.DefaultValue)})\n");
+
+                var flags = (Int32)field.Flags;
+                if (flags != 0) sb.Append($"/Ff {flags}\n");
+
+                var rect = $"[{field.X:F2} {field.Y:F2} {(field.X + field.Width):F2} {(field.Y + field.Height):F2}]";
+                sb.Append($"/Rect {rect}\n");
+                sb.Append("/Border [0 0 1]\n");
+                sb.Append($"/DA (/Helvetica {field.FontSize:F1} Tf 0 g)\n");
+
+                var pageObjId = field.PageIndex < allPages.Count ? allPages[field.PageIndex].PageObjId : 1;
+                sb.Append($"/P {pageObjId} 0 R\n");
+
+                if (field.Options.Count > 0)
+                {
+                    sb.Append("/Opt [");
+                    foreach (var opt in field.Options)
+                        sb.Append($"({EscapePdfText(opt)}) ");
+                    sb.Append("]\n");
+                }
+
+                if (field.MaxLength > 0) sb.Append($"/MaxLen {field.MaxLength}\n");
+                if (!field.Tooltip.IsNullOrEmpty())
+                    sb.Append($"/TU ({EscapePdfText(field.Tooltip!)})\n");
+
+                // 签名字段：预留 /Contents 和签名属性
+                if (field.FieldType == FormFieldType.Sig)
+                {
+                    // 预留 8KB 签名空间（十六进制编码）
+                    var sigPlaceholder = new String('0', 8192 * 2);
+                    sb.Append($"/Contents <{sigPlaceholder}>\n");
+                    sb.Append("/Filter /Adobe.PPKLite\n");
+                    sb.Append("/SubFilter /adbe.pkcs7.detached\n");
+                    sb.Append($"/ByteRange [0 0 0 0]\n");
+                }
+
+                sb.Append(">>");
+                WriteObj(objId, sb.ToString());
+
+                // 递归写入子字段
+                if (field.Kids.Count > 0)
+                    WriteFormFieldObjs(field.Kids, fIds, idx);
+            }
+        }
+
+        void CollectFormPageAnnotsInline(List<FormField> fields, List<Int32> fIds, ref Int32 fidx, Dictionary<Int32, List<Int32>> map)
+        {
+            foreach (var field in fields)
+            {
+                var objId = fIds[fidx++];
+                if (field.PageIndex >= 0 && field.PageIndex < allPages.Count)
+                {
+                    var pId = allPages[field.PageIndex].PageObjId;
+                    if (!map.ContainsKey(pId)) map[pId] = [];
+                    map[pId].Add(objId);
+                }
+                if (field.Kids.Count > 0)
+                    CollectFormPageAnnotsInline(field.Kids, fIds, ref fidx, map);
+            }
+        }
+
         // ── 写入 Catalog (obj 1) ──
         var catalogSb = new StringBuilder();
         catalogSb.Append("<< /Type /Catalog\n/Pages 2 0 R");
         if (outlineObjId > 0) catalogSb.Append($"\n/Outlines {outlineObjId} 0 R\n/PageMode /UseOutlines");
         if (encryptObjId > 0) catalogSb.Append($"\n/Encrypt {encryptObjId} 0 R");
+        if (acroFormObjId > 0) catalogSb.Append($"\n/AcroForm {acroFormObjId} 0 R");
+        if (xmpMetadataObjId > 0) catalogSb.Append($"\n/Metadata {xmpMetadataObjId} 0 R");
+        if (_embeddedFiles.Count > 0)
+        {
+            catalogSb.Append($"\n/Names << /EmbeddedFiles {efNamesObjId} 0 R >>");
+        }
         catalogSb.Append("\n>>");
         WriteObj(1, catalogSb.ToString());
 
@@ -691,11 +1423,55 @@ public class PdfWriter : IDisposable
         {
             var oHex = BitConverter.ToString(enc.OEntry).Replace("-", "");
             var uHex = BitConverter.ToString(enc.UEntry).Replace("-", "");
-            WriteObj(encryptObjId,
-                $"<< /Filter /Standard /V 2 /R 3 /Length 128\n" +
-                $"/P {enc.EncPermissions}\n" +
-                $"/O <{oHex}>\n" +
-                $"/U <{uHex}>\n>>");
+            var encSb = new StringBuilder();
+            encSb.Append("<< /Filter /Standard\n");
+
+            var r = (Int32)enc.Revision;
+            var v = r switch
+            {
+                2 => 1,
+                3 => 2,
+                4 => 4,
+                6 => 5,
+                _ => 2,
+            };
+
+            encSb.Append($"/V {v}\n/R {r}\n");
+
+            if (r >= 6)
+            {
+                // AES-256 (/R 6): 256-bit 密钥
+                encSb.Append("/Length 256\n");
+                encSb.Append($"/O <{oHex}>\n");
+                encSb.Append($"/U <{uHex}>\n");
+                if (enc.OEEntry != null)
+                    encSb.Append($"/OE <{BitConverter.ToString(enc.OEEntry).Replace("-", "")}>\n");
+                if (enc.UEEntry != null)
+                    encSb.Append($"/UE <{BitConverter.ToString(enc.UEEntry).Replace("-", "")}>\n");
+                if (enc.PermsEntry != null)
+                    encSb.Append($"/Perms <{BitConverter.ToString(enc.PermsEntry).Replace("-", "")}>\n");
+                encSb.Append("/EncryptMetadata false\n");
+            }
+            else if (r >= 4)
+            {
+                // AES-128 (/R 4): 128-bit 密钥 + EncryptMetadata
+                encSb.Append("/Length 128\n");
+                encSb.Append("/StrF /StdCF\n");
+                encSb.Append("/StmF /StdCF\n");
+                encSb.Append($"/O <{oHex}>\n");
+                encSb.Append($"/U <{uHex}>\n");
+                encSb.Append("/EncryptMetadata true\n");
+            }
+            else
+            {
+                // RC4 (/R 2/3): 40/128-bit 密钥
+                encSb.Append("/Length 128\n");
+                encSb.Append($"/O <{oHex}>\n");
+                encSb.Append($"/U <{uHex}>\n");
+            }
+
+            encSb.Append($"/P {enc.EncPermissions}\n>>");
+            WriteObj(encryptObjId, encSb.ToString());
         }
 
         // ── 写入字体对象 ──
@@ -710,17 +1486,33 @@ public class PdfWriter : IDisposable
                     // ── 嵌入 TrueType/TTC 字体 ──
                     var fontData = File.ReadAllBytes(f.FontFilePath);
                     var sfOff = GetSfOffset(fontData, f.TtcFontIndex);
-                    var (upm, ascent, descent, xMin, yMin, xMax, yMax) = ReadTtfMetrics(fontData, sfOff);
+
+                    // P08：子集化，仅保留实际使用字符（显著减小 PDF 体积）
+                    Byte[] embedData = fontData;
+                    Dictionary<UInt16, UInt16> glyphMap;
+                    if (SubsetFonts && _usedChars.TryGetValue(f, out var used) && used.Count > 0)
+                    {
+                        var (subsetBytes, subsetCmap) = TrueTypeSubsetter.Subset(fontData, sfOff, used);
+                        embedData = subsetBytes;
+                        glyphMap = subsetCmap;
+                        sfOff = 0; // 子集为单字体 TTF
+                    }
+                    else
+                    {
+                        glyphMap = ParseTtfCmap(fontData, sfOff);
+                    }
+
+                    var (upm, ascent, descent, xMin, yMin, xMax, yMax) = ReadTtfMetrics(embedData, sfOff);
                     var scale  = upm > 0 ? 1000.0 / upm : 1.0;
                     var a1000  = (Int32)(ascent  * scale);
                     var d1000  = (Int32)(descent * scale);
                     var bb     = $"[{(Int32)(xMin*scale)} {(Int32)(yMin*scale)} {(Int32)(xMax*scale)} {(Int32)(yMax*scale)}]";
 
-                    // FontFile2 流（原始字体字节）
+                    // FontFile2 流（子集化后字体字节）
                     offsets[fontFile2ObjIds[fi] - 1] = written;
-                    var ff2h = latin1.GetBytes($"{fontFile2ObjIds[fi]} 0 obj\n<< /Length {fontData.Length} /Length1 {fontData.Length} >>\nstream\n");
+                    var ff2h = latin1.GetBytes($"{fontFile2ObjIds[fi]} 0 obj\n<< /Length {embedData.Length} /Length1 {embedData.Length} >>\nstream\n");
                     WriteBytes(ff2h, 0, ff2h.Length);
-                    WriteBytes(fontData, 0, fontData.Length);
+                    WriteBytes(embedData, 0, embedData.Length);
                     WriteBytes(streamEndBytes, 0, streamEndBytes.Length);
 
                     // FontDescriptor
@@ -730,7 +1522,6 @@ public class PdfWriter : IDisposable
                         $"/CapHeight {a1000}\n/StemV 80\n/FontFile2 {fontFile2ObjIds[fi]} 0 R\n>>");
 
                     // CIDToGIDMap 流（Unicode → GlyphID，压缩以减小体积）
-                    var glyphMap = ParseTtfCmap(fontData, sfOff);
                     var ctgData  = ZlibCompress(BuildCidToGidMap(glyphMap));
                     offsets[cidToGidObjIds[fi] - 1] = written;
                     var ctgh = latin1.GetBytes($"{cidToGidObjIds[fi]} 0 obj\n<< /Length {ctgData.Length} /Filter /FlateDecode >>\nstream\n");
@@ -818,19 +1609,58 @@ public class PdfWriter : IDisposable
             }
         }
 
+        // ── 写入 PDF/A 输出意图和 XMP 元数据 ──
+        if (outputIntentObjId > 0)
+        {
+            WriteObj(outputIntentObjId,
+                $"<< /Type /OutputIntent\n/S /GTS_PDFA1\n" +
+                $"/OutputConditionIdentifier ({PdfAConstants.SrgbIecProfileIdentifier})\n" +
+                $"/RegistryName (http://www.color.org)\n" +
+                "/Info (sRGB IEC61966-2.1)\n>>");
+        }
+        if (xmpMetadataObjId > 0)
+        {
+            // PDF/A part: 1=1B, 2=2B, 3=3B
+            var compliance = (Int32)(PdfACompliance ?? Pdf.PdfACompliance.PDF_A_1B);
+            var part = compliance switch
+            {
+                (Int32)Pdf.PdfACompliance.PDF_A_2B => 2,
+                (Int32)Pdf.PdfACompliance.PDF_A_3B => 3,
+                _ => 1,
+            };
+            var xmpData = PdfAConstants.GenerateXmpMetadata(part);
+            offsets[xmpMetadataObjId - 1] = written;
+            var xmpHdr = latin1.GetBytes($"{xmpMetadataObjId} 0 obj\n<< /Type /Metadata /Subtype /XML\n/Length {xmpData.Length} >>\nstream\n");
+            WriteBytes(xmpHdr, 0, xmpHdr.Length);
+            WriteBytes(xmpData, 0, xmpData.Length);
+            WriteBytes(streamEndBytes, 0, streamEndBytes.Length);
+        }
+
         // ── 写入图片 XObject ──
         foreach (var (name, data, imgW, imgH, isJpeg) in allImages)
         {
-            var rawRgb = ExtractPngRgb(data, imgW, imgH);
+            Byte[] imgData;
+            String extraFilters;
+            if (isJpeg)
+            {
+                // JPEG: 直通 JPEG 字节，使用 DCTDecode 过滤器（无需解码/重编码）
+                imgData = data;
+                extraFilters = "\n/Filter /DCTDecode";
+            }
+            else
+            {
+                imgData = ExtractPngRgb(data, imgW, imgH);
+                extraFilters = "";
+            }
             var imgObjId = imgObjMap[name];
-            var imgData = enc != null ? enc.EncryptBytes(rawRgb, imgObjId, 0) : rawRgb;
+            var encData = enc != null ? enc.EncryptBytes(imgData, imgObjId, 0) : imgData;
             offsets[imgObjId - 1] = written;
             var imgHdr = latin1.GetBytes(
                 $"{imgObjId} 0 obj\n" +
                 $"<< /Type /XObject /Subtype /Image\n/Width {imgW} /Height {imgH}\n" +
-                $"/ColorSpace /DeviceRGB\n/BitsPerComponent 8\n/Length {imgData.Length}\n>>\nstream\n");
+                $"/ColorSpace /DeviceRGB\n/BitsPerComponent 8{extraFilters}\n/Length {encData.Length}\n>>\nstream\n");
             WriteBytes(imgHdr, 0, imgHdr.Length);
-            WriteBytes(imgData, 0, imgData.Length);
+            WriteBytes(encData, 0, encData.Length);
             var imgEnd = latin1.GetBytes("\nendstream\nendobj\n");
             WriteBytes(imgEnd, 0, imgEnd.Length);
         }
@@ -846,6 +1676,73 @@ public class PdfWriter : IDisposable
                 WriteObj(annotIds[ai],
                     $"<< /Type /Annot /Subtype /Link\n/Rect {rect}\n/Border [0 0 0]\n" +
                     $"/A << /Type /Action /S /URI /URI {PdfStr(url, annotIds[ai])} >>\n>>");
+            }
+        }
+
+        // ── 写入通用注释对象 ──
+        for (var ai = 0; ai < Annotations.Count; ai++)
+        {
+            var ann = Annotations[ai];
+            var objId = annotObjIds[ai];
+
+            var subtype = ann.Type switch
+            {
+                PdfAnnotationType.Link => "Link",
+                PdfAnnotationType.Text => "Text",
+                PdfAnnotationType.Highlight => "Highlight",
+                PdfAnnotationType.Underline => "Underline",
+                PdfAnnotationType.StrikeOut => "StrikeOut",
+                PdfAnnotationType.FreeText => "FreeText",
+                PdfAnnotationType.Square => "Square",
+                PdfAnnotationType.Circle => "Circle",
+                PdfAnnotationType.Line => "Line",
+                PdfAnnotationType.Stamp => "Stamp",
+                PdfAnnotationType.Caret => "Caret",
+                PdfAnnotationType.Polygon => "Polygon",
+                PdfAnnotationType.PolyLine => "PolyLine",
+                PdfAnnotationType.Squiggly => "Squiggly",
+                _ => "Text",
+            };
+
+            var rect = $"[{ann.X:F2} {ann.Y:F2} {(ann.X + ann.Width):F2} {(ann.Y + ann.Height):F2}]";
+            var sb = new StringBuilder();
+            sb.Append($"<< /Type /Annot /Subtype /{subtype}\n/Rect {rect}\n");
+
+            if (ann.Type == PdfAnnotationType.Link && ann.Url != null)
+                sb.Append($"/A << /Type /Action /S /URI /URI ({EscapePdfText(ann.Url)}) >>\n");
+            else if (ann.Type == PdfAnnotationType.Link && ann.DestinationPage >= 0)
+                sb.Append($"/Dest [{allPages[Math.Min(ann.DestinationPage, allPages.Count - 1)].PageObjId} 0 R /XYZ 0 {allPages[Math.Min(ann.DestinationPage, allPages.Count - 1)].Height} 0]\n");
+
+            if (ann.Contents != null)
+                sb.Append($"/Contents ({EscapePdfText(ann.Contents)})\n");
+            if (ann.Author != null)
+                sb.Append($"/T ({EscapePdfText(ann.Author)})\n");
+            if (ann.Subject != null)
+                sb.Append($"/Subj ({EscapePdfText(ann.Subject)})\n");
+
+            // 颜色（高亮/下划线/删除线/图章等需要 /C 数组）
+            if (ann.Type is PdfAnnotationType.Highlight or PdfAnnotationType.Underline or PdfAnnotationType.StrikeOut or PdfAnnotationType.Stamp or PdfAnnotationType.Square or PdfAnnotationType.Circle)
+                sb.Append("/C [1 0.84 0]\n"); // 默认黄色
+
+            // 多边形/折线顶点坐标
+            if (ann.Vertices != null && ann.Vertices.Length >= 4 && (ann.Type is PdfAnnotationType.Polygon or PdfAnnotationType.PolyLine))
+            {
+                sb.Append("/Vertices [");
+                for (var vi = 0; vi < ann.Vertices.Length; vi++)
+                    sb.Append($" {ann.Vertices[vi]:F2}");
+                sb.Append("]\n");
+            }
+
+            sb.Append(">>");
+            WriteObj(objId, sb.ToString());
+
+            // 收集页面注释关联
+            var pageIdx = ann.PageIndex;
+            if (pageIdx >= 0 && pageIdx < allPages.Count)
+            {
+                var pId = allPages[pageIdx].PageObjId;
+                if (!annotPageMap.ContainsKey(pId)) annotPageMap[pId] = [];
+                annotPageMap[pId].Add(objId);
             }
         }
 
@@ -868,6 +1765,28 @@ public class PdfWriter : IDisposable
                 bmSb.Append($"/Dest [{pageRef} 0 R /XYZ 0 {pageSz.Height} 0]\n");
                 if (bi > 0) bmSb.Append($"/Prev {bookmarkObjIds[bi - 1]} 0 R\n");
                 if (bi < Bookmarks.Count - 1) bmSb.Append($"/Next {bookmarkObjIds[bi + 1]} 0 R\n");
+
+                // 书签样式
+                var style = 0;
+                if (bm.Italic) style |= 1;
+                if (bm.Bold) style |= 2;
+                if (style != 0) bmSb.Append($"/F {style}\n");
+
+                if (bm.Color != null)
+                {
+                    var hex = bm.Color.TrimStart('#');
+                    if (hex.Length >= 6)
+                    {
+                        var r = Convert.ToInt32(hex[..2], 16) / 255f;
+                        var g = Convert.ToInt32(hex.Substring(2, 2), 16) / 255f;
+                        var b = Convert.ToInt32(hex.Substring(4, 2), 16) / 255f;
+                        bmSb.Append($"/C [{r:F3} {g:F3} {b:F3}]\n");
+                    }
+                }
+
+                // 展开/折叠状态
+                if (!bm.Expanded && bm.Children.Count > 0) bmSb.Append("/Count 0\n");
+
                 bmSb.Append(">>");
                 WriteObj(bookmarkObjIds[bi], bmSb.ToString());
             }
@@ -884,6 +1803,53 @@ public class PdfWriter : IDisposable
             WriteObj(infoObjId, infoSb.ToString());
         }
 
+        // ── 写入嵌入文件 ──
+        for (var i = 0; i < _embeddedFiles.Count; i++)
+        {
+            var (fileName, data) = _embeddedFiles[i];
+            var specId = efSpecObjIds[i];
+            var streamId = efStreamObjIds[i];
+
+            // 嵌入文件流对象（原始字节写入）
+            offsets[streamId - 1] = written;
+            var efHeader = latin1.GetBytes($"{streamId} 0 obj\n<< /Type /EmbeddedFile /Length {data.Length} >>\nstream\n");
+            WriteBytes(efHeader, 0, efHeader.Length);
+            WriteBytes(data, 0, data.Length);
+            WriteBytes(streamEndBytes, 0, streamEndBytes.Length);
+
+            // 文件规格字典
+            WriteObj(specId, $"<< /Type /Filespec\n/F ({EscapePdfText(fileName)})\n/EF << /F {streamId} 0 R >>\n>>");
+        }
+
+        // 嵌入文件名树节点
+        if (_embeddedFiles.Count > 0)
+        {
+            var efNames = String.Join(" ", _embeddedFiles.Select((ef, i) =>
+                $"({EscapePdfText(ef.FileName)}) {efSpecObjIds[i]} 0 R"));
+            WriteObj(efNamesObjId, $"<< /Names [{efNames}] >>");
+        }
+
+        // ── 写入 AcroForm 表单字典和字段 ──
+        var formPageAnnotMap = new Dictionary<Int32, List<Int32>>(); // pageObjId → [field annot objIds]
+        if (acroFormObjId > 0 && Form != null)
+        {
+            // 写入每个字段对象
+            WriteFormFieldObjs(Form.Fields, fieldObjIds, 0);
+
+            // 构建 AcroForm 字典
+            var afSb = new StringBuilder();
+            afSb.Append("<< /Fields [");
+            afSb.Append(String.Join(" ", fieldObjIds.Select(id => $"{id} 0 R")));
+            afSb.Append("]\n");
+            if (Form.NeedAppearances) afSb.Append("/NeedAppearances true\n");
+            afSb.Append(">>");
+            WriteObj(acroFormObjId, afSb.ToString());
+
+            // 收集每个页面的表单字段注释
+            var fidx = 0;
+            CollectFormPageAnnotsInline(Form.Fields, fieldObjIds, ref fidx, formPageAnnotMap);
+        }
+
         // ── 写入页面和内容流 ──
         var needHdrFtr = HeaderText != null || FooterText != null || ShowPageNumbers;
         for (var pi = 0; pi < allPages.Count; pi++)
@@ -898,12 +1864,36 @@ public class PdfWriter : IDisposable
             resSb.Append(fontRefs);
             resSb.Append(" >>");
             if (imgRefs.Length > 0) { resSb.Append("\n/XObject << "); resSb.Append(imgRefs); resSb.Append(" >>"); }
+            // ExtGState 字典（透明度等）
+            if (page.ExtGStates.Count > 0)
+            {
+                resSb.Append("\n/ExtGState << ");
+                foreach (var kv in page.ExtGStates)
+                {
+                    var parts = kv.Key.Split(',');
+                    var fa = Single.Parse(parts[0]);
+                    var sa = Single.Parse(parts[1]);
+                    resSb.Append($"/{kv.Value} << /Type /ExtGState");
+                    if (fa < 0.999f) resSb.Append($" /ca {fa:F2}");
+                    if (sa < 0.999f) resSb.Append($" /CA {sa:F2}");
+                    resSb.Append(" >> ");
+                }
+                resSb.Append(">>");
+            }
             resSb.Append(" >>");
 
-            // 超链接注释引用
-            var annotStr = String.Empty;
-            if (pageAnnotObjIds.TryGetValue(page.PageObjId, out var annotIds2))
-                annotStr = $"\n/Annots [{String.Join(" ", annotIds2.Select(id => $"{id} 0 R"))}]";
+            // 合并超链接、表单注释和通用注释引用
+            var allAnnotIds = new List<Int32>();
+            if (pageAnnotObjIds.TryGetValue(page.PageObjId, out var linkAnnotIds))
+                allAnnotIds.AddRange(linkAnnotIds);
+            if (formPageAnnotMap.TryGetValue(page.PageObjId, out var formAnnotIds))
+                allAnnotIds.AddRange(formAnnotIds);
+            if (annotPageMap.TryGetValue(page.PageObjId, out var genAnnotIds))
+                allAnnotIds.AddRange(genAnnotIds);
+
+            var annotStr = allAnnotIds.Count > 0
+                ? $"\n/Annots [{String.Join(" ", allAnnotIds.Select(id => $"{id} 0 R"))}]"
+                : String.Empty;
 
             // 旋转
             var rotateStr = page.Rotation != 0 ? $"\n/Rotate {page.Rotation}" : String.Empty;
@@ -935,7 +1925,9 @@ public class PdfWriter : IDisposable
                     hfSb.Append($"BT /{f1Name} 9 Tf\n{MarginLeft} {ftrY:F2} Td\n({EncodePdfText(FooterText)}) Tj\nET\n");
                 if (ShowPageNumbers)
                 {
-                    var pageNumText = $"- {pi + 1} -";
+                    var pageNumText = PageNumberFormat != null
+                        ? PageNumberFormat.Replace("{page}", (pi + 1).ToString()).Replace("{total}", allPages.Count.ToString())
+                        : $"- {pi + 1} -";
                     var pgX = (page.Width - pageNumText.Length * 4f) / 2f;
                     hfSb.Append($"BT /{f1Name} 9 Tf\n{pgX:F2} {ftrY:F2} Td\n({pageNumText}) Tj\nET\n");
                 }
@@ -963,8 +1955,8 @@ public class PdfWriter : IDisposable
         var xrefSb = new StringBuilder();
         xrefSb.AppendLine("xref");
         xrefSb.AppendLine($"0 {totalObjs + 1}");
-        xrefSb.AppendLine("0000000000 65535 f ");
-        foreach (var off in offsets) xrefSb.AppendLine($"{off:D10} 00000 n ");
+        xrefSb.Append("0000000000 65535 f \n");
+        foreach (var off in offsets) xrefSb.Append($"{off:D10} 00000 n \n");
         var xrefBytes = latin1.GetBytes(xrefSb.ToString());
         WriteBytes(xrefBytes, 0, xrefBytes.Length);
 
@@ -1295,6 +2287,17 @@ public class PdfWriter : IDisposable
             : $"{r:F3} {g:F3} {b:F3} RG";
     }
 
+    /// <summary>将16进制颜色转为RGB浮点三元组（0-1）</summary>
+    private static (Single R, Single G, Single B) HexToRgb(String hex)
+    {
+        hex = hex.TrimStart('#');
+        if (hex.Length < 6) hex = "000000";
+        var r = Convert.ToInt32(hex[..2], 16) / 255f;
+        var g = Convert.ToInt32(hex.Substring(2, 2), 16) / 255f;
+        var b = Convert.ToInt32(hex.Substring(4, 2), 16) / 255f;
+        return (r, g, b);
+    }
+
     /// <summary>从 PNG 数据读取宽高（从 IHDR chunk）</summary>
     private static (Int32 Width, Int32 Height) GetPngSize(Byte[] png)
     {
@@ -1304,6 +2307,31 @@ public class PdfWriter : IDisposable
         var w = (png[16] << 24) | (png[17] << 16) | (png[18] << 8) | png[19];
         var h = (png[20] << 24) | (png[21] << 16) | (png[22] << 8) | png[23];
         return (w > 0 ? w : 1, h > 0 ? h : 1);
+    }
+
+    private static Boolean IsJpegData(Byte[] data)
+    {
+        return data.Length >= 2 && data[0] == 0xFF && data[1] == 0xD8;
+    }
+
+    private static (Int32 Width, Int32 Height) GetJpegSize(Byte[] jpeg)
+    {
+        // Scan JPEG markers for SOF0 (0xC0) or SOF2 (0xC2) frame header
+        var i = 2;
+        while (i < jpeg.Length - 8)
+        {
+            if (jpeg[i] != 0xFF) { i++; continue; }
+            var marker = jpeg[i + 1];
+            if (marker == 0xC0 || marker == 0xC2)
+            {
+                var h = (jpeg[i + 5] << 8) | jpeg[i + 6];
+                var w = (jpeg[i + 7] << 8) | jpeg[i + 8];
+                return (w, h);
+            }
+            var segLen = (jpeg[i + 2] << 8) | jpeg[i + 3];
+            i += 2 + segLen;
+        }
+        return (1, 1);
     }
 
     /// <summary>从 PNG 提取原始 RGB 字节（简化：跳过压缩，直接返回后 IDAT 内容占位）</summary>
@@ -1355,6 +2383,34 @@ public class PdfWriter : IDisposable
         var rgb = new Byte[w * h * 3];
         for (var i = 0; i < rgb.Length; i++) rgb[i] = 255; // white
         return rgb;
+    }
+    #endregion
+
+    #region 表单辅助
+    /// <summary>为表单字段树分配对象 ID</summary>
+    private static List<Int32> AllocateFormFieldIds(List<FormField> fields, Func<Int32> nextId)
+    {
+        var ids = new List<Int32>();
+        foreach (var field in fields)
+        {
+            ids.Add(nextId());
+            if (field.Kids.Count > 0)
+                ids.AddRange(AllocateFormFieldIds(field.Kids, nextId));
+        }
+        return ids;
+    }
+
+    /// <summary>转义 PDF 文本中的特殊字符（括号和反斜杠）</summary>
+    private static String EscapePdfText(String text)
+    {
+        var sb = new StringBuilder(text.Length);
+        foreach (var c in text)
+        {
+            if (c == '(' || c == ')' || c == '\\')
+                sb.Append('\\');
+            sb.Append(c);
+        }
+        return sb.ToString();
     }
     #endregion
 }

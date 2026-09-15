@@ -2,9 +2,10 @@
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
+using System.Xml;
 using NewLife.Buffers;
 
-namespace NewLife.Office;
+namespace NewLife.Office.Ppt;
 
 /// <summary>PowerPoint pptx 写入器</summary>
 /// <remarks>
@@ -22,10 +23,16 @@ public partial class PptxWriter : IDisposable
     public Int64 SlideHeight { get; set; } = 6858000;
 
     /// <summary>幻灯片集合</summary>
-    public List<PptSlide> Slides { get; } = [];
+    public List<Slide> Slides { get; } = [];
 
     /// <summary>主题强调色（6个，默认 Office 配色，可通过 SetAccentColors 修改）</summary>
     public String[] AccentColors { get; set; } = ["4F81BD", "C0504D", "9BBB59", "8064A2", "4BACC6", "F79646"];
+
+    /// <summary>全局页眉页脚设置（S13-03），null 表示不加页脚</summary>
+    public HeaderFooter? HeaderFooter { get; set; }
+
+    /// <summary>节（Section）列表（S13-04），按节组织幻灯片，null 表示不使用节</summary>
+    public List<Section>? Sections { get; set; }
     #endregion
 
     #region 私有字段
@@ -33,17 +40,55 @@ public partial class PptxWriter : IDisposable
     private Int32 _chartGlobal = 1;
     private Int32 _hlinkGlobal = 1;
     private Int32 _mediaGlobal = 1;
+    private Int32 _videoGlobal = 1;
+    private Int32 _embedGlobal = 1;
     private String? _protectionHash;
     private String? _protectionSalt;
     // 跨文件复制的原始幻灯片（S10-04）：(幻灯片XML, rels XML)
     private readonly List<(String SlideXml, String RelsXml)> _rawSlides = [];
     // 跨文件复制的媒体文件：(文件名, 字节数据)
     private readonly List<(String Name, Byte[] Data)> _rawSlideMedia = [];
+    // 跨文件复制的动态部件（图表/批注/嵌入等）：(完整路径, 字节数据)
+    private readonly List<(String Path, Byte[] Data)> _rawParts = [];
+    // 跨文件复制部件的路径重命名映射（本次复制会话内）
+    private readonly Dictionary<String, String> _rawPartMap = new(StringComparer.OrdinalIgnoreCase);
+    // 跨文件复制媒体文件名映射（旧文件名 → 新文件名，本次复制会话内）
+    private readonly Dictionary<String, String> _rawMediaMap = new(StringComparer.OrdinalIgnoreCase);
+    // 原始幻灯片中是否含批注（决定 commentAuthors 关系与内容类型）
+    private Boolean _rawHasComments;
+    // 从模板加载的母版/版式/主题（S04-Master）
+    private readonly List<PartContent> _masterContents = [];
+    private readonly List<PartContent> _layoutContents = [];
+    private readonly List<String> _layoutNames = [];
+    private String? _templateThemeXml;
+    private Byte[]? _templateThemeBytes;
+    private readonly Dictionary<String, Byte[]> _infraMedia = [];
+    // 编程式创建的母版（Phase 5：无需模板文件）
+    private readonly List<SlideMaster> _progMasters = [];
+    // 嵌入字体：文件名→字节数据（ppt/fonts/*.fntdata）
+    private readonly Dictionary<String, Byte[]> _embeddedFonts = [];
+
+    // 文档属性（docProps，S14-01/S14-02），从 Presentation.Properties 委托  
+    private DocumentProperties? _documentProperties;
+
+    /// <summary>最小有效 PNG（1×1 黑色像素，67 字节），用作视频无缩略图时的占位</summary>
+    private static readonly Byte[] MinimalPng =
+    [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+        0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0x60, 0x60, 0x60, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x01, 0x27, 0x34, 0x27, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+        0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
     #endregion
 
     #region 构造
     /// <summary>实例化写入器（默认 16:9 比例）</summary>
     public PptxWriter() { }
+
+    /// <summary>从模板 pptx 文件实例化写入器，复用模板的母版/版式/主题（S04-Master）</summary>
+    /// <param name="templatePath">模板 pptx 文件路径</param>
+    public PptxWriter(String templatePath) => LoadMaster(templatePath);
 
     /// <summary>释放资源</summary>
     public void Dispose() { GC.SuppressFinalize(this); }
@@ -51,10 +96,12 @@ public partial class PptxWriter : IDisposable
 
     #region 幻灯片方法
     /// <summary>添加新幻灯片</summary>
+    /// <param name="layoutIndex">版式索引（0起始），超出范围时自动修正到末尾版式</param>
     /// <returns>新幻灯片对象</returns>
-    public PptSlide AddSlide()
+    public Slide AddSlide(Int32 layoutIndex = 0)
     {
-        var slide = new PptSlide();
+        var maxIdx = Math.Max(0, GetLayoutCount() - 1);
+        var slide = new Slide { LayoutIndex = Math.Min(Math.Max(0, layoutIndex), maxIdx) };
         Slides.Add(slide);
         return slide;
     }
@@ -69,11 +116,11 @@ public partial class PptxWriter : IDisposable
     /// <param name="fontSize">字号（磅）</param>
     /// <param name="bold">粗体</param>
     /// <returns>文本框对象</returns>
-    public PptTextBox AddTextBox(Int32 slideIndex, String text, Double leftCm, Double topCm,
+    public TextBox AddTextBox(Int32 slideIndex, String text, Double leftCm, Double topCm,
         Double widthCm, Double heightCm, Int32 fontSize = 18, Boolean bold = false)
     {
         var slide = EnsureSlide(slideIndex);
-        var tb = new PptTextBox
+        var tb = new TextBox
         {
             Text = text,
             Left = CmToEmu(leftCm),
@@ -96,11 +143,11 @@ public partial class PptxWriter : IDisposable
     /// <param name="widthCm">宽度（厘米）</param>
     /// <param name="heightCm">高度（厘米）</param>
     /// <returns>图片对象</returns>
-    public PptImage AddImage(Int32 slideIndex, Byte[] imageData, String extension,
+    public Picture AddImage(Int32 slideIndex, Byte[] imageData, String extension,
         Double leftCm, Double topCm, Double widthCm, Double heightCm)
     {
         var slide = EnsureSlide(slideIndex);
-        var img = new PptImage
+        var img = new Picture
         {
             Data = imageData,
             Extension = extension.TrimStart('.').ToLowerInvariant(),
@@ -114,6 +161,51 @@ public partial class PptxWriter : IDisposable
         return img;
     }
 
+    /// <summary>替换幻灯片中已有图片的字节数据（S15-01）</summary>
+    /// <param name="slideIndex">幻灯片索引</param>
+    /// <param name="imageIndex">图片在幻灯片中的索引（0起始）</param>
+    /// <param name="newData">新图片字节</param>
+    /// <param name="newExtension">新扩展名（如 "png"/"jpg"），null 表示保持原扩展名</param>
+    public void ReplaceImage(Int32 slideIndex, Int32 imageIndex, Byte[] newData, String? newExtension = null)
+    {
+        var slide = EnsureSlide(slideIndex);
+        if (imageIndex < 0 || imageIndex >= slide.Images.Count)
+            throw new ArgumentOutOfRangeException(nameof(imageIndex), $"图片索引 {imageIndex} 超出范围（共 {slide.Images.Count} 张）");
+        var img = slide.Images[imageIndex];
+        img.Data = newData;
+        if (newExtension != null && newExtension.Length > 0)
+            img.Extension = newExtension.TrimStart('.').ToLowerInvariant();
+    }
+
+    /// <summary>向幻灯片添加视频/音频</summary>
+    /// <param name="slideIndex">幻灯片索引</param>
+    /// <param name="mediaData">媒体字节</param>
+    /// <param name="extension">扩展名</param>
+    /// <param name="leftCm">左边距（厘米）</param>
+    /// <param name="topCm">上边距（厘米）</param>
+    /// <param name="widthCm">宽度（厘米）</param>
+    /// <param name="heightCm">高度（厘米）</param>
+    /// <returns>视频对象</returns>
+    public Video AddVideo(Int32 slideIndex, Byte[] mediaData, String extension,
+        Double leftCm, Double topCm, Double widthCm, Double heightCm)
+    {
+        var slide = EnsureSlide(slideIndex);
+        var vid = new Video
+        {
+            Data = mediaData,
+            Extension = extension.TrimStart('.').ToLowerInvariant(),
+            Left = CmToEmu(leftCm),
+            Top = CmToEmu(topCm),
+            Width = CmToEmu(widthCm),
+            Height = CmToEmu(heightCm),
+            RelId = $"rVid{_videoGlobal}",
+            ThumbnailRelId = $"rVidThumb{_videoGlobal}",
+        };
+        _videoGlobal++;
+        slide.Videos.Add(vid);
+        return vid;
+    }
+
     /// <summary>向幻灯片添加表格</summary>
     /// <param name="slideIndex">幻灯片索引</param>
     /// <param name="rows">行列数据</param>
@@ -122,11 +214,11 @@ public partial class PptxWriter : IDisposable
     /// <param name="widthCm">宽度（厘米）</param>
     /// <param name="firstRowHeader">首行表头</param>
     /// <returns>表格对象</returns>
-    public PptTable AddTable(Int32 slideIndex, IEnumerable<String[]> rows,
+    public Table AddTable(Int32 slideIndex, IEnumerable<String[]> rows,
         Double leftCm = 1, Double topCm = 2, Double widthCm = 22, Boolean firstRowHeader = true)
     {
         var slide = EnsureSlide(slideIndex);
-        var tbl = new PptTable
+        var tbl = new Table
         {
             Left = CmToEmu(leftCm),
             Top = CmToEmu(topCm),
@@ -157,7 +249,7 @@ public partial class PptxWriter : IDisposable
     /// <param name="type">切换类型（fade/push/wipe/zoom/split/cut）</param>
     /// <param name="durationMs">时长（毫秒）</param>
     public void SetTransition(Int32 slideIndex, String type = "fade", Int32 durationMs = 500)
-        => EnsureSlide(slideIndex).Transition = new PptTransition { Type = type, DurationMs = durationMs };
+        => EnsureSlide(slideIndex).Transition = new Transition { Type = type, DurationMs = durationMs };
 
     /// <summary>设置幻灯片尺寸（厘米）</summary>
     /// <param name="widthCm">宽度（厘米，默认 16:9 = 33.87cm）</param>
@@ -191,10 +283,10 @@ public partial class PptxWriter : IDisposable
     /// <summary>复制幻灯片（浅拷贝，图片/文本框引用相同）</summary>
     /// <param name="sourceIndex">源幻灯片索引</param>
     /// <returns>新幻灯片对象</returns>
-    public PptSlide CloneSlide(Int32 sourceIndex)
+    public Slide CloneSlide(Int32 sourceIndex)
     {
         var src = EnsureSlide(sourceIndex);
-        var clone = new PptSlide { BackgroundColor = src.BackgroundColor, Notes = src.Notes };
+        var clone = new Slide { BackgroundColor = src.BackgroundColor, Notes = src.Notes };
         foreach (var tb in src.TextBoxes) clone.TextBoxes.Add(tb);
         foreach (var img in src.Images) clone.Images.Add(img);
         foreach (var tbl in src.Tables) clone.Tables.Add(tbl);
@@ -212,12 +304,12 @@ public partial class PptxWriter : IDisposable
     /// <param name="heightCm">高度（厘米）</param>
     /// <param name="fillColor">填充色（16进制 RGB）</param>
     /// <returns>图形对象</returns>
-    public PptShape AddShape(Int32 slideIndex, String shapeType,
+    public Shape AddShape(Int32 slideIndex, String shapeType,
         Double leftCm, Double topCm, Double widthCm, Double heightCm,
         String? fillColor = null)
     {
         var slide = EnsureSlide(slideIndex);
-        var sp = new PptShape
+        var sp = new Shape
         {
             ShapeType = shapeType,
             Left = CmToEmu(leftCm),
@@ -230,6 +322,44 @@ public partial class PptxWriter : IDisposable
         return sp;
     }
 
+    /// <summary>克隆指定幻灯片上的形状，返回新形状对象</summary>
+    /// <param name="slideIndex">幻灯片索引</param>
+    /// <param name="shapeIndex">形状索引</param>
+    /// <returns>克隆后的形状</returns>
+    public Shape DuplicateShape(Int32 slideIndex, Int32 shapeIndex)
+    {
+        var slide = EnsureSlide(slideIndex);
+        if (shapeIndex < 0 || shapeIndex >= slide.Shapes.Count)
+            throw new ArgumentOutOfRangeException(nameof(shapeIndex));
+
+        var src = slide.Shapes[shapeIndex];
+        var clone = new Shape
+        {
+            Id = 0, // 写入时自动分配新 ID
+            Text = src.Text,
+            ShapeType = src.ShapeType,
+            Left = src.Left,
+            Top = src.Top + CmToEmu(1.0), // 默认向下偏移 1cm 以可见区别
+            Width = src.Width,
+            Height = src.Height,
+            FillColor = src.FillColor,
+            LineColor = src.LineColor,
+            LineWidth = src.LineWidth,
+            FontSize = src.FontSize,
+            FontColor = src.FontColor,
+            Bold = src.Bold,
+            LatinFontName = src.LatinFontName,
+            EastAsianFontName = src.EastAsianFontName,
+            ComplexScriptFontName = src.ComplexScriptFontName,
+            SymbolFontName = src.SymbolFontName,
+            Rotation = src.Rotation,
+            AltText = src.AltText,
+            CornerRadius = src.CornerRadius,
+        };
+        slide.Shapes.Add(clone);
+        return clone;
+    }
+
     /// <summary>向幻灯片添加柱状图</summary>
     /// <param name="slideIndex">幻灯片索引</param>
     /// <param name="categories">分类轴标签</param>
@@ -238,7 +368,7 @@ public partial class PptxWriter : IDisposable
     /// <param name="widthCm">宽度（厘米）</param>
     /// <param name="heightCm">高度（厘米）</param>
     /// <returns>图表对象</returns>
-    public PptChart AddBarChart(Int32 slideIndex, String[] categories,
+    public Chart AddBarChart(Int32 slideIndex, String[] categories,
         Double leftCm = 2, Double topCm = 2, Double widthCm = 18, Double heightCm = 12)
         => AddChart(slideIndex, "bar", categories, leftCm, topCm, widthCm, heightCm);
 
@@ -250,9 +380,21 @@ public partial class PptxWriter : IDisposable
     /// <param name="widthCm">宽度（厘米）</param>
     /// <param name="heightCm">高度（厘米）</param>
     /// <returns>图表对象</returns>
-    public PptChart AddLineChart(Int32 slideIndex, String[] categories,
+    public Chart AddLineChart(Int32 slideIndex, String[] categories,
         Double leftCm = 2, Double topCm = 2, Double widthCm = 18, Double heightCm = 12)
         => AddChart(slideIndex, "line", categories, leftCm, topCm, widthCm, heightCm);
+
+    /// <summary>向幻灯片添加面积图</summary>
+    /// <param name="slideIndex">幻灯片索引</param>
+    /// <param name="categories">分类轴标签</param>
+    /// <param name="leftCm">左边距（厘米）</param>
+    /// <param name="topCm">上边距（厘米）</param>
+    /// <param name="widthCm">宽度（厘米）</param>
+    /// <param name="heightCm">高度（厘米）</param>
+    /// <returns>图表对象</returns>
+    public Chart AddAreaChart(Int32 slideIndex, String[] categories,
+        Double leftCm = 2, Double topCm = 2, Double widthCm = 18, Double heightCm = 12)
+        => AddChart(slideIndex, "area", categories, leftCm, topCm, widthCm, heightCm);
 
     /// <summary>向幻灯片添加饼图</summary>
     /// <param name="slideIndex">幻灯片索引</param>
@@ -262,16 +404,62 @@ public partial class PptxWriter : IDisposable
     /// <param name="widthCm">宽度（厘米）</param>
     /// <param name="heightCm">高度（厘米）</param>
     /// <returns>图表对象</returns>
-    public PptChart AddPieChart(Int32 slideIndex, String[] categories,
+    public Chart AddPieChart(Int32 slideIndex, String[] categories,
         Double leftCm = 2, Double topCm = 2, Double widthCm = 18, Double heightCm = 12)
         => AddChart(slideIndex, "pie", categories, leftCm, topCm, widthCm, heightCm);
 
-    private PptChart AddChart(Int32 slideIndex, String chartType, String[] categories,
+    /// <summary>向幻灯片添加散点图（S06 扩展）</summary>
+    /// <param name="slideIndex">幻灯片索引</param>
+    /// <param name="categories">X 轴分类标签</param>
+    /// <param name="leftCm">左边距（厘米）</param>
+    /// <param name="topCm">上边距（厘米）</param>
+    /// <param name="widthCm">宽度（厘米）</param>
+    /// <param name="heightCm">高度（厘米）</param>
+    /// <returns>图表对象</returns>
+    public Chart AddScatterChart(Int32 slideIndex, String[] categories,
+        Double leftCm = 2, Double topCm = 2, Double widthCm = 18, Double heightCm = 12)
+        => AddChart(slideIndex, "scatter", categories, leftCm, topCm, widthCm, heightCm);
+
+    /// <summary>向幻灯片添加气泡图（S06 扩展）</summary>
+    /// <param name="slideIndex">幻灯片索引</param>
+    /// <param name="categories">X 轴分类标签</param>
+    /// <param name="leftCm">左边距（厘米）</param>
+    /// <param name="topCm">上边距（厘米）</param>
+    /// <param name="widthCm">宽度（厘米）</param>
+    /// <param name="heightCm">高度（厘米）</param>
+    /// <returns>图表对象</returns>
+    public Chart AddBubbleChart(Int32 slideIndex, String[] categories,
+        Double leftCm = 2, Double topCm = 2, Double widthCm = 18, Double heightCm = 12)
+        => AddChart(slideIndex, "bubble", categories, leftCm, topCm, widthCm, heightCm);
+
+    /// <summary>向幻灯片添加雷达图</summary>
+    /// <param name="slideIndex">幻灯片索引</param>
+    /// <param name="categories">轴分类标签</param>
+    /// <param name="leftCm">左边距（厘米）</param>
+    /// <param name="topCm">上边距（厘米）</param>
+    /// <param name="widthCm">宽度（厘米）</param>
+    /// <param name="heightCm">高度（厘米）</param>
+    /// <returns>图表对象</returns>
+    public Chart AddRadarChart(Int32 slideIndex, String[] categories,
+        Double leftCm = 2, Double topCm = 2, Double widthCm = 18, Double heightCm = 12)
+        => AddChart(slideIndex, "radar", categories, leftCm, topCm, widthCm, heightCm);
+
+    /// <summary>向幻灯片添加股价图（K线/OHLC）</summary>
+    public Chart AddStockChart(Int32 slideIndex, String[] categories,
+        Double leftCm = 2, Double topCm = 2, Double widthCm = 18, Double heightCm = 12)
+        => AddChart(slideIndex, "stock", categories, leftCm, topCm, widthCm, heightCm);
+
+    /// <summary>向幻灯片添加曲面图</summary>
+    public Chart AddSurfaceChart(Int32 slideIndex, String[] categories,
+        Double leftCm = 2, Double topCm = 2, Double widthCm = 18, Double heightCm = 12)
+        => AddChart(slideIndex, "surface", categories, leftCm, topCm, widthCm, heightCm);
+
+    private Chart AddChart(Int32 slideIndex, String chartType, String[] categories,
         Double leftCm, Double topCm, Double widthCm, Double heightCm)
     {
         var slide = EnsureSlide(slideIndex);
         var chartNum = _chartGlobal++;
-        var chart = new PptChart
+        var chart = new Chart
         {
             ChartType = chartType,
             Categories = categories,
@@ -361,7 +549,7 @@ public partial class PptxWriter : IDisposable
     /// <summary>向幻灯片添加形状组（S07-02）</summary>
     /// <remarks>
     /// 组内的形状和文本框将以 <c>&lt;p:grpSp&gt;</c> 元素组合，
-    /// 可作为一个整体移动/缩放。返回 PptGroup 对象，向其 Shapes/TextBoxes 属性添加元素即可。
+    /// 可作为一个整体移动/缩放。返回 GroupShape 对象，向其 Shapes/TextBoxes 属性添加元素即可。
     /// </remarks>
     /// <param name="slideIndex">幻灯片索引（0起始）</param>
     /// <param name="leftCm">组左边距（厘米）</param>
@@ -369,11 +557,11 @@ public partial class PptxWriter : IDisposable
     /// <param name="widthCm">组宽度（厘米）</param>
     /// <param name="heightCm">组高度（厘米）</param>
     /// <returns>形状组对象</returns>
-    public PptGroup GroupShapes(Int32 slideIndex, Double leftCm, Double topCm,
+    public GroupShape GroupShapes(Int32 slideIndex, Double leftCm, Double topCm,
         Double widthCm, Double heightCm)
     {
         var slide = EnsureSlide(slideIndex);
-        var group = new PptGroup
+        var group = new GroupShape
         {
             Left = CmToEmu(leftCm),
             Top = CmToEmu(topCm),
@@ -384,7 +572,80 @@ public partial class PptxWriter : IDisposable
         return group;
     }
 
-    /// <summary>为幻灯片添加页脚文本和/或页码（S04-05）</summary>    /// <param name="slideIndex">幻灯片索引（0起始）</param>
+    /// <summary>将指定形状移至最上层（BringToFront）</summary>
+    /// <param name="slideIndex">幻灯片索引（0起始）</param>
+    /// <param name="shapeIndex">形状在 Shapes 列表中的索引</param>
+    public void BringToFront(Int32 slideIndex, Int32 shapeIndex)
+    {
+        var slide = EnsureSlide(slideIndex);
+        if (shapeIndex < 0 || shapeIndex >= slide.Shapes.Count) return;
+        var shape = slide.Shapes[shapeIndex];
+        slide.Shapes.RemoveAt(shapeIndex);
+        slide.Shapes.Add(shape);
+    }
+
+    /// <summary>将指定形状移至最底层（SendToBack）</summary>
+    /// <param name="slideIndex">幻灯片索引（0起始）</param>
+    /// <param name="shapeIndex">形状在 Shapes 列表中的索引</param>
+    public void SendToBack(Int32 slideIndex, Int32 shapeIndex)
+    {
+        var slide = EnsureSlide(slideIndex);
+        if (shapeIndex < 0 || shapeIndex >= slide.Shapes.Count) return;
+        var shape = slide.Shapes[shapeIndex];
+        slide.Shapes.RemoveAt(shapeIndex);
+        slide.Shapes.Insert(0, shape);
+    }
+
+    /// <summary>将指定形状上移一层（BringForward）</summary>
+    /// <param name="slideIndex">幻灯片索引（0起始）</param>
+    /// <param name="shapeIndex">形状在 Shapes 列表中的索引</param>
+    public void BringForward(Int32 slideIndex, Int32 shapeIndex)
+    {
+        var slide = EnsureSlide(slideIndex);
+        if (shapeIndex < 0 || shapeIndex >= slide.Shapes.Count - 1) return;
+        var shape = slide.Shapes[shapeIndex];
+        slide.Shapes.RemoveAt(shapeIndex);
+        slide.Shapes.Insert(shapeIndex + 1, shape);
+    }
+
+    /// <summary>将指定形状下移一层（SendBackward）</summary>
+    /// <param name="slideIndex">幻灯片索引（0起始）</param>
+    /// <param name="shapeIndex">形状在 Shapes 列表中的索引</param>
+    public void SendBackward(Int32 slideIndex, Int32 shapeIndex)
+    {
+        var slide = EnsureSlide(slideIndex);
+        if (shapeIndex < 1 || shapeIndex >= slide.Shapes.Count) return;
+        var shape = slide.Shapes[shapeIndex];
+        slide.Shapes.RemoveAt(shapeIndex);
+        slide.Shapes.Insert(shapeIndex - 1, shape);
+    }
+
+    /// <summary>取消组合，将组内形状释放到幻灯片顶层（保留位置）</summary>
+    /// <param name="slideIndex">幻灯片索引（0起始）</param>
+    /// <param name="groupIndex">组在 Groups 列表中的索引</param>
+    public void UngroupShapes(Int32 slideIndex, Int32 groupIndex)
+    {
+        var slide = EnsureSlide(slideIndex);
+        if (groupIndex < 0 || groupIndex >= slide.Groups.Count) return;
+        var group = slide.Groups[groupIndex];
+        // 将组内形状坐标从相对于组转换为相对于幻灯片
+        foreach (var s in group.Shapes)
+        {
+            s.Left += group.Left;
+            s.Top += group.Top;
+            slide.Shapes.Add(s);
+        }
+        foreach (var tb in group.TextBoxes)
+        {
+            tb.Left += group.Left;
+            tb.Top += group.Top;
+            slide.TextBoxes.Add(tb);
+        }
+        slide.Groups.RemoveAt(groupIndex);
+    }
+
+    /// <summary>为幻灯片添加页脚文本和/或页码（S04-05）</summary>
+    /// /// <param name="slideIndex">幻灯片索引（0起始）</param>
     /// <param name="footerText">页脚文本，null 表示不显示</param>
     /// <param name="showSlideNumber">是否在右下角显示幻灯片序号</param>
     public void SetSlideFooter(Int32 slideIndex, String? footerText = null, Boolean showSlideNumber = false)
@@ -394,7 +655,7 @@ public partial class PptxWriter : IDisposable
         var slide = Slides[slideIndex];
 
         if (footerText != null)
-            slide.TextBoxes.Add(new PptTextBox
+            slide.TextBoxes.Add(new TextBox
             {
                 Text = footerText,
                 Left = CmToEmu(1.3),
@@ -406,7 +667,7 @@ public partial class PptxWriter : IDisposable
             });
 
         if (showSlideNumber)
-            slide.TextBoxes.Add(new PptTextBox
+            slide.TextBoxes.Add(new TextBox
             {
                 Text = (slideIndex + 1).ToString(),
                 Left = SlideWidth - CmToEmu(2),
@@ -455,7 +716,8 @@ public partial class PptxWriter : IDisposable
             relsXml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
                 "<Relationship Id=\"rLayout1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout\" Target=\"../slideLayouts/slideLayout1.xml\"/></Relationships>";
         }
-        // 复制媒体文件并重命名
+        // 复制媒体文件并重命名（统一经 _rawMediaMap 记录，供动态部件引用复用）
+        _rawMediaMap.Clear();
         foreach (var entry in srcZip.Entries)
         {
             if (!entry.FullName.StartsWith("ppt/media/", StringComparison.OrdinalIgnoreCase)) continue;
@@ -464,14 +726,170 @@ public partial class PptxWriter : IDisposable
                 && slideXml.IndexOf(baseName, StringComparison.OrdinalIgnoreCase) < 0) continue;
             var ext = Path.GetExtension(baseName);
             var newName = $"m{_mediaGlobal++}{ext}";
+            _rawMediaMap[baseName] = newName;
             relsXml = relsXml.Replace($"../media/{baseName}", $"../media/{newName}");
             slideXml = slideXml.Replace($"../media/{baseName}", $"../media/{newName}");
             var buf = new MemoryStream();
             using (var es = entry.Open()) es.CopyTo(buf);
             _rawSlideMedia.Add((newName, buf.ToArray()));
         }
+        // 复制动态部件（图表/批注/嵌入等），并重写幻灯片关系目标
+        relsXml = RemapRawSlideRels(srcZip, relsXml, Slides.Count + _rawSlides.Count + 1);
         _rawSlides.Add((slideXml, relsXml));
         return Slides.Count + _rawSlides.Count - 1;
+    }
+
+    /// <summary>重映射跨文件复制幻灯片的关系中的动态部件（图表/批注/嵌入），并存入 _rawParts</summary>
+    /// <param name="srcZip">源 pptx ZIP</param>
+    /// <param name="relsXml">幻灯片关系 XML</param>
+    /// <param name="outSlideNum">输出幻灯片编号（1 起始，批注按此命名）</param>
+    /// <returns>重映射后的关系 XML</returns>
+    private String RemapRawSlideRels(ZipArchive srcZip, String relsXml, Int32 outSlideNum)
+    {
+        var doc = new XmlDocument();
+        doc.LoadXml(relsXml);
+        const String PKG = "http://schemas.openxmlformats.org/package/2006/relationships";
+        var ns = new XmlNamespaceManager(doc.NameTable);
+        ns.AddNamespace("r", PKG);
+        var modified = false;
+        foreach (XmlElement rel in doc.SelectNodes("//r:Relationship", ns)!)
+        {
+            var type = rel.GetAttribute("Type");
+            var target = rel.GetAttribute("Target");
+            // 媒体/版式/母版/主题/超链接：媒体已改名，其余保持原样
+            if (type.EndsWith("/slideLayout", StringComparison.OrdinalIgnoreCase)
+                || type.EndsWith("/slideMaster", StringComparison.OrdinalIgnoreCase)
+                || type.EndsWith("/theme", StringComparison.OrdinalIgnoreCase)
+                || type.EndsWith("/hyperlink", StringComparison.OrdinalIgnoreCase)) continue;
+
+            // 批注：按输出幻灯片编号命名
+            if (type.EndsWith("/comments", StringComparison.OrdinalIgnoreCase))
+            {
+                var newPath = $"ppt/comments/comment{outSlideNum}.xml";
+                CopyRawPart(srcZip, NormalizePartTarget(target), newPath);
+                CopyRawCommentAuthors(srcZip);
+                rel.SetAttribute("Target", $"../comments/comment{outSlideNum}.xml");
+                modified = true;
+                continue;
+            }
+
+            // 其他动态部件（图表/嵌入等）：递归复制并重命名
+            var fullPath = NormalizePartTarget(target);
+            if (_rawPartMap.ContainsKey(fullPath)) continue; // 已在本次复制中处理
+            var newPart = CopyRawPartRecursive(srcZip, fullPath);
+            rel.SetAttribute("Target", "../" + newPart[(newPart.IndexOf('/') + 1)..]);
+            modified = true;
+        }
+        if (!modified) return relsXml;
+        return SaveXml(doc);
+    }
+
+    /// <summary>复制单个动态部件字节到 _rawParts</summary>
+    /// <param name="srcZip">源 pptx ZIP</param>
+    /// <param name="srcPath">源部件路径</param>
+    /// <param name="dstPath">目标部件路径</param>
+    private void CopyRawPart(ZipArchive srcZip, String srcPath, String dstPath)
+    {
+        var entry = srcZip.GetEntry(srcPath);
+        if (entry == null) return;
+        using var ms = new MemoryStream();
+        using (var es = entry.Open()) es.CopyTo(ms);
+        _rawParts.Add((dstPath, ms.ToArray()));
+    }
+
+    /// <summary>复制批注作者部件（全局唯一），标记 _rawHasComments</summary>
+    /// <param name="srcZip">源 pptx ZIP</param>
+    private void CopyRawCommentAuthors(ZipArchive srcZip)
+    {
+        if (_rawHasComments) return;
+        const String fullPath = "ppt/comments/commentAuthors.xml";
+        if (srcZip.GetEntry(fullPath) == null) return;
+        using var ms = new MemoryStream();
+        using (var es = srcZip.GetEntry(fullPath)!.Open()) es.CopyTo(ms);
+        _rawParts.Add((fullPath, ms.ToArray()));
+        _rawHasComments = true;
+    }
+
+    /// <summary>递归复制动态部件及其关系依赖（图表→嵌入 xlsx 等），返回目标路径</summary>
+    /// <param name="srcZip">源 pptx ZIP</param>
+    /// <param name="fullPath">源部件完整路径</param>
+    /// <returns>目标部件完整路径</returns>
+    private String CopyRawPartRecursive(ZipArchive srcZip, String fullPath)
+    {
+        if (_rawPartMap.TryGetValue(fullPath, out var existing)) return existing;
+
+        var newPath = AllocateRawPartPath(fullPath);
+        _rawPartMap[fullPath] = newPath; // 先占位，防循环引用
+        CopyRawPart(srcZip, fullPath, newPath);
+
+        // 递归处理该部件的关系文件
+        var relsPath = GetRelsPath(fullPath);
+        var relsEntry = srcZip.GetEntry(relsPath);
+        if (relsEntry != null)
+        {
+            String relsXml;
+            using (var sr = new StreamReader(relsEntry.Open())) relsXml = sr.ReadToEnd();
+            var doc = new XmlDocument();
+            doc.LoadXml(relsXml);
+            const String PKG = "http://schemas.openxmlformats.org/package/2006/relationships";
+            var ns = new XmlNamespaceManager(doc.NameTable);
+            ns.AddNamespace("r", PKG);
+            var modified = false;
+            foreach (XmlElement rel in doc.SelectNodes("//r:Relationship", ns)!)
+            {
+                var type = rel.GetAttribute("Type");
+                var target = rel.GetAttribute("Target");
+                if (target.StartsWith("../media/", StringComparison.OrdinalIgnoreCase))
+                {
+                    var fname = Path.GetFileName(target);
+                    // 复用幻灯片级媒体重命名，未覆盖时新分配并复制
+                    if (!_rawMediaMap.TryGetValue(fname, out var newName))
+                    {
+                        var ext = Path.GetExtension(fname);
+                        newName = $"m{_mediaGlobal++}{ext}";
+                        _rawMediaMap[fname] = newName;
+                        var mediaEntry = srcZip.GetEntry($"ppt/media/{fname}");
+                        if (mediaEntry != null)
+                        {
+                            using var ms = new MemoryStream();
+                            using (var es = mediaEntry.Open()) es.CopyTo(ms);
+                            _rawSlideMedia.Add((newName, ms.ToArray()));
+                        }
+                    }
+                    rel.SetAttribute("Target", $"../media/{newName}");
+                    modified = true;
+                    continue;
+                }
+                if (type.EndsWith("/slideLayout", StringComparison.OrdinalIgnoreCase)
+                    || type.EndsWith("/slideMaster", StringComparison.OrdinalIgnoreCase)
+                    || type.EndsWith("/theme", StringComparison.OrdinalIgnoreCase)
+                    || type.EndsWith("/hyperlink", StringComparison.OrdinalIgnoreCase)) continue;
+                var depFull = ResolvePartPath(fullPath, target);
+                var depNew = CopyRawPartRecursive(srcZip, depFull);
+                rel.SetAttribute("Target", MakeRelative(GetDir(newPath), depNew));
+                modified = true;
+            }
+            if (modified)
+                _rawParts.Add((GetRelsPath(newPath), Encoding.UTF8.GetBytes(SaveXml(doc))));
+            else
+                CopyRawPart(srcZip, relsPath, GetRelsPath(newPath));
+        }
+        return newPath;
+    }
+
+    /// <summary>为跨文件复制部件分配目标路径（按类型重命名避免冲突）</summary>
+    /// <param name="fullPath">源部件完整路径</param>
+    /// <returns>目标部件完整路径</returns>
+    private String AllocateRawPartPath(String fullPath)
+    {
+        if (fullPath.StartsWith("ppt/charts/", StringComparison.OrdinalIgnoreCase) && fullPath.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+            return $"ppt/charts/chart{_chartGlobal++}.xml";
+        if (fullPath.StartsWith("ppt/embeddings/", StringComparison.OrdinalIgnoreCase))
+            return $"ppt/embeddings/embed{_embedGlobal++}{Path.GetExtension(fullPath)}";
+        var dir = (Path.GetDirectoryName(fullPath) ?? String.Empty).Replace('\\', '/');
+        var name = Path.GetFileNameWithoutExtension(fullPath);
+        var ext = Path.GetExtension(fullPath);
+        return $"{dir}/{name}_{_embedGlobal++}{ext}";
     }
 
     /// <summary>修改 pptx 文件中指定图表的系列数据（S10-03）</summary>
@@ -483,7 +901,7 @@ public partial class PptxWriter : IDisposable
     /// <param name="chartNumber">图表编号（ppt/charts/chart{N}.xml 的 N，从 1 开始）</param>
     /// <param name="series">新系列数据</param>
     /// <param name="outputPath">输出路径，null 时覆盖源文件</param>
-    public static void UpdateChartData(String sourcePath, Int32 chartNumber, IEnumerable<PptChartSeries> series, String? outputPath = null)
+    public static void UpdateChartData(String sourcePath, Int32 chartNumber, IEnumerable<ChartSeries> series, String? outputPath = null)
     {
         var data = File.ReadAllBytes(sourcePath.GetFullPath());
         var result = UpdateChartData(data, chartNumber, series);
@@ -496,7 +914,7 @@ public partial class PptxWriter : IDisposable
     /// <param name="chartNumber">图表编号（1 起始）</param>
     /// <param name="series">新系列数据</param>
     /// <returns>更新后的 pptx 字节数据</returns>
-    public static Byte[] UpdateChartData(Byte[] pptxData, Int32 chartNumber, IEnumerable<PptChartSeries> series)
+    public static Byte[] UpdateChartData(Byte[] pptxData, Int32 chartNumber, IEnumerable<ChartSeries> series)
     {
         var serList = series.ToList();
         var chartPath = $"ppt/charts/chart{chartNumber}.xml";
@@ -530,7 +948,7 @@ public partial class PptxWriter : IDisposable
     /// <param name="xml">原始图表 XML 字符串</param>
     /// <param name="series">新系列数据列表</param>
     /// <returns>更新后的 XML 字符串</returns>
-    private static String PatchChartXml(String xml, List<PptChartSeries> series)
+    private static String PatchChartXml(String xml, List<ChartSeries> series)
     {
         var doc = new System.Xml.XmlDocument();
         doc.LoadXml(xml);
@@ -568,10 +986,7 @@ public partial class PptxWriter : IDisposable
                 numCache.AppendChild(pt);
             }
         }
-        var sb = new StringBuilder();
-        using var sw = new System.IO.StringWriter(sb);
-        doc.Save(sw);
-        return sb.ToString();
+        return SaveXml(doc);
     }
 
     /// <summary>合并多个 pptx 文件为一个（S05-02）</summary>
@@ -596,19 +1011,42 @@ public partial class PptxWriter : IDisposable
         var slideTotal = 0;
         var mediaTotal = 0;
 
+        // 跨文件动态部件重命名：键 = "文件序号|源完整路径"，值 = 目标完整路径
+        var partMap = new Dictionary<String, String>(StringComparer.OrdinalIgnoreCase);
+        // 目标部件全局编号
+        var chartTotal = 0;
+        var notesTotal = 0;
+        var notesMasterTotal = 0;
+        var embedTotal = 0;
+        // 输出幻灯片中带批注的索引集合（批注按输出幻灯片编号命名 comment{slideTotal}.xml）
+        var commentSlides = new HashSet<Int32>();
+        var commentAuthorsDone = false;
+        // 首文件幻灯片尺寸（保留）
+        var slideWidth = 12192000L;
+        var slideHeight = 6858000L;
+
         for (var fi = 0; fi < sources.Count; fi++)
         {
             using var srcMs = new MemoryStream(sources[fi]);
             using var srcZip = new ZipArchive(srcMs, ZipArchiveMode.Read);
             var mediaRename = new Dictionary<String, String>(StringComparer.OrdinalIgnoreCase); // oldFilename -> newFilename
 
-            // Copy infrastructure entries from the first file only
+            if (fi == 0)
+                ParseSlideSize(srcZip, ref slideWidth, ref slideHeight);
+
+            // Copy infrastructure entries from the first file only（排除幻灯片/媒体/动态部件）
             if (fi == 0)
             {
                 foreach (var entry in srcZip.Entries)
                 {
                     var n = entry.FullName;
-                    if (n.StartsWith("ppt/slides/") || n.StartsWith("ppt/media/")
+                    if (n.StartsWith("ppt/slides/", StringComparison.OrdinalIgnoreCase)
+                        || n.StartsWith("ppt/media/", StringComparison.OrdinalIgnoreCase)
+                        || n.StartsWith("ppt/charts/", StringComparison.OrdinalIgnoreCase)
+                        || n.StartsWith("ppt/comments/", StringComparison.OrdinalIgnoreCase)
+                        || n.StartsWith("ppt/notesSlides/", StringComparison.OrdinalIgnoreCase)
+                        || n.StartsWith("ppt/notesMasters/", StringComparison.OrdinalIgnoreCase)
+                        || n.StartsWith("ppt/embeddings/", StringComparison.OrdinalIgnoreCase)
                         || n == "ppt/presentation.xml" || n == "ppt/_rels/presentation.xml.rels"
                         || n == "[Content_Types].xml") continue;
 
@@ -660,10 +1098,6 @@ public partial class PptxWriter : IDisposable
                 if (relsEntry != null)
                 {
                     using var sr = new StreamReader(relsEntry.Open()); relsXml = sr.ReadToEnd();
-                    foreach (var kv in mediaRename)
-                    {
-                        relsXml = relsXml.Replace($"../media/{kv.Key}", $"../media/{kv.Value}");
-                    }
                 }
                 else
                 {
@@ -672,11 +1106,14 @@ public partial class PptxWriter : IDisposable
                         "<Relationship Id=\"rLayout1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout\" Target=\"../slideLayouts/slideLayout1.xml\"/>" +
                         "</Relationships>";
                 }
+                // 重映射动态部件（图表/批注/备注/嵌入）并复制
+                relsXml = RemapSlideRels(srcZip, dstZip, relsXml, slideTotal, mediaRename, partMap, fi,
+                    ref chartTotal, ref notesTotal, ref notesMasterTotal, ref embedTotal, commentSlides, ref commentAuthorsDone);
                 WriteZipEntryText(dstZip, $"ppt/slides/_rels/slide{slideTotal}.xml.rels", relsXml);
             }
         }
 
-        // Write merged presentation.xml
+        // Write merged presentation.xml（保留首文件幻灯片尺寸）
         var presSb = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
         presSb.Append("<p:presentation xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"");
         presSb.Append(" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">");
@@ -686,10 +1123,10 @@ public partial class PptxWriter : IDisposable
         {
             presSb.Append($"<p:sldId id=\"{256 + i}\" r:id=\"rSlide{i + 1}\"/>");
         }
-        presSb.Append("</p:sldIdLst><p:sldSz cx=\"12192000\" cy=\"6858000\"/><p:notesSz cx=\"6858000\" cy=\"9144000\"/></p:presentation>");
+        presSb.Append($"</p:sldIdLst><p:sldSz cx=\"{slideWidth}\" cy=\"{slideHeight}\"/><p:notesSz cx=\"6858000\" cy=\"9144000\"/></p:presentation>");
         WriteZipEntryText(dstZip, "ppt/presentation.xml", presSb.ToString());
 
-        // Write merged ppt/_rels/presentation.xml.rels
+        // Write merged ppt/_rels/presentation.xml.rels（含批注作者关系）
         var relsSb = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
         relsSb.Append("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
         for (var i = 1; i <= slideTotal; i++)
@@ -697,10 +1134,12 @@ public partial class PptxWriter : IDisposable
             relsSb.Append($"<Relationship Id=\"rSlide{i}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide{i}.xml\"/>");
         }
         relsSb.Append("<Relationship Id=\"rMaster1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster\" Target=\"slideMasters/slideMaster1.xml\"/>");
+        if (commentAuthorsDone)
+            relsSb.Append("<Relationship Id=\"rCommentAuthors\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/commentAuthors\" Target=\"comments/commentAuthors.xml\"/>");
         relsSb.Append("</Relationships>");
         WriteZipEntryText(dstZip, "ppt/_rels/presentation.xml.rels", relsSb.ToString());
 
-        // Write [Content_Types].xml
+        // Write [Content_Types].xml（含全部动态部件）
         var ctSb = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
         ctSb.Append("<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">");
         ctSb.Append("<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>");
@@ -708,6 +1147,15 @@ public partial class PptxWriter : IDisposable
         ctSb.Append("<Default Extension=\"png\" ContentType=\"image/png\"/>");
         ctSb.Append("<Default Extension=\"jpg\" ContentType=\"image/jpeg\"/>");
         ctSb.Append("<Default Extension=\"jpeg\" ContentType=\"image/jpeg\"/>");
+        ctSb.Append("<Default Extension=\"gif\" ContentType=\"image/gif\"/>");
+        ctSb.Append("<Default Extension=\"bmp\" ContentType=\"image/bmp\"/>");
+        ctSb.Append("<Default Extension=\"svg\" ContentType=\"image/svg+xml\"/>");
+        ctSb.Append("<Default Extension=\"emf\" ContentType=\"image/x-emf\"/>");
+        ctSb.Append("<Default Extension=\"wmf\" ContentType=\"image/x-wmf\"/>");
+        ctSb.Append("<Default Extension=\"mp4\" ContentType=\"video/mp4\"/>");
+        ctSb.Append("<Default Extension=\"wmv\" ContentType=\"video/x-ms-wmv\"/>");
+        ctSb.Append("<Default Extension=\"mp3\" ContentType=\"audio/mpeg\"/>");
+        ctSb.Append("<Default Extension=\"xlsx\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\"/>");
         ctSb.Append("<Override PartName=\"/ppt/presentation.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/>");
         for (var i = 1; i <= slideTotal; i++)
         {
@@ -716,9 +1164,577 @@ public partial class PptxWriter : IDisposable
         ctSb.Append("<Override PartName=\"/ppt/slideLayouts/slideLayout1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml\"/>");
         ctSb.Append("<Override PartName=\"/ppt/slideMasters/slideMaster1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml\"/>");
         ctSb.Append("<Override PartName=\"/ppt/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/>");
+        for (var i = 1; i <= chartTotal; i++)
+            ctSb.Append($"<Override PartName=\"/ppt/charts/chart{i}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/>");
+        foreach (var si in commentSlides)
+            ctSb.Append($"<Override PartName=\"/ppt/comments/comment{si}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.comments+xml\"/>");
+        if (commentAuthorsDone)
+            ctSb.Append("<Override PartName=\"/ppt/comments/commentAuthors.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.commentAuthors+xml\"/>");
+        for (var i = 1; i <= notesTotal; i++)
+            ctSb.Append($"<Override PartName=\"/ppt/notesSlides/notesSlide{i}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml\"/>");
+        for (var i = 1; i <= notesMasterTotal; i++)
+            ctSb.Append($"<Override PartName=\"/ppt/notesMasters/notesMaster{i}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml\"/>");
         ctSb.Append("</Types>");
         WriteZipEntryText(dstZip, "[Content_Types].xml", ctSb.ToString());
     }
+
+    /// <summary>解析 presentation.xml 的幻灯片尺寸（sldSz），失败保持默认</summary>
+    /// <param name="zip">源 ZIP</param>
+    /// <param name="width">输出宽度（EMU）</param>
+    /// <param name="height">输出高度（EMU）</param>
+    private static void ParseSlideSize(ZipArchive zip, ref Int64 width, ref Int64 height)
+    {
+        var entry = zip.GetEntry("ppt/presentation.xml");
+        if (entry == null) return;
+        var doc = new XmlDocument();
+        using (var s = entry.Open()) doc.Load(s);
+        var sldSz = doc.SelectSingleNode("//*[local-name()='sldSz']") as XmlElement;
+        if (sldSz == null) return;
+        if (Int64.TryParse(sldSz.GetAttribute("cx"), out var cx)) width = cx;
+        if (Int64.TryParse(sldSz.GetAttribute("cy"), out var cy)) height = cy;
+    }
+
+    /// <summary>重映射幻灯片关系中的动态部件引用（图表/批注/备注/嵌入），并复制对应部件到目标 ZIP</summary>
+    /// <param name="srcZip">源 ZIP</param>
+    /// <param name="dstZip">目标 ZIP</param>
+    /// <param name="relsXml">幻灯片关系 XML</param>
+    /// <param name="slideTotal">输出幻灯片编号（1 起始）</param>
+    /// <param name="mediaRename">媒体文件名重命名映射</param>
+    /// <param name="partMap">跨文件部件重命名映射</param>
+    /// <param name="fi">源文件序号</param>
+    /// <param name="chartTotal">图表全局编号</param>
+    /// <param name="notesTotal">备注全局编号</param>
+    /// <param name="notesMasterTotal">备注母版全局编号</param>
+    /// <param name="embedTotal">嵌入对象全局编号</param>
+    /// <param name="commentSlides">带批注的输出幻灯片索引集合</param>
+    /// <param name="commentAuthorsDone">批注作者部件是否已复制</param>
+    /// <returns>重映射后的关系 XML</returns>
+    private static String RemapSlideRels(ZipArchive srcZip, ZipArchive dstZip, String relsXml, Int32 slideTotal,
+        Dictionary<String, String> mediaRename, Dictionary<String, String> partMap, Int32 fi,
+        ref Int32 chartTotal, ref Int32 notesTotal, ref Int32 notesMasterTotal, ref Int32 embedTotal,
+        HashSet<Int32> commentSlides, ref Boolean commentAuthorsDone)
+    {
+        var doc = new XmlDocument();
+        doc.LoadXml(relsXml);
+        const String PKG = "http://schemas.openxmlformats.org/package/2006/relationships";
+        var ns = new XmlNamespaceManager(doc.NameTable);
+        ns.AddNamespace("r", PKG);
+        var modified = false;
+        foreach (XmlElement rel in doc.SelectNodes("//r:Relationship", ns)!)
+        {
+            var type = rel.GetAttribute("Type");
+            var target = rel.GetAttribute("Target");
+
+            // 媒体引用：由 mediaRename 统一改名
+            if (target.StartsWith("../media/", StringComparison.OrdinalIgnoreCase))
+            {
+                var fname = Path.GetFileName(target);
+                if (mediaRename.TryGetValue(fname, out var newName))
+                {
+                    rel.SetAttribute("Target", $"../media/{newName}");
+                    modified = true;
+                }
+                continue;
+            }
+            // 版式/母版/主题/超链接：保持原样（基础结构来自首文件）
+            if (type.EndsWith("/slideLayout", StringComparison.OrdinalIgnoreCase)
+                || type.EndsWith("/slideMaster", StringComparison.OrdinalIgnoreCase)
+                || type.EndsWith("/theme", StringComparison.OrdinalIgnoreCase)
+                || type.EndsWith("/hyperlink", StringComparison.OrdinalIgnoreCase)) continue;
+
+            // 批注：按输出幻灯片编号命名 comment{slideTotal}.xml，保证读回与幻灯片编号一致
+            if (type.EndsWith("/comments", StringComparison.OrdinalIgnoreCase))
+            {
+                var newPath = $"ppt/comments/comment{slideTotal}.xml";
+                CopyPart(srcZip, dstZip, NormalizePartTarget(target), newPath);
+                rel.SetAttribute("Target", $"../comments/comment{slideTotal}.xml");
+                commentSlides.Add(slideTotal);
+                EnsureCommentAuthors(srcZip, dstZip, partMap, fi, ref commentAuthorsDone);
+                modified = true;
+                continue;
+            }
+
+            // 其他动态部件（图表/备注/嵌入等）：递归复制并重命名
+            var fullPath = NormalizePartTarget(target);
+            var key = $"{fi}|{fullPath}";
+            if (!partMap.TryGetValue(key, out var newPart))
+            {
+                newPart = CopyPartRecursive(srcZip, dstZip, fullPath, fi, mediaRename, partMap,
+                    ref chartTotal, ref notesTotal, ref notesMasterTotal, ref embedTotal);
+                partMap[key] = newPart;
+            }
+            rel.SetAttribute("Target", "../" + newPart[(newPart.IndexOf('/') + 1)..]);
+            modified = true;
+        }
+        if (!modified) return relsXml;
+
+        return SaveXml(doc);
+    }
+
+    /// <summary>复制单个部件（无递归）</summary>
+    /// <param name="srcZip">源 ZIP</param>
+    /// <param name="dstZip">目标 ZIP</param>
+    /// <param name="srcPath">源部件路径</param>
+    /// <param name="dstPath">目标部件路径</param>
+    private static void CopyPart(ZipArchive srcZip, ZipArchive dstZip, String srcPath, String dstPath)
+    {
+        var entry = srcZip.GetEntry(srcPath);
+        if (entry == null) return;
+        var dst = dstZip.CreateEntry(dstPath, CompressionLevel.Fastest);
+        using var ss = entry.Open();
+        using var ds = dst.Open();
+        ss.CopyTo(ds);
+    }
+
+    /// <summary>确保批注作者部件（commentAuthors.xml，全局唯一）已复制到目标 ZIP</summary>
+    /// <param name="srcZip">源 ZIP</param>
+    /// <param name="dstZip">目标 ZIP</param>
+    /// <param name="partMap">部件重命名映射</param>
+    /// <param name="fi">源文件序号</param>
+    /// <param name="commentAuthorsDone">是否已完成（引用传递）</param>
+    private static void EnsureCommentAuthors(ZipArchive srcZip, ZipArchive dstZip,
+        Dictionary<String, String> partMap, Int32 fi, ref Boolean commentAuthorsDone)
+    {
+        if (commentAuthorsDone) return;
+        const String fullPath = "ppt/comments/commentAuthors.xml";
+        if (srcZip.GetEntry(fullPath) == null) return;
+        var key = $"{fi}|{fullPath}";
+        if (!partMap.ContainsKey(key)) partMap[key] = fullPath;
+        CopyPart(srcZip, dstZip, fullPath, fullPath);
+        commentAuthorsDone = true;
+    }
+
+    /// <summary>递归复制部件及其关系依赖（图表→嵌入 xlsx、备注→备注母版等），返回目标路径</summary>
+    /// <param name="srcZip">源 ZIP</param>
+    /// <param name="dstZip">目标 ZIP</param>
+    /// <param name="fullPath">源部件完整路径</param>
+    /// <param name="fi">源文件序号</param>
+    /// <param name="mediaRename">媒体文件名重命名映射</param>
+    /// <param name="partMap">跨文件部件重命名映射</param>
+    /// <param name="chartTotal">图表全局编号</param>
+    /// <param name="notesTotal">备注全局编号</param>
+    /// <param name="notesMasterTotal">备注母版全局编号</param>
+    /// <param name="embedTotal">嵌入对象全局编号</param>
+    /// <returns>目标部件完整路径</returns>
+    private static String CopyPartRecursive(ZipArchive srcZip, ZipArchive dstZip, String fullPath, Int32 fi,
+        Dictionary<String, String> mediaRename, Dictionary<String, String> partMap,
+        ref Int32 chartTotal, ref Int32 notesTotal, ref Int32 notesMasterTotal, ref Int32 embedTotal)
+    {
+        var key = $"{fi}|{fullPath}";
+        if (partMap.TryGetValue(key, out var existing)) return existing;
+
+        var newPath = AllocatePartPath(fullPath, ref chartTotal, ref notesTotal, ref notesMasterTotal, ref embedTotal);
+        partMap[key] = newPath; // 先占位，防止循环引用
+
+        CopyPart(srcZip, dstZip, fullPath, newPath);
+
+        // 递归处理该部件的关系文件
+        var relsPath = GetRelsPath(fullPath);
+        var relsEntry = srcZip.GetEntry(relsPath);
+        if (relsEntry != null)
+        {
+            String relsXml;
+            using (var sr = new StreamReader(relsEntry.Open())) relsXml = sr.ReadToEnd();
+            var doc = new XmlDocument();
+            doc.LoadXml(relsXml);
+            const String PKG = "http://schemas.openxmlformats.org/package/2006/relationships";
+            var ns = new XmlNamespaceManager(doc.NameTable);
+            ns.AddNamespace("r", PKG);
+            var modified = false;
+            foreach (XmlElement rel in doc.SelectNodes("//r:Relationship", ns)!)
+            {
+                var type = rel.GetAttribute("Type");
+                var target = rel.GetAttribute("Target");
+                if (target.StartsWith("../media/", StringComparison.OrdinalIgnoreCase))
+                {
+                    var fname = Path.GetFileName(target);
+                    if (mediaRename.TryGetValue(fname, out var newName))
+                    {
+                        rel.SetAttribute("Target", $"../media/{newName}");
+                        modified = true;
+                    }
+                    continue;
+                }
+                // 版式/母版/主题/超链接：保持原样（基础结构来自首文件）
+                if (type.EndsWith("/slideLayout", StringComparison.OrdinalIgnoreCase)
+                    || type.EndsWith("/slideMaster", StringComparison.OrdinalIgnoreCase)
+                    || type.EndsWith("/theme", StringComparison.OrdinalIgnoreCase)
+                    || type.EndsWith("/hyperlink", StringComparison.OrdinalIgnoreCase)) continue;
+                var depFull = ResolvePartPath(fullPath, target);
+                var depKey = $"{fi}|{depFull}";
+                if (!partMap.TryGetValue(depKey, out var depNew))
+                {
+                    depNew = CopyPartRecursive(srcZip, dstZip, depFull, fi, mediaRename, partMap,
+                        ref chartTotal, ref notesTotal, ref notesMasterTotal, ref embedTotal);
+                    partMap[depKey] = depNew;
+                }
+                rel.SetAttribute("Target", MakeRelative(GetDir(newPath), depNew));
+                modified = true;
+            }
+            if (modified)
+            {
+                WriteZipEntryText(dstZip, GetRelsPath(newPath), SaveXml(doc));
+            }
+            else
+            {
+                CopyPart(srcZip, dstZip, relsPath, GetRelsPath(newPath));
+            }
+        }
+        return newPath;
+    }
+
+    /// <summary>以 UTF-8 编码序列化 XmlDocument（避免 StringWriter 默认 utf-16 声明与实际字节错配）</summary>
+    /// <param name="doc">XML 文档</param>
+    /// <returns>UTF-8 XML 字符串</returns>
+    private static String SaveXml(XmlDocument doc)
+    {
+        using var ms = new MemoryStream();
+        var settings = new XmlWriterSettings { Encoding = new UTF8Encoding(false), Indent = false };
+        using (var xw = XmlWriter.Create(ms, settings))
+            doc.Save(xw);
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    /// <summary>为动态部件分配目标路径（按类型重命名避免跨文件冲突）</summary>
+    /// <param name="fullPath">源部件完整路径</param>
+    /// <param name="chartTotal">图表全局编号</param>
+    /// <param name="notesTotal">备注全局编号</param>
+    /// <param name="notesMasterTotal">备注母版全局编号</param>
+    /// <param name="embedTotal">嵌入对象全局编号</param>
+    /// <returns>目标部件完整路径</returns>
+    private static String AllocatePartPath(String fullPath,
+        ref Int32 chartTotal, ref Int32 notesTotal, ref Int32 notesMasterTotal, ref Int32 embedTotal)
+    {
+        if (fullPath.StartsWith("ppt/charts/", StringComparison.OrdinalIgnoreCase) && fullPath.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+            return $"ppt/charts/chart{++chartTotal}.xml";
+        if (fullPath.Equals("ppt/comments/commentAuthors.xml", StringComparison.OrdinalIgnoreCase))
+            return fullPath; // 全局唯一
+        if (fullPath.StartsWith("ppt/notesSlides/", StringComparison.OrdinalIgnoreCase) && fullPath.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+            return $"ppt/notesSlides/notesSlide{++notesTotal}.xml";
+        if (fullPath.StartsWith("ppt/notesMasters/", StringComparison.OrdinalIgnoreCase) && fullPath.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+            return $"ppt/notesMasters/notesMaster{++notesMasterTotal}.xml";
+        if (fullPath.StartsWith("ppt/embeddings/", StringComparison.OrdinalIgnoreCase))
+            return $"ppt/embeddings/embed{++embedTotal}{Path.GetExtension(fullPath)}";
+        // 其他未知部件：保留目录，追加序号避免冲突
+        var dir = Path.GetDirectoryName(fullPath)?.Replace('\\', '/');
+        var name = Path.GetFileNameWithoutExtension(fullPath);
+        var ext = Path.GetExtension(fullPath);
+        return $"{dir}/{name}_{++embedTotal}{ext}";
+    }
+
+    /// <summary>计算部件对应的关系文件路径</summary>
+    /// <param name="fullPath">部件完整路径</param>
+    /// <returns>关系文件路径</returns>
+    private static String GetRelsPath(String fullPath)
+    {
+        var dir = (Path.GetDirectoryName(fullPath) ?? String.Empty).Replace('\\', '/');
+        return $"{dir}/_rels/{Path.GetFileName(fullPath)}.rels";
+    }
+
+    /// <summary>获取部件所在目录</summary>
+    /// <param name="fullPath">部件完整路径</param>
+    /// <returns>目录路径</returns>
+    private static String GetDir(String fullPath)
+        => (Path.GetDirectoryName(fullPath) ?? String.Empty).Replace('\\', '/');
+
+    /// <summary>将幻灯片关系目标（相对 ppt/slides/）规范化为完整路径</summary>
+    /// <param name="target">关系目标（如 ../charts/chart1.xml）</param>
+    /// <returns>完整路径（如 ppt/charts/chart1.xml）</returns>
+    private static String NormalizePartTarget(String target)
+    {
+        if (target.StartsWith("/", StringComparison.Ordinal))
+            return target.TrimStart('/');
+        var parts = new List<String>();
+        foreach (var seg in target.Split('/'))
+        {
+            if (seg == "..") { if (parts.Count > 0) parts.RemoveAt(parts.Count - 1); }
+            else if (seg != "." && seg.Length > 0) parts.Add(seg);
+        }
+        return "ppt/" + String.Join("/", parts);
+    }
+
+    /// <summary>解析部件相对引用（相对 fullPath 所在目录）为完整路径</summary>
+    /// <param name="fullPath">部件完整路径</param>
+    /// <param name="target">关系目标</param>
+    /// <returns>完整路径</returns>
+    private static String ResolvePartPath(String fullPath, String target)
+    {
+        if (target.StartsWith("/", StringComparison.Ordinal))
+            return target.TrimStart('/');
+        var parts = new List<String>(GetDir(fullPath).Split('/'));
+        foreach (var seg in target.Split('/'))
+        {
+            if (seg == "..") { if (parts.Count > 0) parts.RemoveAt(parts.Count - 1); }
+            else if (seg != "." && seg.Length > 0) parts.Add(seg);
+        }
+        return String.Join("/", parts);
+    }
+
+    /// <summary>计算从 fromDir 到 toPath 的相对路径</summary>
+    /// <param name="fromDir">起始目录（如 ppt/charts）</param>
+    /// <param name="toPath">目标完整路径（如 ppt/embeddings/embed1.xlsx）</param>
+    /// <returns>相对路径（如 ../embeddings/embed1.xlsx）</returns>
+    private static String MakeRelative(String fromDir, String toPath)
+    {
+        var from = fromDir.Split('/');
+        var to = toPath.Split('/');
+        var i = 0;
+        while (i < from.Length && i < to.Length && from[i].Equals(to[i], StringComparison.OrdinalIgnoreCase)) i++;
+        var ups = new List<String>();
+        for (var j = i; j < from.Length; j++) ups.Add("..");
+        var rest = new List<String>();
+        for (var j = i; j < to.Length; j++) rest.Add(to[j]);
+        return String.Join("/", ups.Concat(rest));
+    }
+    #endregion
+
+    #region 母版
+
+    /// <summary>从现有 pptx 文件加载母版、版式和主题（S04-Master）</summary>
+    /// <remarks>
+    /// 以原始 XML 形式加载母版/版式/主题，保存时保留完整品牌设计。
+    /// 调用此方法会清除已加载的母版/版式内容，但不影响已添加的幻灯片。
+    /// 注意：加载模板后 SetAccentColors 对主题颜色不再生效，颜色由模板主题决定。
+    /// </remarks>
+    /// <param name="templatePath">模板 pptx 文件路径</param>
+    public void LoadMaster(String templatePath)
+        => LoadMaster(File.ReadAllBytes(templatePath.GetFullPath()), keepTemplateSlides: false);
+
+    /// <summary>从现有 pptx 文件加载母版、版式和主题，可选保留模板原有幻灯片</summary>
+    /// <param name="templatePath">模板 pptx 文件路径</param>
+    /// <param name="keepTemplateSlides">true 时保留模板原有幻灯片（追加在程序化幻灯片之后）</param>
+    public void LoadMaster(String templatePath, Boolean keepTemplateSlides)
+        => LoadMaster(File.ReadAllBytes(templatePath.GetFullPath()), keepTemplateSlides);
+
+    /// <summary>从 pptx 字节数据加载母版、版式和主题（S04-Master）</summary>
+    /// <remarks>
+    /// 可与 <see cref="PptxWriter(String)"/> 构造函数等效，也可在已有 PptxWriter 实例上调用。
+    /// </remarks>
+    /// <param name="templateBytes">模板 pptx 字节数据</param>
+    public void LoadMaster(Byte[] templateBytes) => LoadMaster(templateBytes, keepTemplateSlides: false);
+
+    /// <summary>从 pptx 字节数据加载母版、版式和主题，可选保留模板原有幻灯片</summary>
+    /// <param name="templateBytes">模板 pptx 字节数据</param>
+    /// <param name="keepTemplateSlides">true 时保留模板原有幻灯片</param>
+    public void LoadMaster(Byte[] templateBytes, Boolean keepTemplateSlides)
+    {
+        _masterContents.Clear();
+        _layoutContents.Clear();
+        _layoutNames.Clear();
+        _infraMedia.Clear();
+        _templateThemeXml = null;
+        _templateThemeBytes = null;
+
+        using var ms = new MemoryStream(templateBytes);
+        using var zip = new ZipArchive(ms, ZipArchiveMode.Read);
+
+        // 加载母版（按文件名数值排序，避免 slideMaster10 排在 slideMaster2 前面）
+        var masterEntries = zip.Entries
+            .Where(e => e.FullName.StartsWith("ppt/slideMasters/", StringComparison.OrdinalIgnoreCase)
+                     && e.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)
+                     && !e.FullName.Contains("_rels", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(e =>
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(e.FullName, @"slideMaster(\d+)\.xml");
+                return m.Success ? Int32.Parse(m.Groups[1].Value) : 0;
+            })
+            .ToList();
+
+        foreach (var entry in masterEntries)
+        {
+            var content = new PartContent();
+            using (var sr = new StreamReader(entry.Open(), Encoding.UTF8))
+                content.Xml = sr.ReadToEnd();
+            var relsEntry = zip.GetEntry(GetRelsEntryPath(entry.FullName));
+            if (relsEntry != null)
+            {
+                using var rsr = new StreamReader(relsEntry.Open(), Encoding.UTF8);
+                content.RelsXml = rsr.ReadToEnd();
+            }
+            _masterContents.Add(content);
+        }
+
+        // 加载版式（按文件名数值排序，避免 slideLayout10 排在 slideLayout2 前面）
+        var layoutEntries = zip.Entries
+            .Where(e => e.FullName.StartsWith("ppt/slideLayouts/", StringComparison.OrdinalIgnoreCase)
+                     && e.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)
+                     && !e.FullName.Contains("_rels", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(e =>
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(e.FullName, @"slideLayout(\d+)\.xml");
+                return m.Success ? Int32.Parse(m.Groups[1].Value) : 0;
+            })
+            .ToList();
+
+        foreach (var entry in layoutEntries)
+        {
+            var content = new PartContent();
+            using (var sr = new StreamReader(entry.Open(), Encoding.UTF8))
+                content.Xml = sr.ReadToEnd();
+            var relsEntry = zip.GetEntry(GetRelsEntryPath(entry.FullName));
+            if (relsEntry != null)
+            {
+                using var rsr = new StreamReader(relsEntry.Open(), Encoding.UTF8);
+                content.RelsXml = rsr.ReadToEnd();
+            }
+            _layoutNames.Add(ExtractLayoutDisplayName(content.Xml));
+            _layoutContents.Add(content);
+        }
+
+        // 加载主题（优先 theme1.xml，否则取第一个；同时保留原始字节避免 StreamReader 归一化换行符）
+        var themeEntry = zip.GetEntry("ppt/theme/theme1.xml")
+            ?? zip.Entries.FirstOrDefault(e =>
+                e.FullName.StartsWith("ppt/theme/", StringComparison.OrdinalIgnoreCase)
+                && e.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase));
+        if (themeEntry != null)
+        {
+            using var themeMs = new MemoryStream();
+            using (var es = themeEntry.Open()) es.CopyTo(themeMs);
+            _templateThemeBytes = themeMs.ToArray();
+            using var sr = new StreamReader(new MemoryStream(_templateThemeBytes), Encoding.UTF8);
+            _templateThemeXml = sr.ReadToEnd();
+        }
+
+        // 加载母版/版式 rels 引用的媒体文件
+        foreach (var entry in zip.Entries)
+        {
+            if (!entry.FullName.StartsWith("ppt/media/", StringComparison.OrdinalIgnoreCase)) continue;
+            var fileName = entry.Name;
+            var isReferenced = _masterContents.Any(c => c.RelsXml.IndexOf(fileName, StringComparison.OrdinalIgnoreCase) >= 0)
+                            || _layoutContents.Any(c => c.RelsXml.IndexOf(fileName, StringComparison.OrdinalIgnoreCase) >= 0);
+            if (!isReferenced) continue;
+            using var buf = new MemoryStream();
+            using (var es = entry.Open()) es.CopyTo(buf);
+            _infraMedia[fileName] = buf.ToArray();
+        }
+
+        // 加载嵌入字体（ppt/fonts/*.fntdata）
+        _embeddedFonts.Clear();
+        foreach (var entry in zip.Entries)
+        {
+            if (!entry.FullName.StartsWith("ppt/fonts/", StringComparison.OrdinalIgnoreCase)) continue;
+            if (entry.FullName.EndsWith("/", StringComparison.Ordinal)) continue; // 跳过目录条目
+            using var buf = new MemoryStream();
+            using (var es = entry.Open()) es.CopyTo(buf);
+            _embeddedFonts[entry.Name] = buf.ToArray();
+        }
+
+        // 可选：保留模板原有幻灯片
+        if (keepTemplateSlides)
+        {
+            CopyTemplateSlides(zip);
+        }
+    }
+
+    /// <summary>将模板中的幻灯片复制到 _rawSlides（供 keepTemplateSlides 使用）</summary>
+    private void CopyTemplateSlides(ZipArchive zip)
+    {
+        // 收集模板中所有媒体文件的重命名映射
+        var mediaRename = new Dictionary<String, String>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in zip.Entries)
+        {
+            if (!entry.FullName.StartsWith("ppt/media/", StringComparison.OrdinalIgnoreCase)) continue;
+            var newName = $"mt{_mediaGlobal++}{Path.GetExtension(entry.Name)}";
+            mediaRename[entry.Name] = newName;
+            using var buf = new MemoryStream();
+            using (var es = entry.Open()) es.CopyTo(buf);
+            _rawSlideMedia.Add((newName, buf.ToArray()));
+        }
+
+        // 按幻灯片编号顺序复制
+        var slideEntries = zip.Entries
+            .Where(e => System.Text.RegularExpressions.Regex.IsMatch(e.FullName, @"^ppt/slides/slide\d+\.xml$"))
+            .OrderBy(e =>
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(e.FullName, @"slide(\d+)\.xml");
+                return m.Success ? Int32.Parse(m.Groups[1].Value) : 0;
+            })
+            .ToList();
+
+        foreach (var slideEntry in slideEntries)
+        {
+            var slideNum = Int32.Parse(
+                System.Text.RegularExpressions.Regex.Match(slideEntry.FullName, @"slide(\d+)\.xml").Groups[1].Value);
+
+            String slideXml;
+            using (var sr = new StreamReader(slideEntry.Open())) slideXml = sr.ReadToEnd();
+            foreach (var kv in mediaRename)
+            {
+                slideXml = slideXml.Replace($"../media/{kv.Key}", $"../media/{kv.Value}");
+            }
+
+            String relsXml;
+            var relsEntry = zip.GetEntry($"ppt/slides/_rels/slide{slideNum}.xml.rels");
+            if (relsEntry != null)
+            {
+                using var sr = new StreamReader(relsEntry.Open()); relsXml = sr.ReadToEnd();
+                foreach (var kv in mediaRename)
+                {
+                    relsXml = relsXml.Replace($"../media/{kv.Key}", $"../media/{kv.Value}");
+                }
+            }
+            else
+            {
+                relsXml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                    "<Relationship Id=\"rLayout1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout\" Target=\"../slideLayouts/slideLayout1.xml\"/>" +
+                    "</Relationships>";
+            }
+
+            _rawSlides.Add((slideXml, relsXml));
+        }
+    }
+
+    /// <summary>获取已加载的版式数量</summary>
+    /// <returns>版式数量（未加载模板且未编程创建时为 1）</returns>
+    public Int32 GetLayoutCount()
+    {
+        if (_layoutContents.Count > 0) return _layoutContents.Count;
+        var progCount = _progMasters.Sum(m => m.Layouts.Count);
+        return Math.Max(1, progCount);
+    }
+
+    /// <summary>获取指定版式的显示名称</summary>
+    /// <param name="layoutIndex">版式索引（0起始）</param>
+    /// <returns>版式名称；超出范围返回空字符串</returns>
+    public String GetLayoutName(Int32 layoutIndex)
+    {
+        if (_layoutNames.Count > 0)
+        {
+            if (layoutIndex < 0 || layoutIndex >= _layoutNames.Count) return String.Empty;
+            return _layoutNames[layoutIndex];
+        }
+        var total = 0;
+        foreach (var m in _progMasters)
+        {
+            foreach (var l in m.Layouts)
+            {
+                if (total == layoutIndex) return l.Name;
+                total++;
+            }
+        }
+        return total == 0 && layoutIndex == 0 ? "blank" : String.Empty;
+    }
+
+    /// <summary>编程式创建一个新母版（Phase 5：无需外部模板文件）</summary>
+    /// <remarks>
+    /// 创建后可向母版添加形状（如公司 Logo），并通过 <see cref="SlideMaster.AddLayout"/> 添加自定义版式。
+    /// 保存时自动生成符合 OOXML 规范的母版和版式 XML。
+    /// <para>注意：调用此方法会与 <see cref="LoadMaster(String)"/> 互斥——后者通过模板文件加载，前者纯编程构建。</para>
+    /// </remarks>
+    /// <returns>新创建的母版对象</returns>
+    public SlideMaster CreateMaster()
+    {
+        var master = new SlideMaster();
+        _progMasters.Add(master);
+        return master;
+    }
+
+    /// <summary>从另一个 pptx 文件复制母版、版式和主题（S04-Master）</summary>
+    /// <remarks>语义等同于 <see cref="LoadMaster(String)"/>，命名更明确地表达跨文件母版复制的意图。</remarks>
+    /// <param name="sourcePath">源 pptx 文件路径</param>
+    public void CopyMasterFrom(String sourcePath) => LoadMaster(sourcePath);
+
     #endregion
 
 }
