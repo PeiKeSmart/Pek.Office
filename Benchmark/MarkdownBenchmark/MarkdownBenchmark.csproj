@@ -9,8 +9,9 @@
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
-    <!-- 本地源：引用打包后的主库，规避 BDN 强制 Deterministic 与通配版本冲突 -->
-    <RestoreSources>$(RestoreSources);$(MSBuildThisFileDirectory)..\..\Bin\LocalFeed</RestoreSources>
+    <!-- 基准测试直接引用主库项目；不再使用 Bin\LocalFeed 本地源——
+         该目录不存在时会导致 restore 失败（NU1301），且 RestoreSources 会覆盖 NuGet.config 的源列表。
+         历史：曾用"pack 主库到 Bin\LocalFeed + 包引用"规避 BDN 强制 Deterministic 与通配版本冲突。 -->
   </PropertyGroup>
 
   <ItemGroup>
