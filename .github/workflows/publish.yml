@@ -16,15 +16,20 @@ jobs:
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: |
+          6.x
+          7.x
           8.x
           9.x
           10.x
+          11.x
     - name: Restore
       run: |
         dotnet restore Pek.Office/Pek.Office.csproj
+        dotnet restore Pek.Office.Rendering/Pek.Office.Rendering.csproj
     - name: Build
       run: |
         dotnet pack --no-restore --version-suffix $(date "+%Y.%m%d") -c Release -o out Pek.Office/Pek.Office.csproj
+        dotnet pack --no-restore --version-suffix $(date "+%Y.%m%d") -c Release -o out Pek.Office.Rendering/Pek.Office.Rendering.csproj
     - name: Publish
       run: |
         dotnet nuget push ./out/*.nupkg --skip-duplicate --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.nugetKey }}

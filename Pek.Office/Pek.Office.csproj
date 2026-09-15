@@ -1,10 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net45;netstandard2.0;netstandard2.1</TargetFrameworks>
+    <TargetFrameworks>net45;netstandard2.0;netstandard2.1;net11.0</TargetFrameworks>
     <OutputType>Library</OutputType>
     <RootNamespace>Pek.Office</RootNamespace>
     <AssemblyTitle>办公自动化库</AssemblyTitle>
-    <Description>基于DH框架的办公自动化库，支持Excel文件读写、导入导出、单元格操作等功能</Description>
+    <Description>基于DH框架的办公自动化库，支持 Excel（xlsx/xls）、Word（docx/doc）、PPT（pptx/ppt）、PDF、Markdown、RTF、ODS、Email（eml/msg）、iCalendar、vCard、EPUB、XPS 等格式的读写、模板填充与格式转换，零外部依赖，MIT 许可</Description>
     <Company>湖北登灏科技有限公司</Company>
     <Copyright>©2020-2026 湖北登灏科技有限公司</Copyright>
     <VersionPrefix>4.25</VersionPrefix>
@@ -21,6 +21,8 @@
     <NoWarn>1701;1702;1591;NU5104;NU1505;NETSDK1138;CS7035</NoWarn>
     <AnalysisLevel>latest</AnalysisLevel>
     <WarningsAsErrors>CA2007</WarningsAsErrors>
+    <!-- 允许 unsafe 代码块，保持与上游一致（当前源码未使用，预留兼容后续同步） -->
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -33,7 +35,7 @@
     <RepositoryUrl>https://github.com/PeiKeSmart/Pek.Office</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>湖北登灏科技有限公司;DH组件;DH;PeiKeSmart;Pek;Office;Excel;Word;PDF;Markdown;$(AssemblyName)</PackageTags>
-    <PackageReleaseNotes>新增 ITextExtractable/IMarkdownExtractable 统一文本提取接口；全格式覆盖，Excel/Word/PPT/PDF/RTF/ODS/EML/iCal/vCard/EPUB/XPS 均实现接口；OfficeFactory 新增 ReadText() 和 ReadMarkdown() 一行提取静态方法</PackageReleaseNotes>
+    <PackageReleaseNotes>Word 读取保真修复、日常编辑 API（FindText/ReplaceText/行列操作/单元格）、多节/脚注尾注/文本框、doc→docx 转换；Excel 全面增强（xls 样式/批注/合并单元格、条件格式 dxf、图表类型扩展、切片器/线程化批注、ReadRows 流式读取）；Markdown CommonMark 规范补全与解析性能多轮优化；PPT 形状往返保真与图表/超链接增强；PDF 结构化表格提取与嵌入字体子集化；新增 CLI 命令行转换工具链与 OfficeFactory 内容识别</PackageReleaseNotes>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>

@@ -2344,7 +2344,10 @@ public class PdfWriter : IDisposable
         // 尝试用简单方案：如果系统有 System.Drawing，用它；否则返回白色占位
         try
         {
-#if NET6_0_OR_GREATER
+            // 本地适配（net11.0）：System.Drawing 在 net6+ 需要 System.Drawing.Common 包（Windows-only）。
+            // 为避免引入平台依赖并保持与 net45/netstandard 目标输出一致，统一走白色占位分支；
+            // 如需启用真实解码，定义 ENABLE_SYSTEM_DRAWING 并引用 System.Drawing.Common。
+#if NET6_0_OR_GREATER && ENABLE_SYSTEM_DRAWING
             using var ms = new System.IO.MemoryStream(png);
             using var bmp = System.Drawing.Image.FromStream(ms);
             return ExtractBitmapRgb(bmp, w, h);
@@ -2358,7 +2361,7 @@ public class PdfWriter : IDisposable
         }
     }
 
-#if NET6_0_OR_GREATER
+#if NET6_0_OR_GREATER && ENABLE_SYSTEM_DRAWING
     private static Byte[] ExtractBitmapRgb(System.Drawing.Image img, Int32 w, Int32 h)
     {
         using var bmp = new System.Drawing.Bitmap(img);

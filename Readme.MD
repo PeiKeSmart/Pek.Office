@@ -4,12 +4,13 @@
 
 `Pek.Office` 是一个功能全面的 .NET 办公自动化库，覆盖 **Excel（xlsx/xls）、Word（docx/doc）、PPT（pptx/ppt）、PDF**、Markdown、RTF、ODS、Email（eml/msg）、iCalendar、vCard、EPUB、XPS 以及基于 OLE2/BIFF8 的老式二进制格式，致力于为 .NET 社区提供零依赖、MIT 许可的高质量办公自动化能力。
 
-- 仅依赖 `NewLife.Core`，零外部依赖
+- 仅依赖 `DH.NCore`，零外部依赖
 - 支持 `net45/netstandard2.0/netstandard2.1`
 - 直接基于 Open XML（ZIP + XML）/ PDF / OLE2 文件结构实现
-- 统一命名空间 `Pek.Office`，API 风格一致，学习成本低
+- 统一命名空间 `NewLife.Office`（保持与上游 API 兼容），API 风格一致，学习成本低
+- 配套 `Pek.Office.Rendering` 渲染扩展包（文档 → 图片）与 `Pek.Office.Cli` 命令行工具
 
-> CSV 读写能力由 `NewLife.Core` 的 `CsvFile` 提供，本仓库不重复实现 CSV。
+> CSV 读写能力由 `DH.NCore` 的 `CsvFile` 提供，本仓库不重复实现 CSV。
 
 ## 已实现能力（Excel）
 
@@ -18,7 +19,7 @@
 - 多工作表写入、表头与多行数据写入
 - 单元格样式：字体/背景/边框/对齐/换行/数字格式
 - 布局能力：列宽、行高、合并单元格、冻结窗格、自动筛选
-- 高级能力：超链接、下拉数据验证、条件格式、插入图片、图表（柱/折/饼/散点）、数据透视表
+- 高级能力：超链接、下拉数据验证、条件格式（含 dxf 字体/填充/边框）、插入图片、图表（柱/折/饼/散点，支持 doughnut/radar/stock/surface）、数据透视表、切片器、线程化批注、迷你图
 - 页面能力：页面方向、纸张大小、页边距、页眉页脚、打印标题行
 - 安全能力：工作表保护
 - 便捷能力：`WriteObjects<T>()`、`WriteDataTable()`
@@ -26,6 +27,7 @@
 ### ExcelReader（读取）
 
 - 读取多工作表行数据（自动类型转换）
+- `ReadRows` 大文件流式读取（XmlReader，内存平稳）
 - `ReadObjects<T>()` 对象映射导入（支持 `DisplayName/Description`）
 - `ReadDataTable()` 导入为 `DataTable`
 - `GetMergeRanges()` 读取合并区域
@@ -35,22 +37,23 @@
 - 基于现有 xlsx 模板执行 `{{Key}}` 占位符替换
 - 支持输出到文件或流
 
-### BiffReader（xls 安全读取）
+### BiffReader / BiffWriter（xls 读写）
 
-- 基于 OLE2/CFB 容器，解析 BIFF8 格式工作表流
-- `ReadSheet()` 读取工作表行数据
-- `ReadObjects<T>()` 对象映射导入
+- 基于 OLE2/CFB 容器，解析/生成 BIFF8 格式工作表流（Excel 97-2003 原生读写）
+- `ReadSheet()` 读取工作表行数据；`ReadObjects<T>()` 对象映射导入
 - 支持字符串、数字、布尔、日期、RK 编码等多种单元格类型
+- 写入支持样式（FONT/FORMAT/XF）、批注、命名范围、打印区域、合并单元格、页面设置
 
 ## 已实现能力（Word）
 
 ### WordWriter / WordReader / WordTemplate
 
-- docx 全面读写：段落、表格、图片、标题、列表、超链接、页眉页脚、页面设置
+- docx 全面读写：段落、表格、图片、标题、列表、超链接、页眉页脚、页面设置、批注、内容控件、脚注尾注、文本框、多节、AES 加密、邮件合并
+- 日常编辑 API：`FindText`/`ReplaceText` 跨 Run 查找替换（含文本框）、表格行列增删、`GetCell`/`SetCellText` 单元格操作
 - 模板填充：`{{Key}}` 占位符替换，保留原样式
 - `WordHtmlConverter`：docx 转语义化 HTML（段落→`<p>`，表格→`<table>`，标题→`<h1>`-`<h6>`）
 - `WordPdfConverter`：docx 转 PDF（内容映射型，纳入 PdfFluentDocument）
-- `DocReader`：读取 doc 格式（OLE2 容器，提取纯文本和段落结构）
+- `DocReader`：读取 doc 格式（OLE2 容器，提取纯文本和段落格式），支持 doc→docx 转换（`OfficeFactory.ConvertDocToDocx`）
 
 ## 已实现能力（PPT）
 
@@ -58,7 +61,8 @@
 
 - pptx 全面读写：幻灯片管理、文本框、表格、图片、基本形状、超链接、备注、模板填充
 - 布局设计：母版、版式、背景、尺寸、幻灯片切换动画
-- `PptReader`：读取 ppt 格式（OLE2 容器，提取幻灯片文本）
+- 增强能力：图表/超链接、形状往返保真、跨文件合并（含图表/批注/备注保真）
+- `PptReader`：读取 ppt 格式（OLE2 容器，提取幻灯片文本）；`PptxPdfConverter`：pptx → PDF
 
 ## 已实现能力（PDF）
 
@@ -66,9 +70,9 @@
 
 - 创建 PDF：文本排版、表格、图片、页眉页脚、中文字体支持（Type0/STSong-Light，UniGB-UCS2-H 编码）
 - `PdfFluentDocument`：声明式布局 API（Row/Column/Text/Image/Table），自动分页
-- PDF 操作：合并/拆分、水印、页面旋转、文字覆盖、可点击链接、书签导航
+- PDF 操作：合并/拆分、水印、页面旋转、文字覆盖、可点击链接、书签导航、数字签名、表单、注释、PDF/A
 - `PdfEncryptor`：加密/权限控制
-- 文本提取：逐页/全文，带坐标信息提取
+- 文本提取：逐页/全文，带坐标信息提取；结构化表格提取；嵌入字体子集化
 
 ## 已实现能力（Markdown / RTF / ODS）
 
@@ -122,6 +126,19 @@ String? pdfText = OfficeFactory.ReadText(fs, ".pdf");
 using var reader = new WordReader("document.docx");
 String? text = (reader as ITextExtractable)?.ExtractText();
 String? md = (reader as IMarkdownExtractable)?.ExtractMarkdown();
+```
+
+### 命令行工具（Pek.Office.Cli）
+
+```bash
+# 任意办公文档 → Markdown（不传 output 时输出到 stdout）
+dotnet run --project Pek.Office.Cli -- convert input.docx output.md
+
+# 查看文档格式信息
+dotnet run --project Pek.Office.Cli -- info input.pdf
+
+# doc（97-2003）→ docx
+dotnet run --project Pek.Office.Cli -- doc2docx legacy.doc legacy.docx
 ```
 
 ### Excel 读写
@@ -260,64 +277,60 @@ writer.SetRowHeight("Sheet1", 1, 30); // 设置行高
 - `AddImage(name, data, mime)` 嵌入图片资源
 - `Save(path|stream)` / `ToBytes()` 输出
 
+## 已实现能力（Rendering 渲染扩展包）
+
+`Pek.Office.Rendering` 是独立发布的渲染扩展包（依赖 SkiaSharp），提供文档页面 → 图片的跨平台渲染能力：
+
+- `DocumentPreview`：自动检测格式并渲染首页/全部页为 PNG（支持 PDF/DOCX/PPTX/Markdown）
+- `PdfRenderer` / `WordRenderer` / `PptRenderer` / `MdRenderer`：各格式专用渲染器
+- 图片处理：缩放/裁剪/旋转/水印叠加/格式转换、文字→图片、二维码生成、缩略图网格
+
 ## 测试状态
 
-- 当前测试集：`395` 项
-- 通过：`395` 项
-- 失败：`0` 项
+- 当前测试集：`1266` 项
+- 通过：`1259` 项
+- 失败：`7` 项（均为依赖 Bin 目录真实样本文件/系统字体的环境型回归测试，与上游一致）
 
 ## 已实现格式概览
 
 | 格式 | 读取 | 写入 | 模板 | 转换 | 说明 |
 |------|:---:|:---:|:---:|:---:|------|
-| **Excel xlsx** | ✅ | ✅ | ✅ | — | 含样式/图表/透视表/条件格式/图片 |
-| **Excel xls** | ✅ | 🔄规划 | — | — | OLE2/BIFF8，BiffReader 已实现读取 |
-| **Word docx** | ✅ | ✅ | ✅ | HTML/PDF | 含段落/表格/图片/页眉页脚 |
-| **Word doc** | ✅ | — | — | — | MS-DOC，DocReader 提取纯文本 |
-| **PPT pptx** | ✅ | ✅ | ✅ | 🔄规划 | 含文本框/图片/表格/图表/母版 |
+| **Excel xlsx** | ✅ | ✅ | ✅ | — | 含样式/图表/透视表/条件格式/图片/切片器/线程化批注，流式读取与 1904 日期支持 |
+| **Excel xls** | ✅ | ✅ | — | — | OLE2/BIFF8，BiffReader+BiffWriter 读写双全，含样式/合并/超链接/筛选/页面设置 |
+| **Word docx** | ✅ | ✅ | ✅ | HTML/PDF | 含段落/表格/图片/页眉页脚/批注/内容控件/加密/查找替换/脚注尾注/多节 |
+| **Word doc** | ✅ | — | — | ✅ doc→docx | MS-DOC，DocReader 纯文本 + 段落格式提取 + doc→docx 转换 |
+| **PPT pptx** | ✅ | ✅ | ✅ | PDF | 含文本框/图片/表格/图表/母版/动画/批注/Section；跨文件合并 |
 | **PPT ppt** | ✅ | — | — | — | MS-PPT，PptReader 提取幻灯片文本 |
-| **PDF** | ✅ | ✅ | — | — | 含 Fluent API/合并/拆分/加密 |
-| **Markdown** | ✅ | ✅ | — | HTML/Word/PDF | CommonMark + GFM，含 AST 模型，→Word/→PDF 已实现 |
+| **PDF** | ✅ | ✅ | — | — | 含 Fluent API/合并/拆分/加密/签名/表单/注释/PDF-A/表格提取/字体子集化 |
+| **Markdown** | ✅ | ✅ | — | HTML/Word/PDF/各格式→MD | CommonMark + GFM，含强类型 AST，全格式转换中枢 |
 | **RTF** | ✅ | ✅ | ✅ | — | 段落/表格/模板填充/图片嵌入（PNG/JPEG） |
-| **ODS** | ✅ | ✅ | — | — | LibreOffice 原生格式 |
+| **ODS** | ✅ | ✅ | — | — | LibreOffice 原生格式，含合并单元格/样式/公式 |
 | **EML** | ✅ | ✅ | — | — | RFC 5322 + MIME，附件/内嵌图片 |
 | **MSG** | ✅ | — | — | — | Outlook，OLE2 + MAPI，提取主题/正文/附件 |
 | **iCalendar** | ✅ | ✅ | — | — | RFC 5545 .ics，VEVENT/VTODO/RRULE |
 | **vCard** | ✅ | ✅ | — | — | RFC 6350 .vcf，vCard 3.0/4.0 |
 | **EPUB** | ✅ | ✅ | — | — | EPUB 2/3，OPF/Nav/章节/封面 |
 | **XPS** | ✅ | ✅ | — | — | ZIP+XML，Glyphs 文本提取/多页写入/图片/元数据 |
+| **Rendering** | — | — | — | — | 独立扩展包（SkiaSharp）：PDF/Word/PPT/Markdown → 图片 |
 
 ## 代码结构
 
 ```
-NewLife.Office/
-├── Excel/        # xlsx 读写：ExcelWriter / ExcelReader / ExcelTemplate / CellStyle / ExcelHelper / BiffReader
+Pek.Office/            # 核心库（命名空间 NewLife.Office，保持与上游 API 兼容）
+├── Excel/        # xlsx 读写：ExcelWriter / ExcelReader / ExcelTemplate / CellStyle / ExcelHelper / BiffReader / BiffWriter
 ├── Word/         # docx 读写：WordWriter / WordReader / WordTemplate / DocReader / WordHtmlConverter / WordPdfConverter
-├── PPT/          # pptx 读写：PptxWriter / PptxReader / PptxTemplate / PptReader
+├── PPT/          # pptx 读写：PptxWriter / PptxReader / PptxTemplate / PptReader / PptxPdfConverter
 ├── PDF/          # PDF 读写：PdfWriter / PdfReader / PdfDocument / PdfFluentDocument / PdfEncryptor
 ├── OLE2/         # OLE2/CFB 容器：CfbReader / CfbWriter
 ├── Markdown/     # Markdown 读写：MarkdownParser / MarkdownWriter / MarkdownHtmlConverter
 ├── Rtf/          # RTF 读写：RtfReader / RtfWriter
 ├── Ods/          # ODS 读写：OdsReader / OdsWriter
-├── Mail/         # EML 邮件读写：EmlReader / EmlWriter / EmlMessage
+├── Mail/         # EML/MSG 邮件读写：EmlReader / EmlWriter / MsgReader
 ├── Calendar/     # iCalendar .ics 读写：ICalReader / ICalWriter / ICalDocument
-├── VCard/        # vCard .vcf 读写：VCardReader / VCardWriter / VCardContact
+├── VCard/        # vCard .vcf 读写：VCardReader / VCardWriter / Contact
 ├── Epub/         # EPUB 读写：EpubReader / EpubWriter / EpubDocument
 └── Xps/          # XPS 读写：XpsReader / XpsWriter
+
+Pek.Office.Cli/        # 命令行工具：convert（文档→Markdown）/ doc2docx / info
+Pek.Office.Rendering/  # 渲染扩展包：文档页面 → 图片（依赖 SkiaSharp）
 ```
-
-## 规划中
-
-以下功能已在路线图中，但尚未实现：
-
-### 写入 xls（BIFF8，Excel 97-2003）
-
-- 生成合法 BIFF8 工作簿流并写入 OLE2 容器
-
-### PPT → PDF / 图片
-
-- pptx 每张幻灯片转换为 PDF 页面或 PNG/JPEG 图像
-
-### ODS 合并单元格
-
-- OdsReader 识别合并单元格（number-columns-spanned）

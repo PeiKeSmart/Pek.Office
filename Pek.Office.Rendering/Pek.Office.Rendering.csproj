@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net462;netstandard2.0;netstandard2.1</TargetFrameworks>
+    <TargetFrameworks>net462;netstandard2.0;netstandard2.1;net11.0</TargetFrameworks>
     <AssemblyTitle>办公文档渲染扩展</AssemblyTitle>
     <Description>Pek.Office 的渲染扩展包，提供文档页面→图片渲染、图片处理、水印叠加、二维码生成等功能。依赖 SkiaSharp 实现跨平台 2D 图形渲染。</Description>
     <Company>湖北登灏科技有限公司</Company>
@@ -16,8 +16,7 @@
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <SignAssembly>True</SignAssembly>
-    <AssemblyOriginatorKeyFile>..\Doc\newlife.snk</AssemblyOriginatorKeyFile>
+    <!-- 本地不启用上游强名称签名（上游用 Doc\newlife.snk），与主库保持一致 -->
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
     <RootNamespace>NewLife.Office.Rendering</RootNamespace>
   </PropertyGroup>
@@ -29,7 +28,7 @@
     <PackageIcon>DH.png</PackageIcon>
     <RepositoryUrl>https://github.com/PeiKeSmart/Pek.Office</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>新生命团队;X组件;NewLife;$(AssemblyName);Office;Rendering;PDF;Word;PPT;Markdown;Image;SkiaSharp</PackageTags>
+    <PackageTags>湖北登灏科技有限公司;DH组件;DH;PeiKeSmart;Pek;$(AssemblyName);Office;Rendering;PDF;Word;PPT;Markdown;Image;SkiaSharp</PackageTags>
     <PackageReleaseNotes>PDF/Word/PPT/Markdown 页面渲染为图片；图片缩放/裁剪/旋转/水印/格式转换；文字→图片；二维码→图片；缩略图网格；测试补齐 21 项并修复 PDF 页面对象号解析负长度崩溃、BMP 编码空引用、解码异常包装 3 个生产缺陷</PackageReleaseNotes>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>

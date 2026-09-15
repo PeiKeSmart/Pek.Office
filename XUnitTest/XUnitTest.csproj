@@ -7,6 +7,7 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
     <IsTestProject>true</IsTestProject>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
@@ -16,7 +17,14 @@
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="excel.xlsx" />
+    <EmbeddedResource Include="excel.xlsx">
+      <LogicalName>XUnitTest.excel.xlsx</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <!-- Markdown 测试夹具：复制到输出目录供真实文件测试使用 -->
+  <ItemGroup>
+    <None Include="Markdown\Fixtures\**\*.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
@@ -32,8 +40,28 @@
     </PackageReference>
   </ItemGroup>
 
+  <!-- 竞品交叉兼容测试依赖（仅测试项目，不污染生产代码） -->
+  <ItemGroup>
+    <PackageReference Include="NPOI" Version="2.8.0" />
+    <PackageReference Include="DocumentFormat.OpenXml" Version="3.5.1" />
+  </ItemGroup>
+
+  <!-- Word 真实文件回归库：从 Bin 复制到测试输出，供往返/交叉测试使用 -->
+  <ItemGroup>
+    <None Include="Word\Fixtures\**\*.docx" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\Pek.Office\Pek.Office.csproj" />
+    <ProjectReference Include="..\Pek.Office.Cli\Pek.Office.Cli.csproj" />
+  </ItemGroup>
+
+  <!-- Rendering 渲染扩展包测试（独立 NuGet 扩展，依赖 SkiaSharp；仅测试项目引用，不污染生产代码） -->
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="4.151.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Pek.Office.Rendering\Pek.Office.Rendering.csproj" />
   </ItemGroup>
 
 </Project>
