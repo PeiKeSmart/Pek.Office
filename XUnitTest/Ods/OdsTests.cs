@@ -89,7 +89,7 @@ public class OdsTests
     [DisplayName("写入保存到文件")]
     public void Write_SaveFile_FileCreated()
     {
-        var path = Path.Combine(Path.GetTempPath(), "test_ods_write.ods");
+        var path = Path.Combine(Path.GetTempPath(), $"test_ods_write_{Guid.NewGuid():N}.ods");
         try
         {
             var writer = new OdsWriter();
@@ -200,7 +200,7 @@ public class OdsTests
     [DisplayName("ReadRows 从文件返回第一张表行数据")]
     public void ReadFile_ReadRows_ReturnsFirstSheet()
     {
-        var path = Path.Combine(Path.GetTempPath(), "test_ods_readrows.ods");
+        var path = Path.Combine(Path.GetTempPath(), $"test_ods_readrows_{Guid.NewGuid():N}.ods");
         try
         {
             var writer = new OdsWriter();

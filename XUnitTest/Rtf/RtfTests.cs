@@ -315,7 +315,7 @@ public class RtfTests
     [DisplayName("保存到文件后可读取")]
     public void Write_SaveFile_CanReadBack()
     {
-        var path = Path.Combine(Path.GetTempPath(), "test_rtf.rtf");
+        var path = Path.Combine(Path.GetTempPath(), $"test_rtf_{Guid.NewGuid():N}.rtf");
         try
         {
             var writer = new RtfWriter();

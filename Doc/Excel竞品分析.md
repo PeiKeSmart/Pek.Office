@@ -393,7 +393,7 @@ cell.CellStyle = cellStyle;
 - **双格式读写**：xls（BIFF8）与 xlsx 读写双全，同层级竞品中少有（EPPlus/ClosedXML 不支持 xls 写入）
 - **功能覆盖广**：样式、图表、数据透视表、迷你图、条件格式、结构化表格等高级特性齐全，与 EPPlus/Aspose 同级
 - **开发效率高**：对象映射、模板填充、ExcelHelper 一键 API，单行完成导入导出，代码量比 EPPlus/NPOI 少 60–80%
-- **框架兼容广**：net45 / netstandard2.0 / netstandard2.1 / net6.0+ 全覆盖
+- **框架兼容广**：net45 / netstandard2.0 / netstandard2.1 / net11.0 全覆盖
 
 ### 6.2 差距领域（真实未实现项）
 

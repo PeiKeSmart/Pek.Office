@@ -84,7 +84,7 @@
 | 类型化转换错误 | ✅ (ConvertErrorException) | ❌ | ❌ | ❌ | ❌ | ✅ (ConvertError) |
 | 流式解析（Stream） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 文件解析 | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ |
-| 目标框架覆盖 | net45/netstandard2.0/2.1 | netstandard2.0+（无 net45） | net45+ | net45+ | net8.0+ | Rust 绑定 |
+| 目标框架覆盖 | net45/netstandard2.0/2.1/net11.0 | netstandard2.0+（无 net45） | net45+ | net45+ | net8.0+ | Rust 绑定 |
 | 外部依赖数 | 1 (NewLife.Core) | 0 | 0 | 0 | 1 (HtmlAgilityPack) | — |
 | NuGet 包体积 | <50KB | ~500KB | ~100KB | ~100KB | ~200KB | —（非 NuGet） |
 
@@ -114,7 +114,7 @@ var html = CommonMarkConverter.Convert("# Hello\nWorld");
 | **统一 AST 转换层** | `IMarkdownDocumentExtractable.ToMarkdownDocument()`，各 Reader 直接产出块模型，单一序列化器保证输出一致性（对标 anydoc 统一 Document 模型） |
 | **全格式转换中枢** | `FormatToMarkdown.Convert/ToDocument` 统一入口，PDF/PPT/Excel/Word→MD 一行转换，自动附加元数据 FrontMatter |
 | **零依赖轻量** | 仅依赖 NewLife.Core，包体积极小（<50KB） |
-| **全框架覆盖** | net45 ~ netstandard2.1 全覆盖，Markdig 已放弃 net45，ReverseMarkdown 仅 net8.0+ |
+| **全框架覆盖** | net45 ~ net11.0 全覆盖，Markdig 已放弃 net45，ReverseMarkdown 仅 net8.0+ |
 | **强类型 AST** | 12 种块类型继承体系（HeadingBlock/CodeBlock/ListItemBlock/TableBlock 等），对标 Markdig |
 | **完整 HTML 页面** | `ToHtmlPage()` 一键输出含内联样式的完整页面 |
 | **安全选项** | SafeLinks 危险链接过滤，适合服务端渲染场景 |

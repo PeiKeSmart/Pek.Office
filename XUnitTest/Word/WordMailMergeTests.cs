@@ -33,7 +33,7 @@ public class WordMailMergeTests
             ["FirstName"] = "张三"
         };
 
-        var outputPath = Path.Combine(Path.GetTempPath(), "merge_single.docx");
+        var outputPath = Path.Combine(Path.GetTempPath(), $"merge_single_{Guid.NewGuid():N}.docx");
         try
         {
             var template = new WordTemplate(templatePath);
@@ -65,7 +65,7 @@ public class WordMailMergeTests
             ["Company"] = "新生命团队"
         };
 
-        var outputPath = Path.Combine(Path.GetTempPath(), "merge_multi.docx");
+        var outputPath = Path.Combine(Path.GetTempPath(), $"merge_multi_{Guid.NewGuid():N}.docx");
         try
         {
             var template = new WordTemplate(templatePath);
@@ -96,7 +96,7 @@ public class WordMailMergeTests
             ["SomeOther"] = "hello"
         };
 
-        var outputPath = Path.Combine(Path.GetTempPath(), "merge_missing.docx");
+        var outputPath = Path.Combine(Path.GetTempPath(), $"merge_missing_{Guid.NewGuid():N}.docx");
         try
         {
             var template = new WordTemplate(templatePath);
@@ -126,7 +126,7 @@ public class WordMailMergeTests
             new Dictionary<String, Object?> { ["Name"] = "李四", ["Amount"] = "200.50" },
         };
 
-        var outputPath = Path.Combine(Path.GetTempPath(), "merge_multi_record.docx");
+        var outputPath = Path.Combine(Path.GetTempPath(), $"merge_multi_record_{Guid.NewGuid():N}.docx");
         try
         {
             var template = new WordTemplate(templatePath);
@@ -163,7 +163,7 @@ public class WordMailMergeTests
             new Dictionary<String, Object?> { ["Name"] = "张三" },
         };
 
-        var outputPath = Path.Combine(Path.GetTempPath(), "merge_multi_single.docx");
+        var outputPath = Path.Combine(Path.GetTempPath(), $"merge_multi_single_{Guid.NewGuid():N}.docx");
         try
         {
             var template = new WordTemplate(templatePath);
@@ -187,7 +187,7 @@ public class WordMailMergeTests
 
         var records = Array.Empty<Dictionary<String, Object?>>();
 
-        var outputPath = Path.Combine(Path.GetTempPath(), "merge_empty.docx");
+        var outputPath = Path.Combine(Path.GetTempPath(), $"merge_empty_{Guid.NewGuid():N}.docx");
         try
         {
             var template = new WordTemplate(templatePath);
@@ -214,7 +214,7 @@ public class WordMailMergeTests
 
         var data = new Dictionary<String, Object?>();
 
-        var outputPath = Path.Combine(Path.GetTempPath(), "merge_empty_data.docx");
+        var outputPath = Path.Combine(Path.GetTempPath(), $"merge_empty_data_{Guid.NewGuid():N}.docx");
         try
         {
             var template = new WordTemplate(templatePath);
@@ -241,7 +241,7 @@ public class WordMailMergeTests
             ["Optional"] = null
         };
 
-        var outputPath = Path.Combine(Path.GetTempPath(), "merge_null.docx");
+        var outputPath = Path.Combine(Path.GetTempPath(), $"merge_null_{Guid.NewGuid():N}.docx");
         try
         {
             var template = new WordTemplate(templatePath);
@@ -267,7 +267,7 @@ public class WordMailMergeTests
             ["Content"] = "A < B & C > D"
         };
 
-        var outputPath = Path.Combine(Path.GetTempPath(), "merge_escape.docx");
+        var outputPath = Path.Combine(Path.GetTempPath(), $"merge_escape_{Guid.NewGuid():N}.docx");
         try
         {
             var template = new WordTemplate(templatePath);

@@ -4,6 +4,10 @@
 > 包名 / 程序集名为 `Pek.Office`（含 `Pek.Office.Rendering`、`Pek.Office.Cli`），命名空间保持 `NewLife.Office` 以兼容上游 API。
 > 上游更早版本的完整更新记录请参见上游仓库。
 
+## 2026-09-16
+
+- **构建**：`Pek.Office.Cli`、`Test`、`XUnitTest`、`MarkdownBenchmark` 追加 `net11.0` 多目标（保留 `net10.0`，输出按框架分目录）；Readme 与 Doc 竞品分析的框架声明同步至 `net11.0`；修复 WordMailMergeTests 等 5 个测试类固定临时文件名在双框架并行运行时的争用冲突
+
 ## 2026-09-15（九月发版同步）
 
 同步上游 `v1.4.2026.0902`，主要能力：

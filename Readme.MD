@@ -5,7 +5,7 @@
 `Pek.Office` 是一个功能全面的 .NET 办公自动化库，覆盖 **Excel（xlsx/xls）、Word（docx/doc）、PPT（pptx/ppt）、PDF**、Markdown、RTF、ODS、Email（eml/msg）、iCalendar、vCard、EPUB、XPS 以及基于 OLE2/BIFF8 的老式二进制格式，致力于为 .NET 社区提供零依赖、MIT 许可的高质量办公自动化能力。
 
 - 仅依赖 `DH.NCore`，零外部依赖
-- 支持 `net45/netstandard2.0/netstandard2.1`
+- 支持 `net45/netstandard2.0/netstandard2.1/net11.0`
 - 直接基于 Open XML（ZIP + XML）/ PDF / OLE2 文件结构实现
 - 统一命名空间 `NewLife.Office`（保持与上游 API 兼容），API 风格一致，学习成本低
 - 配套 `Pek.Office.Rendering` 渲染扩展包（文档 → 图片）与 `Pek.Office.Cli` 命令行工具

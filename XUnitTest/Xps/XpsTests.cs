@@ -86,7 +86,7 @@ public class XpsTests
     [DisplayName("XP02-01 Save 写入文件")]
     public void Save_WritesFile()
     {
-        var path = Path.Combine(Path.GetTempPath(), "test_output.xps");
+        var path = Path.Combine(Path.GetTempPath(), $"test_output_{Guid.NewGuid():N}.xps");
         try
         {
             var writer = new XpsWriter();

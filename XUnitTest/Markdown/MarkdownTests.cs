@@ -608,7 +608,7 @@ var x = 1;
     [DisplayName("MD03-02 SaveWord 写入文件")]
     public void SaveWord_WritesFile()
     {
-        var path = Path.Combine(Path.GetTempPath(), "test_md_output.docx");
+        var path = Path.Combine(Path.GetTempPath(), $"test_md_output_{Guid.NewGuid():N}.docx");
         try
         {
             var doc = MarkdownDocument.Parse(SampleMd);
@@ -662,7 +662,7 @@ var x = 1;
     [DisplayName("MD03-03 SavePdf 写入文件")]
     public void SavePdf_WritesFile()
     {
-        var path = Path.Combine(Path.GetTempPath(), "test_md_output.pdf");
+        var path = Path.Combine(Path.GetTempPath(), $"test_md_output_{Guid.NewGuid():N}.pdf");
         try
         {
             var doc = MarkdownDocument.Parse(SampleMd);

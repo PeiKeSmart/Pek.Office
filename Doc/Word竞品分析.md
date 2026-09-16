@@ -529,7 +529,7 @@ var doc = new XWPFDocument(File.OpenRead("source.docx"));
 | **格式转换** | docx→PDF、docx→HTML、docx→Markdown，均为 MIT 免费 |
 | **doc 格式读取** | 自研 OLE2/CFB + MS-DOC 解析器，零依赖读取旧版 .doc |
 | **极致轻量** | Word 模块 <200KB，仅依赖 NewLife.Core |
-| **全框架兼容** | net45 → net9.0+，无框架版本盲区 |
+| **全框架兼容** | net45 → net11.0+，无框架版本盲区 |
 
 **功能覆盖率**：对比矩阵 92 项中，NewLife.Office 完整支持 77 项、RawXml 透传兜底 10 项，可用率 **94.6%**（87/92），在 MIT/Apache 开源库中排名第一；仅 5 项不支持（见 7.2）。
 
